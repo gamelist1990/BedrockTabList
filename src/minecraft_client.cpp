@@ -2,6 +2,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <knownfolders.h>
+#include <shlobj.h>
 
 #include <MinHook.h>
 #include <bedrock/generated_symbols.hpp>
@@ -9,19 +11,24 @@
 #include <bedrock/logger.hpp>
 #include <bedrock/resolver.hpp>
 #include <imgui.h>
+#include "tablist/config.hpp"
 #include "tablist/model.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -57,10 +64,32 @@ struct UuidHash {
 struct NativePlayerListEntry {
     std::byte beforeName[0x18];
     std::string name;
-    std::byte afterName[0xA8 - 0x18 - sizeof(std::string)];
+    std::byte beforeSkin[0x80 - 0x18 - sizeof(std::string)];
+    struct {
+        void* implementation;
+        void* referenceCount;
+    } skin;
+    std::byte afterSkin[0xA8 - 0x80 - 0x10];
+};
+struct NativeSkinImage {
+    std::int32_t format;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t depth;
+    std::uint8_t usage;
+    std::byte padding[7];
+    void* deleter;
+    const std::uint8_t* data;
+    std::size_t size;
+};
+struct PlayerRow {
+    std::string name;
+    std::array<std::uint32_t, 64> face{};
+    bool hasFace = false;
 };
 static_assert(sizeof(std::string) == 0x20);
 static_assert(sizeof(NativePlayerListEntry) == 0xA8);
+static_assert(sizeof(NativeSkinImage) == 0x30);
 using NativePlayerList = std::unordered_map<Uuid, NativePlayerListEntry, UuidHash>;
 
 std::atomic<Status> status{Status::NotStarted};
@@ -73,6 +102,8 @@ std::atomic<KeyboardFeedFn> originalKeyboardFeed{nullptr};
 std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
+std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
+    std::make_shared<const tablist::Config>()};
 std::array<void*, 4> hookTargets{};
 bool ownsMinHook = false;
 
@@ -119,7 +150,51 @@ bool validateClient(void* client) noexcept {
         reinterpret_cast<const void*>(vtable), sizeof(void*));
 }
 
-bool collectNamesUnsafe(std::vector<std::string>& names) {
+bool extractFace(const NativePlayerListEntry& entry, PlayerRow& row) {
+    if (!entry.skin.implementation) return false;
+    NativeSkinImage image{};
+    if (!safeRead(entry.skin.implementation, 0xA0, image) ||
+        !image.data || image.width < 64 || image.height < 16 ||
+        image.width > 4096 || image.height > 4096 || image.width % 8 != 0)
+        return false;
+    const std::size_t expected = static_cast<std::size_t>(image.width) * image.height * 4u;
+    if (expected / 4u / image.width != image.height || image.size < expected ||
+        !readable(image.data, expected)) return false;
+    const auto sourceSize = image.width / 8;
+    const auto faceX = sourceSize;
+    const auto faceY = sourceSize;
+    const auto overlayX = sourceSize * 5;
+    if (faceX + sourceSize > image.width || overlayX + sourceSize > image.width ||
+        faceY + sourceSize > image.height) return false;
+
+    const auto pixel = [&](std::uint32_t x, std::uint32_t y) {
+        return image.data + ((static_cast<std::size_t>(y) * image.width + x) * 4u);
+    };
+    for (std::uint32_t y = 0; y < 8; ++y) {
+        for (std::uint32_t x = 0; x < 8; ++x) {
+            const auto sourceX = x * sourceSize / 8;
+            const auto sourceY = y * sourceSize / 8;
+            const auto* base = pixel(faceX + sourceX, faceY + sourceY);
+            const auto* overlay = pixel(overlayX + sourceX, faceY + sourceY);
+            const unsigned alpha = overlay[3];
+            const unsigned inverse = 255u - alpha;
+            const auto blend = [&](unsigned channel) {
+                return static_cast<std::uint8_t>(
+                    (overlay[channel] * alpha + base[channel] * inverse) / 255u);
+            };
+            const auto r = blend(0);
+            const auto g = blend(1);
+            const auto b = blend(2);
+            row.face[y * 8 + x] = (static_cast<std::uint32_t>(r) << 24) |
+                (static_cast<std::uint32_t>(g) << 16) |
+                (static_cast<std::uint32_t>(b) << 8) | 255u;
+        }
+    }
+    row.hasFace = true;
+    return true;
+}
+
+bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces) {
     void* client = clientInstance.load(std::memory_order_acquire);
     if (!validateClient(client)) return false;
 
@@ -141,30 +216,41 @@ bool collectNamesUnsafe(std::vector<std::string>& names) {
 
     const auto count = players->size();
     if (count > 512) return false;
-    names.clear();
-    names.reserve(count);
+    rows.clear();
+    rows.reserve(count);
     std::size_t visited = 0;
     for (const auto& item : *players) {
         if (++visited > 512) return false;
         const auto& nativeName = item.second.name;
         const auto length = nativeName.size();
         if (length == 0 || length > 128 || !readable(nativeName.data(), length)) continue;
-        auto name = tablist::stripMinecraftFormatting(
+        PlayerRow row;
+        row.name = tablist::stripMinecraftFormatting(
             std::string_view(nativeName.data(), length));
-        if (!name.empty()) names.push_back(std::move(name));
+        if (row.name.empty()) continue;
+        if (includeFaces) extractFace(item.second, row);
+        rows.push_back(std::move(row));
     }
-    tablist::sortPlayerNames(names);
-    names.erase(std::unique(names.begin(), names.end()), names.end());
+    std::stable_sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+        return std::lexicographical_compare(
+            left.name.begin(), left.name.end(), right.name.begin(), right.name.end(),
+            [](unsigned char a, unsigned char b) {
+                return std::tolower(a) < std::tolower(b);
+            });
+    });
+    rows.erase(std::unique(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+        return left.name == right.name;
+    }), rows.end());
     return true;
 }
 
-bool collectNames(std::vector<std::string>& names) noexcept {
+bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces) noexcept {
     // Keep SEH outside the function that owns C++ objects. A player joining or
     // leaving during the read cannot crash Minecraft; that frame is skipped.
     __try {
-        return collectNamesUnsafe(names);
+        return collectRowsUnsafe(rows, includeFaces);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        names.clear();
+        rows.clear();
         return false;
     }
 }
@@ -200,62 +286,127 @@ float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
 }
 
 void drawTabList(void*) {
+    const auto config = liveConfig.load(std::memory_order_acquire);
+    if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire) ||
         !gameplayActive.load(std::memory_order_acquire)) return;
 
-    std::vector<std::string> names;
-    if (!collectNames(names) || names.empty()) return;
-    const auto layout = tablist::layoutFor(names.size());
+    std::vector<PlayerRow> players;
+    if (!collectRows(players, config->showFaces) || players.empty()) return;
+    const auto layout = tablist::layoutFor(players.size(), config->maximumRows);
     auto* draw = ImGui::GetForegroundDrawList();
     const auto display = ImGui::GetIO().DisplaySize;
-    constexpr float rowHeight = 24.0f;
-    constexpr float headerHeight = 32.0f;
-    constexpr float horizontalPadding = 14.0f;
-    constexpr float columnGap = 10.0f;
+    constexpr float horizontalPadding = 10.0f;
+    const float faceArea = config->showFaces ? config->faceSize + 7.0f : 8.0f;
+    const auto packed = [](tablist::Color color) {
+        return ImGui::ColorConvertFloat4ToU32({color.r, color.g, color.b, color.a});
+    };
 
-    std::vector<float> widths(layout.columns, 150.0f);
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        const auto column = i / 16;
+    std::vector<float> widths(layout.columns, config->minimumColumnWidth);
+    for (std::size_t i = 0; i < players.size(); ++i) {
+        const auto column = i / config->maximumRows;
         widths[column] = std::max(widths[column],
-            ImGui::CalcTextSize(names[i].c_str()).x + horizontalPadding * 2.0f);
+            ImGui::CalcTextSize(players[i].name.c_str()).x +
+            horizontalPadding * 2.0f + faceArea);
     }
     float totalWidth = 0.0f;
     for (float width : widths) totalWidth += width;
-    totalWidth += columnGap * static_cast<float>(layout.columns - 1);
-    const float totalHeight = headerHeight + rowHeight * static_cast<float>(layout.rows);
-    const ImVec2 topLeft{(display.x - totalWidth) * 0.5f, 22.0f};
+    totalWidth += config->columnGap * static_cast<float>(layout.columns - 1);
+    const float totalHeight = config->headerHeight +
+        config->rowHeight * static_cast<float>(layout.rows);
+    const ImVec2 topLeft{(display.x - totalWidth) * 0.5f, config->topOffset};
     const ImVec2 bottomRight{topLeft.x + totalWidth, topLeft.y + totalHeight};
 
-    draw->AddRectFilled(topLeft, bottomRight, IM_COL32(10, 13, 20, 205), 7.0f);
-    draw->AddRect(topLeft, bottomRight, IM_COL32(110, 145, 220, 170), 7.0f,
+    draw->AddRectFilled(topLeft, bottomRight, packed(config->background), config->cornerRadius);
+    draw->AddRect(topLeft, bottomRight, packed(config->border), config->cornerRadius,
                   ImDrawFlags_None, 1.2f);
-    const std::string title = "Players  " + std::to_string(names.size());
+    const std::string title = "Players  " + std::to_string(players.size());
     const auto titleSize = ImGui::CalcTextSize(title.c_str());
     draw->AddText({topLeft.x + (totalWidth - titleSize.x) * 0.5f,
-                   topLeft.y + (headerHeight - titleSize.y) * 0.5f},
-                  IM_COL32(225, 232, 247, 255), title.c_str());
-    draw->AddLine({topLeft.x + 8.0f, topLeft.y + headerHeight},
-                  {bottomRight.x - 8.0f, topLeft.y + headerHeight},
-                  IM_COL32(110, 145, 220, 95));
+                   topLeft.y + (config->headerHeight - titleSize.y) * 0.5f},
+                  packed(config->text), title.c_str());
+    auto separator = config->border;
+    separator.a *= 0.55f;
+    draw->AddLine({topLeft.x + 8.0f, topLeft.y + config->headerHeight},
+                  {bottomRight.x - 8.0f, topLeft.y + config->headerHeight},
+                  packed(separator));
 
     std::vector<float> columnX(layout.columns, topLeft.x);
     for (std::size_t column = 1; column < layout.columns; ++column)
-        columnX[column] = columnX[column - 1] + widths[column - 1] + columnGap;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        const auto column = i / 16;
-        const auto row = i % 16;
-        const float y = topLeft.y + headerHeight + rowHeight * static_cast<float>(row);
+        columnX[column] = columnX[column - 1] + widths[column - 1] + config->columnGap;
+    for (std::size_t i = 0; i < players.size(); ++i) {
+        const auto column = i / config->maximumRows;
+        const auto row = i % config->maximumRows;
+        const float y = topLeft.y + config->headerHeight +
+            config->rowHeight * static_cast<float>(row);
         if ((row & 1U) != 0)
             draw->AddRectFilled({columnX[column], y},
-                                {columnX[column] + widths[column], y + rowHeight},
+                                {columnX[column] + widths[column], y + config->rowHeight},
                                 IM_COL32(255, 255, 255, 10));
-        draw->AddCircleFilled({columnX[column] + 10.0f, y + rowHeight * 0.5f},
-                              2.5f, IM_COL32(100, 220, 155, 255));
-        const auto textSize = ImGui::CalcTextSize(names[i].c_str());
-        draw->AddText({columnX[column] + horizontalPadding + 4.0f,
-                       y + (rowHeight - textSize.y) * 0.5f},
-                      IM_COL32(242, 245, 251, 255), names[i].c_str());
+        float textX = columnX[column] + horizontalPadding;
+        if (config->showFaces && players[i].hasFace) {
+            const float faceX = textX;
+            const float faceY = y + (config->rowHeight - config->faceSize) * 0.5f;
+            const float pixelSize = config->faceSize / 8.0f;
+            for (std::size_t py = 0; py < 8; ++py) for (std::size_t px = 0; px < 8; ++px) {
+                const auto value = players[i].face[py * 8 + px];
+                const ImU32 color = IM_COL32((value >> 24) & 0xFF, (value >> 16) & 0xFF,
+                                             (value >> 8) & 0xFF, value & 0xFF);
+                draw->AddRectFilled({faceX + px * pixelSize, faceY + py * pixelSize},
+                                    {faceX + (px + 1) * pixelSize,
+                                     faceY + (py + 1) * pixelSize}, color);
+            }
+            textX += config->faceSize + 7.0f;
+        } else {
+            draw->AddCircleFilled({textX + 2.5f, y + config->rowHeight * 0.5f},
+                                  2.5f, packed(config->accent));
+            textX += 9.0f;
+        }
+        const auto textSize = ImGui::CalcTextSize(players[i].name.c_str());
+        draw->AddText({textX, y + (config->rowHeight - textSize.y) * 0.5f},
+                      packed(config->text), players[i].name.c_str());
     }
+}
+
+std::filesystem::path configPath() {
+    PWSTR documents = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_CREATE, nullptr, &documents)))
+        return {};
+    std::filesystem::path result{documents};
+    CoTaskMemFree(documents);
+    return result / L"PEXData" / L"TabList" / L"config.json";
+}
+
+bool writeDefaultConfig(const std::filesystem::path& path, std::string& error) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        error = ec.message();
+        return false;
+    }
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = "could not create config.json";
+        return false;
+    }
+    output << tablist::configJson(tablist::Config{});
+    return static_cast<bool>(output);
+}
+
+bool loadConfig(const std::filesystem::path& path, bedrock::Logger& logger) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    std::ostringstream text;
+    text << input.rdbuf();
+    std::string error;
+    auto parsed = tablist::parseConfig(text.str(), error);
+    if (!error.empty()) {
+        logger.error("Ignoring invalid config.json: ", error);
+        return false;
+    }
+    liveConfig.store(std::make_shared<const tablist::Config>(parsed),
+                     std::memory_order_release);
+    return true;
 }
 
 template <class Original>
@@ -288,8 +439,15 @@ DWORD WINAPI startClient(void*) {
     }
     status.store(Status::Loading, std::memory_order_release);
     bedrock::Logger logger{"TabList"};
-    bedrock::Resolver resolver;
+    const auto path = configPath();
     std::string error;
+    if (path.empty() || (!std::filesystem::exists(path) &&
+                         !writeDefaultConfig(path, error)) || !loadConfig(path, logger)) {
+        logger.error("Config initialization failed: ", error);
+        status.store(Status::Failed, std::memory_order_release);
+        return 1;
+    }
+    bedrock::Resolver resolver;
     if (!resolver.loadJson(bedrock::generated::kSymbolDatabase, error) ||
         !resolver.attachWindowsMainModule(error) || !resolver.exactBuild()) {
         logger.error("Unsupported Minecraft executable: ", error);
@@ -351,10 +509,20 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
 
-    logger.info("Minecraft native TabList ready; hold Tab in a world");
+    logger.info("Minecraft native TabList ready; hold Tab in a world. Config: ",
+                path.string());
     status.store(Status::Running, std::memory_order_release);
-    while (!stopRequested.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto lastWrite = std::filesystem::last_write_time(path);
+    while (!stopRequested.load(std::memory_order_acquire)) {
+        const auto delay = liveConfig.load(std::memory_order_acquire)->reloadIntervalMs;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        std::error_code ec;
+        const auto currentWrite = std::filesystem::last_write_time(path, ec);
+        if (!ec && currentWrite != lastWrite && loadConfig(path, logger)) {
+            lastWrite = currentWrite;
+            logger.info("TabList config applied");
+        }
+    }
 
     bedrock::gui::Overlay::shutdown();
     removeNativeHooks();

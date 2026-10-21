@@ -7,6 +7,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 
 - ワールド内で `Tab` を押している間だけプレイヤー一覧を表示
 - 画面上部中央に、半透明の背景・人数・プレイヤー名を表示
+- Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
 - 16人を超える場合は自動的に複数列へ分割
 - メニュー、チャット、インベントリでは自動的に非表示
 - Minecraftの `Keyboard::feed(InputKey, down)` を直接使用
@@ -14,7 +15,39 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - プレイヤー一覧はMinecraftのLevelが保持するネイティブ一覧を読み取り
 
 見た目と基本的な並べ方はLatite ClientのPlayer Listを参考にしつつ、
-プレイヤーヘッドや複雑な設定を省いたシンプルなexampleです。
+シンプルにまとめたexampleです。
+
+## 設定
+
+初回起動時に次のファイルを作成し、保存後はゲーム中に自動反映します。
+
+```text
+C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
+```
+
+```json
+{
+  "enabled": true,
+  "show_faces": true,
+  "background_color": "#0A0D14CC",
+  "text_color": "#F2F5FBFF",
+  "accent_color": "#64DC9BFF",
+  "border_color": "#6E91DCAA",
+  "corner_radius": 7.0,
+  "row_height": 24.0,
+  "header_height": 32.0,
+  "face_size": 18.0,
+  "top_offset": 22.0,
+  "column_gap": 10.0,
+  "minimum_column_width": 150.0,
+  "maximum_rows": 16,
+  "reload_interval_ms": 250
+}
+```
+
+色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
+`corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
+プレイヤーは、アクセント色の小さな丸で表示します。
 
 ## ビルド
 

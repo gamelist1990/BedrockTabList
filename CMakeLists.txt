@@ -17,8 +17,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(bedrock_sdk)
 
-add_library(tablist_core STATIC src/model.cpp)
+add_library(tablist_core STATIC src/config.cpp src/model.cpp)
 target_include_directories(tablist_core PUBLIC include)
+target_link_libraries(tablist_core PUBLIC bedrock::symbols)
 target_compile_features(tablist_core PUBLIC cxx_std_20)
 if(MSVC)
     set_property(TARGET tablist_core PROPERTY MSVC_RUNTIME_LIBRARY
@@ -28,7 +29,7 @@ endif()
 if(WIN32)
     add_library(BedrockTabList SHARED src/minecraft_client.cpp)
     target_link_libraries(BedrockTabList PRIVATE tablist_core bedrock::gui_overlay
-        bedrock::symbols bedrock::logging)
+        bedrock::symbols bedrock::logging shell32 ole32)
     target_compile_features(BedrockTabList PRIVATE cxx_std_20)
     if(MSVC)
         set_property(TARGET BedrockTabList PROPERTY MSVC_RUNTIME_LIBRARY
