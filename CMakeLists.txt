@@ -20,6 +20,10 @@ FetchContent_MakeAvailable(bedrock_sdk)
 add_library(tablist_core STATIC src/model.cpp)
 target_include_directories(tablist_core PUBLIC include)
 target_compile_features(tablist_core PUBLIC cxx_std_20)
+if(MSVC)
+    set_property(TARGET tablist_core PROPERTY MSVC_RUNTIME_LIBRARY
+        "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 if(WIN32)
     add_library(BedrockTabList SHARED src/minecraft_client.cpp)
