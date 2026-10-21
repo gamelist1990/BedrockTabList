@@ -40,6 +40,7 @@ enum class Status : unsigned { NotStarted, Loading, Running, Stopped, Failed };
 using KeyboardFeedFn = bool(__fastcall*)(int, bool);
 using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
+using LevelSubTickFn = void(__fastcall*)(void*);
 
 // These layouts come from the matching Latite SDK revision and are used only
 // after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
@@ -50,6 +51,7 @@ constexpr std::size_t sessionLevelControlOffset = 0x30;
 constexpr std::size_t sessionLevelOffset = 0x40;
 constexpr std::size_t levelPlayerListOffset = 0x4E0;
 constexpr int tabInputKey = 0x09;
+constexpr int tabInputKeyGlfw = 258;
 
 struct Uuid {
     std::uint64_t low{};
@@ -98,14 +100,30 @@ std::atomic<bool> tabHeld{false};
 std::atomic<bool> gameplayActive{false};
 std::atomic<bool> cursorStateObserved{false};
 std::atomic<void*> clientInstance{nullptr};
+std::atomic<void*> levelInstance{nullptr};
 std::atomic<KeyboardFeedFn> originalKeyboardFeed{nullptr};
 std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
+std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
     std::make_shared<const tablist::Config>()};
-std::array<void*, 4> hookTargets{};
+std::array<void*, 5> hookTargets{};
 bool ownsMinHook = false;
+std::mutex diagnosticMutex;
+std::ofstream diagnosticLog;
+std::atomic<bool> loggedRenderer{false};
+std::atomic<bool> loggedListFailure{false};
+std::atomic<bool> loggedListSuccess{false};
+
+template <class... Args>
+void diagnostic(Args&&... args) {
+    std::lock_guard lock(diagnosticMutex);
+    if (!diagnosticLog) return;
+    (diagnosticLog << ... << std::forward<Args>(args));
+    diagnosticLog << '\n';
+    diagnosticLog.flush();
+}
 
 bool readable(const void* pointer, std::size_t bytes) noexcept {
     if (!pointer || !bytes) return false;
@@ -195,23 +213,24 @@ bool extractFace(const NativePlayerListEntry& entry, PlayerRow& row) {
 }
 
 bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces) {
-    void* client = clientInstance.load(std::memory_order_acquire);
-    if (!validateClient(client)) return false;
-
-    void* minecraft = nullptr;
-    void* session = nullptr;
-    void* control = nullptr;
-    void* level = nullptr;
-    std::uint8_t ready = 0;
-    std::uint8_t controlReady = 0;
+    void* level = levelInstance.load(std::memory_order_acquire);
+    if (!level) {
+        void* client = clientInstance.load(std::memory_order_acquire);
+        if (!validateClient(client)) return false;
+        void* minecraft = nullptr;
+        void* session = nullptr;
+        void* control = nullptr;
+        std::uint8_t ready = 0;
+        std::uint8_t controlReady = 0;
+        if (!safeRead(client, clientMinecraftOffset, minecraft) || !minecraft ||
+            !safeRead(minecraft, minecraftGameSessionOffset, session) || !session ||
+            !safeRead(session, sessionReadyOffset, ready) || ready != 1 ||
+            !safeRead(session, sessionLevelControlOffset, control) || !control ||
+            !safeRead(control, 0, controlReady) || controlReady != 1 ||
+            !safeRead(session, sessionLevelOffset, level) || !level) return false;
+    }
     NativePlayerList* players = nullptr;
-    if (!safeRead(client, clientMinecraftOffset, minecraft) || !minecraft ||
-        !safeRead(minecraft, minecraftGameSessionOffset, session) || !session ||
-        !safeRead(session, sessionReadyOffset, ready) || ready != 1 ||
-        !safeRead(session, sessionLevelControlOffset, control) || !control ||
-        !safeRead(control, 0, controlReady) || controlReady != 1 ||
-        !safeRead(session, sessionLevelOffset, level) || !level ||
-        !safeRead(level, levelPlayerListOffset, players) || !players ||
+    if (!safeRead(level, levelPlayerListOffset, players) || !players ||
         !readable(players, sizeof(NativePlayerList))) return false;
 
     const auto count = players->size();
@@ -256,7 +275,10 @@ bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces) noexcept {
 }
 
 bool __fastcall onKeyboardFeed(int inputKey, bool down) {
-    if (inputKey == tabInputKey) tabHeld.store(down, std::memory_order_release);
+    if (inputKey == tabInputKey || inputKey == tabInputKeyGlfw) {
+        tabHeld.store(down, std::memory_order_release);
+        diagnostic("Tab InputKey=", inputKey, " down=", down ? 1 : 0);
+    }
     if (auto original = originalKeyboardFeed.load(std::memory_order_acquire))
         return original(inputKey, down);
     return false;
@@ -285,14 +307,27 @@ float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
     return inputFov;
 }
 
+void __fastcall onLevelSubTick(void* level) {
+    if (level) levelInstance.store(level, std::memory_order_release);
+    if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
+}
+
 void drawTabList(void*) {
+    if (!loggedRenderer.exchange(true, std::memory_order_acq_rel))
+        diagnostic("DXGI render callback active");
     const auto config = liveConfig.load(std::memory_order_acquire);
     if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire) ||
         !gameplayActive.load(std::memory_order_acquire)) return;
 
     std::vector<PlayerRow> players;
-    if (!collectRows(players, config->showFaces) || players.empty()) return;
+    if (!collectRows(players, config->showFaces) || players.empty()) {
+        if (!loggedListFailure.exchange(true, std::memory_order_acq_rel))
+            diagnostic("Tab detected but native player list is unavailable");
+        return;
+    }
+    if (!loggedListSuccess.exchange(true, std::memory_order_acq_rel))
+        diagnostic("Native player list active: ", players.size(), " player(s)");
     const auto layout = tablist::layoutFor(players.size(), config->maximumRows);
     auto* draw = ImGui::GetForegroundDrawList();
     const auto display = ImGui::GetIO().DisplaySize;
@@ -426,7 +461,9 @@ void removeNativeHooks() noexcept {
     originalGrabCursor.store(nullptr);
     originalReleaseCursor.store(nullptr);
     originalGetFov.store(nullptr);
+    originalLevelSubTick.store(nullptr);
     clientInstance.store(nullptr);
+    levelInstance.store(nullptr);
 }
 
 DWORD WINAPI startClient(void*) {
@@ -447,6 +484,9 @@ DWORD WINAPI startClient(void*) {
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
+    diagnosticLog.open(path.parent_path() / L"TabList.log",
+                       std::ios::binary | std::ios::trunc);
+    diagnostic("BedrockTabList starting");
     bedrock::Resolver resolver;
     if (!resolver.loadJson(bedrock::generated::kSymbolDatabase, error) ||
         !resolver.attachWindowsMainModule(error) || !resolver.exactBuild()) {
@@ -458,11 +498,12 @@ DWORD WINAPI startClient(void*) {
     const auto grab = resolver.resolve("ClientInstance::grabCursor", true);
     const auto release = resolver.resolve("ClientInstance::releaseCursor", true);
     const auto fov = resolver.resolve("LevelRendererPlayer::getFov");
+    const auto levelTick = resolver.resolve("MultiPlayerLevel::_subTick", true);
     const auto exact = [](const auto& symbol) {
         return symbol && symbol->exact_build && symbol->method == "exact-rva";
     };
     if (!exact(keyboard) || !keyboard->verified || !exact(grab) || !exact(release) ||
-        !exact(fov) || !fov->verified) {
+        !exact(fov) || !fov->verified || !exact(levelTick)) {
         logger.error("Required native input/render symbols are unavailable");
         status.store(Status::Failed, std::memory_order_release);
         return 1;
@@ -477,12 +518,14 @@ DWORD WINAPI startClient(void*) {
     hookTargets = {reinterpret_cast<void*>(keyboard->address),
                    reinterpret_cast<void*>(grab->address),
                    reinterpret_cast<void*>(release->address),
-                   reinterpret_cast<void*>(fov->address)};
+                   reinterpret_cast<void*>(fov->address),
+                   reinterpret_cast<void*>(levelTick->address)};
     const bool created =
         createHook(hookTargets[0], reinterpret_cast<void*>(&onKeyboardFeed), originalKeyboardFeed) &&
         createHook(hookTargets[1], reinterpret_cast<void*>(&onGrabCursor), originalGrabCursor) &&
         createHook(hookTargets[2], reinterpret_cast<void*>(&onReleaseCursor), originalReleaseCursor) &&
-        createHook(hookTargets[3], reinterpret_cast<void*>(&onGetFov), originalGetFov);
+        createHook(hookTargets[3], reinterpret_cast<void*>(&onGetFov), originalGetFov) &&
+        createHook(hookTargets[4], reinterpret_cast<void*>(&onLevelSubTick), originalLevelSubTick);
     bool queued = created;
     if (queued) for (void* target : hookTargets)
         queued = queued && MH_QueueEnableHook(target) == MH_OK;
@@ -511,6 +554,8 @@ DWORD WINAPI startClient(void*) {
 
     logger.info("Minecraft native TabList ready; hold Tab in a world. Config: ",
                 path.string());
+    diagnostic("hooks enabled: Keyboard::feed, MultiPlayerLevel::_subTick, "
+               "LevelRendererPlayer::getFov, cursor state");
     status.store(Status::Running, std::memory_order_release);
     auto lastWrite = std::filesystem::last_write_time(path);
     while (!stopRequested.load(std::memory_order_acquire)) {

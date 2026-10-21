@@ -13,6 +13,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - Minecraftの `Keyboard::feed(InputKey, down)` を直接使用
 - WinAPIのキーポーリングやキーボードフックは不使用
 - プレイヤー一覧はMinecraftのLevelが保持するネイティブ一覧を読み取り
+- `MultiPlayerLevel::_subTick` から現在のLevelを直接取得
 
 見た目と基本的な並べ方はLatite ClientのPlayer Listを参考にしつつ、
 シンプルにまとめたexampleです。
@@ -48,6 +49,9 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
+
+同じフォルダの `TabList.log` には、TabのMinecraft `InputKey`、描画開始、
+プレイヤー一覧取得状態を記録します。
 
 ## ビルド
 
