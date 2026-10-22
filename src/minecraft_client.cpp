@@ -115,6 +115,7 @@ std::ofstream diagnosticLog;
 std::atomic<bool> loggedRenderer{false};
 std::atomic<bool> loggedListFailure{false};
 std::atomic<bool> loggedListSuccess{false};
+std::atomic<unsigned> loggedInputEvents{0};
 
 template <class... Args>
 void diagnostic(Args&&... args) {
@@ -275,9 +276,10 @@ bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces) noexcept {
 }
 
 bool __fastcall onKeyboardFeed(int inputKey, bool down) {
+    if (loggedInputEvents.fetch_add(1, std::memory_order_relaxed) < 512)
+        diagnostic("Keyboard InputKey=", inputKey, " down=", down ? 1 : 0);
     if (inputKey == tabInputKey || inputKey == tabInputKeyGlfw) {
         tabHeld.store(down, std::memory_order_release);
-        diagnostic("Tab InputKey=", inputKey, " down=", down ? 1 : 0);
     }
     if (auto original = originalKeyboardFeed.load(std::memory_order_acquire))
         return original(inputKey, down);
