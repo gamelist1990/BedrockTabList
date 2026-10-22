@@ -22,8 +22,10 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <memory>
@@ -46,7 +48,13 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
-using RuntimeActorListFn = void(__fastcall*)(void*, std::vector<void*>*);
+// 1.26.52.3's runtime actor-list routine copies 0x40-byte values into its
+// output vector (not 8-byte Actor* elements). Preserve that native stride.
+struct RuntimeActorRecord {
+    std::array<std::byte, 0x40> bytes{};
+};
+static_assert(sizeof(RuntimeActorRecord) == 0x40);
+using RuntimeActorListFn = void*(__fastcall*)(void*, std::vector<RuntimeActorRecord>*);
 
 // These layouts come from the matching Latite SDK revision and are used only
 // after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
@@ -115,6 +123,7 @@ std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
 std::atomic<void*> runtimeActorListFunction{nullptr};
+std::atomic<int> runtimeActorPointerOffset{-1};
 struct ActorNameTagEntry {
     std::string nameTag;
     unsigned colorOrder = 16;
@@ -274,6 +283,9 @@ void recordLevel(void* level) noexcept {
         }
         loggedNameTagDetections.store(0, std::memory_order_release);
         lastActorListRefreshMs.store(0, std::memory_order_release);
+        runtimeActorPointerOffset.store(-1, std::memory_order_release);
+        loggedActorListFailure.store(false, std::memory_order_release);
+        loggedActorListSuccess.store(false, std::memory_order_release);
         diagnostic("level ready");
     }
 }
@@ -287,17 +299,67 @@ bool executable(const void* pointer) noexcept {
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
+bool copyActorNameTag(void* actor, std::string* output);
+
 // Keep native dispatch inside a tiny SEH boundary with no owning C++ objects
 // on its stack. The candidate signature is only usable on an exact build.
 bool invokeRuntimeActorList(void* level, void* function,
-                            std::vector<void*>* actors) noexcept {
+                            std::vector<RuntimeActorRecord>* actors,
+                            unsigned long* exceptionCode) noexcept {
+    if (exceptionCode) *exceptionCode = 0;
     if (!level || !actors || !readable(level, sizeof(void*)) || !executable(function)) return false;
     __try {
         reinterpret_cast<RuntimeActorListFn>(function)(level, actors);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (exceptionCode) *exceptionCode = GetExceptionCode();
         return false;
     }
+}
+
+bool looksLikeActor(void* actor) noexcept {
+    if (!actor || !readable(actor, sizeof(void*))) return false;
+    void** vtable = nullptr;
+    std::memcpy(&vtable, actor, sizeof(vtable));
+    if (!vtable || !readable(vtable, sizeof(void*) * 3)) return false;
+    unsigned executableSlots = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        void* entry = nullptr;
+        std::memcpy(&entry, vtable + i, sizeof(entry));
+        if (executable(entry)) ++executableSlots;
+    }
+    return executableSlots >= 2;
+}
+
+void* actorPointerFromRecord(const RuntimeActorRecord& record, std::size_t offset) noexcept {
+    if (offset + sizeof(void*) > record.bytes.size()) return nullptr;
+    void* actor = nullptr;
+    std::memcpy(&actor, record.bytes.data() + offset, sizeof(actor));
+    return actor;
+}
+
+int discoverActorPointerOffset(const std::vector<RuntimeActorRecord>& records) {
+    const auto sampleCount = std::min<std::size_t>(records.size(), 64);
+    std::size_t bestCount = 0;
+    int bestOffset = -1;
+    for (std::size_t offset = 0; offset + sizeof(void*) <= sizeof(RuntimeActorRecord);
+         offset += sizeof(void*)) {
+        std::size_t matchingNames = 0;
+        for (std::size_t i = 0; i < sampleCount; ++i) {
+            auto* actor = actorPointerFromRecord(records[i], offset);
+            if (!looksLikeActor(actor)) continue;
+            std::string nameTag;
+            if (copyActorNameTag(actor, &nameTag) && !nameTag.empty() && nameTag.size() <= 512 &&
+                !tablist::stripMinecraftFormatting(nameTag).empty()) {
+                ++matchingNames;
+            }
+        }
+        if (matchingNames > bestCount) {
+            bestCount = matchingNames;
+            bestOffset = static_cast<int>(offset);
+        }
+    }
+    return bestCount >= 2 ? bestOffset : -1;
 }
 
 bool getActorNameTagView(void* actor, const char** data, std::size_t* size) noexcept {
@@ -326,21 +388,47 @@ bool copyActorNameTag(void* actor, std::string* output) {
 void updateRuntimeActorNameTags(void* level) {
     auto* function = runtimeActorListFunction.load(std::memory_order_acquire);
     if (!function || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
-    std::vector<void*> actors;
-    if (!invokeRuntimeActorList(level, function, &actors) || actors.size() > 4096 ||
-        (actors.size() && !readable(actors.data(), actors.size() * sizeof(void*)))) {
+    std::vector<RuntimeActorRecord> actors;
+    unsigned long exceptionCode = 0;
+    if (!invokeRuntimeActorList(level, function, &actors, &exceptionCode)) {
         runtimeActorListFunction.store(nullptr, std::memory_order_release);
         if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
-            diagnostic("Level::getRuntimeActorList signature call failed; actor color sort inactive");
+            diagnostic("Level::getRuntimeActorList invocation raised SEH exception=0x",
+                       std::hex, exceptionCode, std::dec,
+                       "; actor color sort inactive");
         return;
+    }
+    if (actors.size() > 4096 ||
+        (actors.size() && !readable(actors.data(), actors.size() * sizeof(RuntimeActorRecord)))) {
+        runtimeActorListFunction.store(nullptr, std::memory_order_release);
+        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
+            diagnostic("Level::getRuntimeActorList returned invalid record buffer; records=",
+                       actors.size(), " record_size=", sizeof(RuntimeActorRecord),
+                       "; actor color sort inactive");
+        return;
+    }
+
+    int actorOffset = runtimeActorPointerOffset.load(std::memory_order_acquire);
+    if (actorOffset < 0) {
+        actorOffset = discoverActorPointerOffset(actors);
+        if (actorOffset >= 0) {
+            runtimeActorPointerOffset.store(actorOffset, std::memory_order_release);
+            diagnostic("runtime Actor record layout identified; Actor* at +0x",
+                       std::hex, actorOffset, std::dec);
+        } else if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel)) {
+            diagnostic("Level::getRuntimeActorList returned ", actors.size(),
+                       " 0x40-byte records, but no Actor* field matched Actor::getNameTag");
+        }
+        if (actorOffset < 0) return;
     }
 
     std::unordered_map<void*, ActorNameTagEntry> updated;
     updated.reserve(actors.size());
     std::vector<std::string> observedNames;
     observedNames.reserve(std::min<std::size_t>(actors.size(), 64));
-    for (void* actor : actors) {
-        if (!actor || !readable(actor, sizeof(void*))) continue;
+    for (const auto& record : actors) {
+        void* actor = actorPointerFromRecord(record, static_cast<std::size_t>(actorOffset));
+        if (!looksLikeActor(actor)) continue;
         std::string nameTag;
         if (!copyActorNameTag(actor, &nameTag) || nameTag.empty() || nameTag.size() > 512)
             continue;
