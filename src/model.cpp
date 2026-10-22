@@ -48,6 +48,30 @@ unsigned minecraftNameColorOrder(std::string_view text) noexcept {
     return 16;
 }
 
+std::optional<unsigned> actorNameColorForPlayerName(
+    std::string_view playerListName, std::string_view actorNameTag) {
+    const auto color = minecraftNameColorOrder(actorNameTag);
+    if (color >= 16) return std::nullopt;
+    const auto actorRawName = stripMinecraftFormatting(actorNameTag);
+    if (playerListName.empty() || actorRawName.empty() ||
+        playerListName.size() > actorRawName.size()) return std::nullopt;
+    const auto equalsIgnoreAsciiCase = [](std::string_view left, std::string_view right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(left[i])) !=
+                std::tolower(static_cast<unsigned char>(right[i]))) return false;
+        }
+        return true;
+    };
+    for (std::size_t offset = 0;
+         offset + playerListName.size() <= actorRawName.size(); ++offset) {
+        if (equalsIgnoreAsciiCase(playerListName,
+                                  std::string_view(actorRawName).substr(offset, playerListName.size())))
+            return color;
+    }
+    return std::nullopt;
+}
+
 void sortPlayerNames(std::vector<std::string>& names) {
     std::stable_sort(names.begin(), names.end(), [](const auto& left, const auto& right) {
         return std::lexicographical_compare(

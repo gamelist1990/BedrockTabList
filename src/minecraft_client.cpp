@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,7 @@ using KeyboardFeedFn = bool(__fastcall*)(int, bool);
 using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
+using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
 
 // These layouts come from the matching Latite SDK revision and are used only
 // after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
@@ -108,6 +110,12 @@ std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
+std::atomic<void*> originalActorGetNameTag{nullptr};
+std::atomic<bool> captureActorNameTags{false};
+struct ActorNameTagEntry { std::string nameTag; unsigned colorOrder = 16; };
+std::mutex actorNameTagMutex;
+std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
+BDS_HookToken actorNameTagHookToken{};
 std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
     std::make_shared<const tablist::Config>()};
 std::array<BDS_HookToken, 5> hookTokens{};
@@ -244,7 +252,42 @@ void recordLevel(void* level) noexcept {
     if (!level) return;
     void* previous = levelInstance.exchange(level, std::memory_order_acq_rel);
     levelHeartbeatMs.store(steadyMilliseconds(), std::memory_order_release);
-    if (previous != level) diagnostic("level ready");
+    if (previous != level) {
+        {
+            std::lock_guard lock(actorNameTagMutex);
+            actorNameTags.clear();
+        }
+        diagnostic("level ready");
+    }
+}
+
+// Actor::getNameTag returns a reference to its native std::string on the
+// supported x64 build. Keep the direct hook installed as a passthrough after
+// TabList stops, since SDK DirectRemove does not drain an in-flight call.
+const std::string& __fastcall onActorGetNameTag(void* actor) {
+    auto* rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
+    while (!rawOriginal) {
+        std::this_thread::yield();
+        rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
+    }
+    const auto original = reinterpret_cast<ActorGetNameTagFn>(rawOriginal);
+    const auto& nameTag = original(actor);
+    if (!captureActorNameTags.load(std::memory_order_acquire)) return nameTag;
+    try {
+        if (nameTag.size() > 512) return nameTag;
+        const auto color = tablist::minecraftNameColorOrder(nameTag);
+        const auto rawName = tablist::stripMinecraftFormatting(nameTag);
+        std::lock_guard lock(actorNameTagMutex);
+        if (color < 16 && !rawName.empty()) {
+            actorNameTags[actor] = {nameTag, color};
+            if (actorNameTags.size() > 512) actorNameTags.clear();
+        } else {
+            actorNameTags.erase(actor);
+        }
+    } catch (...) {
+        // Name-tag observation is optional; preserve Minecraft's original result.
+    }
+    return nameTag;
 }
 
 bool levelIsFresh() noexcept {
@@ -272,7 +315,8 @@ bool tryAcquireLevelFromClient() noexcept {
 }
 
 bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
-                       bool sortByNameColor) {
+                       bool sortByNameColor,
+                       const std::vector<ActorNameTagEntry>& actorTags) {
     void* level = levelInstance.load(std::memory_order_acquire);
     if (!level) {
         if (!tryAcquireLevelFromClient()) return false;
@@ -294,11 +338,19 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
         const auto length = nativeName.size();
         if (length == 0 || length > 128 || !readable(nativeName.data(), length)) continue;
         PlayerRow row;
-        row.nameColorOrder = tablist::minecraftNameColorOrder(
-            std::string_view(nativeName.data(), length));
         row.name = tablist::stripMinecraftFormatting(
             std::string_view(nativeName.data(), length));
         if (row.name.empty()) continue;
+        if (sortByNameColor) {
+            std::size_t bestActorNameLength = std::numeric_limits<std::size_t>::max();
+            for (const auto& actorTag : actorTags) {
+                if (actorTag.nameTag.size() >= bestActorNameLength) continue;
+                if (tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag)) {
+                    row.nameColorOrder = actorTag.colorOrder;
+                    bestActorNameLength = actorTag.nameTag.size();
+                }
+            }
+        }
         if (includeFaces) extractFace(item.second, row);
         rows.push_back(std::move(row));
     }
@@ -318,11 +370,12 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
 }
 
 bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
-                 bool sortByNameColor) noexcept {
+                 bool sortByNameColor,
+                 const std::vector<ActorNameTagEntry>& actorTags) noexcept {
     // Keep SEH outside the function that owns C++ objects. A player joining or
     // leaving during the read cannot crash Minecraft; that frame is skipped.
     __try {
-        return collectRowsUnsafe(rows, includeFaces, sortByNameColor);
+        return collectRowsUnsafe(rows, includeFaces, sortByNameColor, actorTags);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         rows.clear();
         return false;
@@ -408,7 +461,16 @@ void drawTabList(void*) {
     if (!levelIsFresh() && !tryAcquireLevelFromClient()) return;
 
     std::vector<PlayerRow> players;
-    if (!collectRows(players, config->showFaces, config->sortByNameColor) || players.empty()) {
+    std::vector<ActorNameTagEntry> actorTags;
+    if (config->sortByNameColor) {
+        std::lock_guard lock(actorNameTagMutex);
+        actorTags.reserve(actorNameTags.size());
+        for (const auto& [actor, entry] : actorNameTags) {
+            (void)actor;
+            actorTags.push_back(entry);
+        }
+    }
+    if (!collectRows(players, config->showFaces, config->sortByNameColor, actorTags) || players.empty()) {
         if (!loggedListFailure.exchange(true, std::memory_order_acq_rel))
             diagnostic("Tab detected but native player list is unavailable");
         return;
@@ -610,11 +672,20 @@ DWORD WINAPI startClient(void*) {
     const auto valid = [](const auto& symbol) {
         return symbol && bedrock::isUsableSharedHookResolution(*symbol);
     };
+    std::optional<bedrock::Resolution> actorNameTag;
+    const auto resolveActorNameTag = [&] {
+        actorNameTag = resolver.resolve("Actor::getNameTag", true);
+        if (actorNameTag &&
+            (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
+            actorNameTag.reset();
+    };
+    resolveActorNameTag();
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
     resolveRequired();
-    if (!requirementsMet() && version.source != bedrock::ProfileSource::Remote) {
+    if ((!requirementsMet() || !actorNameTag) &&
+        version.source != bedrock::ProfileSource::Remote) {
         diagnostic("required symbols missing in cached profile; refreshing exact-build GitHub definition");
         std::string refreshedProfile;
         bedrock::ProfileChoice refreshedVersion;
@@ -626,6 +697,7 @@ DWORD WINAPI startClient(void*) {
                 profile = std::move(refreshedProfile);
                 version = std::move(refreshedVersion);
                 resolveRequired();
+                resolveActorNameTag();
                 diagnostic("latest exact-build profile loaded [",
                            bedrock::profileSourceName(version.source), "]");
             } else {
@@ -635,6 +707,7 @@ DWORD WINAPI startClient(void*) {
             diagnostic("exact-build profile refresh failed: ", error);
         }
     }
+
     if (!requirementsMet()) {
         diagnostic("required symbols unavailable keyboard=", bool(keyboard),
                    " grab=", bool(grab), " release=", bool(release),
@@ -664,6 +737,21 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
     diagnostic("shared hooks registered");
+
+    if (actorNameTag) {
+        void* trampoline = nullptr;
+        if (BDS_HookDirectInstall(reinterpret_cast<void*>(actorNameTag->address),
+                                  reinterpret_cast<void*>(&onActorGetNameTag),
+                                  &trampoline, &actorNameTagHookToken)) {
+            originalActorGetNameTag.store(trampoline, std::memory_order_release);
+            captureActorNameTags.store(true, std::memory_order_release);
+            diagnostic("Actor::getNameTag color source active [guarded exact RVA]");
+        } else {
+            diagnostic("Actor::getNameTag direct hook unavailable; color sort inactive");
+        }
+    } else {
+        diagnostic("Actor::getNameTag exact-build candidate unavailable; color sort inactive");
+    }
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;
@@ -699,6 +787,7 @@ DWORD WINAPI startClient(void*) {
 
     bedrock::gui::Overlay::shutdown();
     removeNativeHooks();
+    captureActorNameTags.store(false, std::memory_order_release);
     status.store(Status::Stopped, std::memory_order_release);
     return 0;
 }
