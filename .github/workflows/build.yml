@@ -4,11 +4,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      sdk_ref:
-        description: BedrockDynamicSDK branch, tag, or commit
-        required: true
-        default: main
 
 jobs:
   test:
@@ -27,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON -DBEDROCK_SDK_REF=${{ github.event.inputs.sdk_ref || 'main' }}
+        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON -DBEDROCK_SDK_REF=main
       - name: Build and test
         shell: pwsh
         run: |
