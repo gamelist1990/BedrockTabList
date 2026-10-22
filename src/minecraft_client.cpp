@@ -39,6 +39,7 @@ enum class Status : unsigned { NotStarted, Loading, Running, Stopped, Failed };
 
 using KeyboardFeedFn = bool(__fastcall*)(int, bool);
 using CursorFn = void(__fastcall*)(void*);
+using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 
 // These layouts come from the matching Latite SDK revision and are used only
@@ -96,16 +97,18 @@ using NativePlayerList = std::unordered_map<Uuid, NativePlayerListEntry, UuidHas
 std::atomic<Status> status{Status::NotStarted};
 std::atomic<bool> stopRequested{false};
 std::atomic<bool> tabHeld{false};
+std::atomic<bool> gameplayActive{false};
 std::atomic<void*> clientInstance{nullptr};
 std::atomic<void*> levelInstance{nullptr};
 std::atomic<std::int64_t> levelHeartbeatMs{0};
 std::atomic<KeyboardFeedFn> originalKeyboardFeed{nullptr};
 std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
+std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
     std::make_shared<const tablist::Config>()};
-std::array<void*, 4> hookTargets{};
+std::array<void*, 5> hookTargets{};
 bool ownsMinHook = false;
 std::mutex diagnosticMutex;
 std::ofstream diagnosticLog;
@@ -310,12 +313,23 @@ bool __fastcall onKeyboardFeed(int inputKey, bool down) {
 void __fastcall onGrabCursor(void* self) {
     if (auto original = originalGrabCursor.load(std::memory_order_acquire)) original(self);
     if (validateClient(self)) clientInstance.store(self, std::memory_order_release);
+    gameplayActive.store(true, std::memory_order_release);
 }
 
 void __fastcall onReleaseCursor(void* self) {
     if (validateClient(self)) clientInstance.store(self, std::memory_order_release);
+    gameplayActive.store(false, std::memory_order_release);
     tabHeld.store(false, std::memory_order_release);
     if (auto original = originalReleaseCursor.load(std::memory_order_acquire)) original(self);
+}
+
+float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
+    // This callback is the reliable world-render heartbeat used by the prior
+    // working build. Level freshness still prevents a menu from drawing a list.
+    gameplayActive.store(true, std::memory_order_release);
+    if (auto original = originalGetFov.load(std::memory_order_acquire))
+        return original(self, inputFov, a3, a4);
+    return inputFov;
 }
 
 void __fastcall onLevelSubTick(void* level) {
@@ -334,6 +348,7 @@ void drawTabList(void*) {
     const auto config = liveConfig.load(std::memory_order_acquire);
     if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire)) return;
+    if (!gameplayActive.load(std::memory_order_acquire)) return;
     if (!levelIsFresh() && !tryAcquireLevelFromClient()) return;
 
     std::vector<PlayerRow> players;
@@ -476,7 +491,9 @@ void removeNativeHooks() noexcept {
     originalKeyboardFeed.store(nullptr);
     originalGrabCursor.store(nullptr);
     originalReleaseCursor.store(nullptr);
+    originalGetFov.store(nullptr);
     originalLevelSubTick.store(nullptr);
+    gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
     levelInstance.store(nullptr);
     levelHeartbeatMs.store(0, std::memory_order_release);
@@ -521,12 +538,13 @@ DWORD WINAPI startClient(void*) {
     const auto keyboard = resolver.resolve("Keyboard::feed");
     const auto grab = resolver.resolve("ClientInstance::grabCursor", true);
     const auto release = resolver.resolve("ClientInstance::releaseCursor", true);
+    const auto fov = resolver.resolve("LevelRendererPlayer::getFov");
     const auto levelTick = resolver.resolve("MultiPlayerLevel::_subTick", true);
     const auto exact = [](const auto& symbol) {
         return symbol && symbol->exact_build && symbol->method == "exact-rva";
     };
     if (!exact(keyboard) || !keyboard->verified || !exact(grab) || !exact(release) ||
-        !exact(levelTick)) {
+        !exact(fov) || !fov->verified || !exact(levelTick)) {
         logger.error("Required native input/render symbols are unavailable");
         status.store(Status::Failed, std::memory_order_release);
         return 1;
@@ -541,12 +559,14 @@ DWORD WINAPI startClient(void*) {
     hookTargets = {reinterpret_cast<void*>(keyboard->address),
                    reinterpret_cast<void*>(grab->address),
                    reinterpret_cast<void*>(release->address),
+                   reinterpret_cast<void*>(fov->address),
                    reinterpret_cast<void*>(levelTick->address)};
     const bool created =
         createHook(hookTargets[0], reinterpret_cast<void*>(&onKeyboardFeed), originalKeyboardFeed) &&
         createHook(hookTargets[1], reinterpret_cast<void*>(&onGrabCursor), originalGrabCursor) &&
         createHook(hookTargets[2], reinterpret_cast<void*>(&onReleaseCursor), originalReleaseCursor) &&
-        createHook(hookTargets[3], reinterpret_cast<void*>(&onLevelSubTick), originalLevelSubTick);
+        createHook(hookTargets[3], reinterpret_cast<void*>(&onGetFov), originalGetFov) &&
+        createHook(hookTargets[4], reinterpret_cast<void*>(&onLevelSubTick), originalLevelSubTick);
     bool queued = created;
     if (queued) for (void* target : hookTargets)
         queued = queued && MH_QueueEnableHook(target) == MH_OK;
@@ -575,7 +595,7 @@ DWORD WINAPI startClient(void*) {
 
     logger.info("Minecraft native TabList ready; hold Tab in a world. Config: ",
                 path.string());
-    diagnostic("ready ", version.version);
+    diagnostic("ready ", version.version, " ", bedrock::profileSourceName(version.source));
     status.store(Status::Running, std::memory_order_release);
     auto lastWrite = std::filesystem::last_write_time(path);
     while (!stopRequested.load(std::memory_order_acquire)) {
