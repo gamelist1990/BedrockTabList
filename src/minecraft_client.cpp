@@ -317,6 +317,11 @@ void __fastcall onLevelSubTick(void* level) {
 void drawTabList(void*) {
     if (!loggedRenderer.exchange(true, std::memory_order_acq_rel))
         diagnostic("DXGI render callback active");
+    // TabList is a passive HUD. Keep this invariant here as a safeguard when
+    // built against an older overlay backend that defaults to a GUI cursor.
+    auto& io = ImGui::GetIO();
+    io.MouseDrawCursor = false;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     const auto config = liveConfig.load(std::memory_order_acquire);
     if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire) ||
