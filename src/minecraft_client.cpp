@@ -33,6 +33,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -112,10 +113,14 @@ std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
+std::atomic<bool> captureActorNameTags{false};
 std::atomic<std::size_t> runtimeActorListVtableSlot{0};
 struct ActorNameTagEntry { std::string nameTag; unsigned colorOrder = 16; };
 std::mutex actorNameTagMutex;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
+std::unordered_set<std::string> loggedNameTags;
+std::atomic<unsigned> loggedNameTagDetections{0};
+BDS_HookToken actorNameTagHookToken{};
 std::atomic<std::int64_t> lastActorListRefreshMs{0};
 std::atomic<bool> loggedActorListFailure{false};
 std::atomic<bool> loggedActorListSuccess{false};
@@ -259,10 +264,54 @@ void recordLevel(void* level) noexcept {
         {
             std::lock_guard lock(actorNameTagMutex);
             actorNameTags.clear();
+            loggedNameTags.clear();
         }
+        loggedNameTagDetections.store(0, std::memory_order_release);
         lastActorListRefreshMs.store(0, std::memory_order_release);
         diagnostic("level ready");
     }
+}
+
+// Fallback/dynamic source: Minecraft calls this while building actor nametags,
+// so it exposes the live §-formatted name without requiring a guessed Level
+// vtable slot. Keep the detour as a passthrough after stop; the SDK does not
+// drain in-flight direct hooks when removing them.
+const std::string& __fastcall onActorGetNameTag(void* actor) {
+    auto* rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
+    while (!rawOriginal) {
+        std::this_thread::yield();
+        rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
+    }
+    const auto& nameTag = reinterpret_cast<ActorGetNameTagFn>(rawOriginal)(actor);
+    const auto config = liveConfig.load(std::memory_order_acquire);
+    if (!captureActorNameTags.load(std::memory_order_acquire) || !config->sortByNameColor ||
+        !tabHeld.load(std::memory_order_acquire) || nameTag.empty() || nameTag.size() > 512)
+        return nameTag;
+
+    try {
+        const auto color = tablist::minecraftNameColorOrder(nameTag);
+        const auto rawName = tablist::stripMinecraftFormatting(nameTag);
+        if (color >= 16 || rawName.empty()) {
+            std::lock_guard lock(actorNameTagMutex);
+            actorNameTags.erase(actor);
+            return nameTag;
+        }
+        bool firstSeen = false;
+        {
+            std::lock_guard lock(actorNameTagMutex);
+            if (actorNameTags.size() >= 512 && !actorNameTags.contains(actor))
+                actorNameTags.erase(actorNameTags.begin());
+            actorNameTags.insert_or_assign(actor, ActorNameTagEntry{nameTag, color});
+            firstSeen = loggedNameTags.size() < 512 && loggedNameTags.insert(nameTag).second;
+        }
+        if (firstSeen) {
+            const auto logCount = loggedNameTagDetections.fetch_add(1, std::memory_order_acq_rel);
+            if (logCount < 64) diagnostic("nametag color detected: ", nameTag);
+        }
+    } catch (...) {
+        // Name-tag observation is optional; preserve Minecraft's original result.
+    }
+    return nameTag;
 }
 
 bool executable(const void* pointer) noexcept {
@@ -323,7 +372,9 @@ void updateRuntimeActorNameTags(void* level) {
         (actors.size() && !readable(actors.data(), actors.size() * sizeof(void*)))) {
         runtimeActorListVtableSlot.store(0, std::memory_order_release);
         if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
-            diagnostic("Level::getRuntimeActorList unavailable; color sort inactive");
+            diagnostic(captureActorNameTags.load(std::memory_order_acquire)
+                ? "Level::getRuntimeActorList unavailable; dynamic nametag hook remains active"
+                : "Level::getRuntimeActorList unavailable; color sort inactive");
         return;
     }
 
@@ -803,16 +854,37 @@ DWORD WINAPI startClient(void*) {
     diagnostic("shared hooks registered");
 
     if (actorNameTag && actorListSlot) {
-        originalActorGetNameTag.store(reinterpret_cast<void*>(actorNameTag->address),
-                                      std::memory_order_release);
         runtimeActorListVtableSlot.store(*actorListSlot, std::memory_order_release);
-        diagnostic("runtime Actor list color source ready [exact-build profile slot ",
-                   *actorListSlot, "]");
+    } else {
+        runtimeActorListVtableSlot.store(0, std::memory_order_release);
+    }
+    diagnostic("color source resolution: Actor::getNameTag=",
+               actorNameTag ? "available" : "missing", " runtimeActorList=",
+               actorListSlot ? "slot-available" : "missing");
+    if (actorNameTag) {
+        void* trampoline = nullptr;
+        if (BDS_HookDirectInstall(reinterpret_cast<void*>(actorNameTag->address),
+                                  reinterpret_cast<void*>(&onActorGetNameTag),
+                                  &trampoline, &actorNameTagHookToken)) {
+            originalActorGetNameTag.store(trampoline, std::memory_order_release);
+            captureActorNameTags.store(true, std::memory_order_release);
+            diagnostic("dynamic Actor::getNameTag detection active; waiting for § color tags");
+        } else if (actorListSlot) {
+            originalActorGetNameTag.store(reinterpret_cast<void*>(actorNameTag->address),
+                                          std::memory_order_release);
+            diagnostic("Actor::getNameTag hook unavailable; runtime Actor list fallback enabled");
+        } else {
+            diagnostic("Actor::getNameTag hook unavailable and runtime Actor list slot missing; color sort inactive");
+        }
     } else {
         originalActorGetNameTag.store(nullptr, std::memory_order_release);
-        runtimeActorListVtableSlot.store(0, std::memory_order_release);
-        diagnostic("runtime Actor list color source unavailable; color sort inactive");
+        diagnostic("Actor::getNameTag missing; cannot inspect §-formatted Actor names");
     }
+    if (actorListSlot)
+        diagnostic("runtime Actor list fallback ready [exact-build profile slot ",
+                   *actorListSlot, "]");
+    else
+        diagnostic("runtime Actor list fallback unavailable; using dynamic nametag hook when available");
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;
@@ -847,6 +919,7 @@ DWORD WINAPI startClient(void*) {
     }
 
     bedrock::gui::Overlay::shutdown();
+    captureActorNameTags.store(false, std::memory_order_release);
     removeNativeHooks();
     status.store(Status::Stopped, std::memory_order_release);
     return 0;
