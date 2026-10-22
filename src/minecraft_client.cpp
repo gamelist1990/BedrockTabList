@@ -14,6 +14,7 @@
 #include <bedrock/game_api.hpp>
 #include <bedrock/game_hooks.hpp>
 #include <imgui.h>
+#include <entt/entt.hpp>
 #include "tablist/config.hpp"
 #include "tablist/model.hpp"
 
@@ -37,10 +38,59 @@
 #include <string_view>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+namespace tablist_native {
+struct EntityId {
+    std::uint32_t rawId{};
+    [[nodiscard]] constexpr bool operator==(const EntityId&) const = default;
+    [[nodiscard]] constexpr operator std::uint32_t() const { return rawId; }
+};
+struct EntityIdTraits {
+    using value_type = EntityId;
+    using entity_type = std::uint32_t;
+    using version_type = std::uint16_t;
+    static constexpr entity_type entity_mask = 0x3FFFF;
+    static constexpr version_type version_mask = 0x3FFF;
+};
+struct ActorEquipmentComponent {
+    static constexpr std::uint32_t type_hash = 0xB06141A9;
+    void* handContainer{};
+    void* armorContainer{};
+};
+}
+
+// These traits mirror the pinned Latite reference's Bedrock ECS component
+// registration so GameApi::Actor::getHeldItem can use an Actor's replicated
+// hand container without consulting PlayerSupplies or enumerating Inventory.
+namespace entt {
+template<> struct entt_traits<tablist_native::EntityId>
+    : basic_entt_traits<tablist_native::EntityIdTraits> {
+    static constexpr std::size_t page_size = 2048;
+};
+template<> struct component_traits<tablist_native::ActorEquipmentComponent,
+                                   tablist_native::EntityId> {
+    using element_type = tablist_native::ActorEquipmentComponent;
+    using entity_type = tablist_native::EntityId;
+    static constexpr bool in_place_delete = true;
+    static constexpr std::size_t page_size = 128 * !std::is_empty_v<element_type>;
+};
+template<> struct storage_type<tablist_native::ActorEquipmentComponent,
+                               tablist_native::EntityId> {
+    using type = basic_storage<tablist_native::ActorEquipmentComponent,
+                               tablist_native::EntityId>;
+};
+template<> struct type_hash<tablist_native::ActorEquipmentComponent> {
+    [[nodiscard]] static consteval id_type value() noexcept {
+        return tablist_native::ActorEquipmentComponent::type_hash;
+    }
+    [[nodiscard]] consteval operator id_type() const noexcept { return value(); }
+};
+}
 
 namespace {
 enum class Status : unsigned { NotStarted, Loading, Running, Stopped, Failed };
@@ -62,13 +112,12 @@ constexpr std::size_t sessionReadyOffset = 0x28;
 constexpr std::size_t sessionLevelControlOffset = 0x30;
 constexpr std::size_t sessionLevelOffset = 0x40;
 constexpr std::size_t levelPlayerListOffset = 0x4E0;
-// Bedrock Lens/Latite layout hints for the current client family. These are
-// guarded by readable-range checks and SEH; if validation fails, item scanning
-// simply reports unavailable rather than dereferencing an untrusted pointer.
-constexpr std::size_t playerSuppliesOffset = 0x5B8;
-constexpr std::size_t suppliesSelectedSlotOffset = 0x10;
-constexpr std::size_t suppliesInventoryOffset = 0xB8;
+// Actor embeds EntityContext at +0x8; its registry reference and entity ID
+// occupy +0x10 and +0x18 respectively (Latite's pinned Bedrock ECS layout).
+constexpr std::size_t actorEntityRegistryOffset = 0x10;
+constexpr std::size_t actorEntityIdOffset = 0x18;
 constexpr std::size_t inventoryGetItemVtableSlot = 7;
+constexpr int actorMainHandSlot = 0;
 constexpr std::size_t itemStackItemPointerOffset = 0x08;
 constexpr std::size_t itemStackCountOffset = 0x22;
 constexpr std::size_t itemNamespacedIdStringOffset = 0x128;
@@ -310,19 +359,36 @@ bool copyNativeString(const void* object, std::string& output,
     }
 }
 
-void* callInventoryGetItem(void* inventory, int slot) noexcept {
-    if (!inventory || slot < 0 || slot > 8) return nullptr;
+void* callHandContainerGetItem(void* handContainer, int handSlot) noexcept {
+    if (!handContainer || handSlot != actorMainHandSlot) return nullptr;
     void** vtable = nullptr;
-    if (!safeRead(inventory, 0, vtable) || !vtable ||
+    if (!safeRead(handContainer, 0, vtable) || !vtable ||
         !readable(vtable, sizeof(void*) * (inventoryGetItemVtableSlot + 1))) return nullptr;
     void* target = nullptr;
     if (!safeRead(vtable, sizeof(void*) * inventoryGetItemVtableSlot, target) ||
         !executable(target)) return nullptr;
     using GetItemFn = void*(__fastcall*)(void*, int);
     __try {
-        return reinterpret_cast<GetItemFn>(target)(inventory, slot);
+        return reinterpret_cast<GetItemFn>(target)(handContainer, handSlot);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
+    }
+}
+
+bool getActorHandContainerSeh(void* registry, std::uint32_t rawEntityId,
+                              void** output) noexcept {
+    if (!registry || !output) return false;
+    __try {
+        using Registry = entt::basic_registry<tablist_native::EntityId>;
+        auto* components = static_cast<Registry*>(registry)->try_get<
+            tablist_native::ActorEquipmentComponent>(
+                tablist_native::EntityId{rawEntityId});
+        if (!components) return false;
+        *output = components->handContainer;
+        return *output != nullptr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        *output = nullptr;
+        return false;
     }
 }
 
@@ -537,17 +603,21 @@ bool TabListGameAccess::isActorValid(void* actor) const noexcept {
 
 std::optional<bedrock::HeldItemInfo> TabListGameAccess::heldItem(void* actor) const {
     if (!isActorValid(actor)) return std::nullopt;
-    void* supplies = nullptr;
-    int selectedSlot = -1;
-    void* inventory = nullptr;
-    if (!safeRead(actor, playerSuppliesOffset, supplies) || !supplies ||
-        !readable(supplies, suppliesInventoryOffset + sizeof(void*)) ||
-        !safeRead(supplies, suppliesSelectedSlotOffset, selectedSlot) ||
-        selectedSlot < 0 || selectedSlot > 8 ||
-        !safeRead(supplies, suppliesInventoryOffset, inventory) || !inventory)
+    void* registry = nullptr;
+    std::uint32_t entityId = 0;
+    if (!safeRead(actor, actorEntityRegistryOffset, registry) || !registry ||
+        !safeRead(actor, actorEntityIdOffset, entityId) ||
+        !readable(registry, sizeof(void*)))
         return std::nullopt;
 
-    void* stack = callInventoryGetItem(inventory, selectedSlot);
+    void* handContainer = nullptr;
+    if (!getActorHandContainerSeh(registry, entityId, &handContainer) || !handContainer)
+        return std::nullopt;
+
+    // ActorEquipmentComponent::handContainer is the replicated equipment API.
+    // Read exactly its main-hand slot; never walk PlayerSupplies or the
+    // player's hotbar/full inventory for remote Actors.
+    void* stack = callHandContainerGetItem(handContainer, actorMainHandSlot);
     if (!stack || !readable(stack, itemStackCountOffset + sizeof(std::uint8_t)))
         return std::nullopt;
 
@@ -1645,7 +1715,7 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
 
-    diagnostic("held-item scan uses canonical IDs only; unverified native hover-name call disabled");
+    diagnostic("MurderDetect reads Actor hand slot only; full inventory scan disabled; item IDs only");
 
     originalKeyboardFeed.store(&callNextKeyboard);
     originalGrabCursor.store(&callNextCursor);
