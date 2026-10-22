@@ -29,8 +29,9 @@ endif()
 if(WIN32)
     add_library(BedrockTabList SHARED src/minecraft_client.cpp)
     target_link_libraries(BedrockTabList PRIVATE tablist_core bedrock::gui_overlay
-        bedrock::symbols bedrock::logging shell32 ole32)
+        bedrock::symbols bedrock::logging bedrock::hook_runtime shell32 ole32)
     target_compile_features(BedrockTabList PRIVATE cxx_std_20)
+    bedrock_enable_hook_runtime(BedrockTabList)
     if(MSVC)
         set_property(TARGET BedrockTabList PROPERTY MSVC_RUNTIME_LIBRARY
             "MultiThreaded$<$<CONFIG:Debug>:Debug>")

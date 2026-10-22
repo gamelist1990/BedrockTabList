@@ -5,7 +5,7 @@
 #include <knownfolders.h>
 #include <shlobj.h>
 
-#include <MinHook.h>
+#include <bedrock/hook_runtime.h>
 #include <bedrock/gui_overlay.hpp>
 #include <bedrock/logger.hpp>
 #include <bedrock/remote_catalog.hpp>
@@ -109,8 +109,30 @@ std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
     std::make_shared<const tablist::Config>()};
-std::array<void*, 5> hookTargets{};
-bool ownsMinHook = false;
+std::array<BDS_HookToken, 5> hookTokens{};
+struct NextFrame { BDS_HookNext next{}; void* frame{}; };
+thread_local NextFrame keyFrame, cursorFrame, fovFrame, levelFrame;
+thread_local NextFrame* activeCursorFrame{};
+
+bool __fastcall callNextKeyboard(int key, bool down) {
+    if (!keyFrame.next) return false;
+    BDS_KeyboardArgs args{key, down ? 1 : 0, 0};
+    keyFrame.next(keyFrame.frame, &args);
+    return args.result != 0;
+}
+void __fastcall callNextCursor(void* self) {
+    if (activeCursorFrame && activeCursorFrame->next) {
+        BDS_CursorArgs args{self}; activeCursorFrame->next(activeCursorFrame->frame, &args);
+    }
+}
+float __fastcall callNextFov(void* self, float fov, void* a3, void* a4) {
+    if (!fovFrame.next) return fov;
+    BDS_FovArgs args{self, fov, a3, a4, fov}; fovFrame.next(fovFrame.frame, &args);
+    return args.result;
+}
+void __fastcall callNextLevel(void* level) {
+    if (levelFrame.next) { BDS_LevelArgs args{level}; levelFrame.next(levelFrame.frame, &args); }
+}
 std::mutex diagnosticMutex;
 std::ofstream diagnosticLog;
 std::atomic<bool> loggedRenderer{false};
@@ -338,6 +360,33 @@ void __fastcall onLevelSubTick(void* level) {
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
 }
 
+void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
+    auto* args = static_cast<BDS_KeyboardArgs*>(raw);
+    const auto old = keyFrame; keyFrame = {next, frame};
+    args->result = onKeyboardFeed(args->key, args->down != 0) ? 1 : 0;
+    keyFrame = old;
+}
+void BDS_HOOK_CALL cursorMiddleware(void* user, void* raw, BDS_HookNext next, void* frame) {
+    auto* args = static_cast<BDS_CursorArgs*>(raw);
+    const bool grabbing = reinterpret_cast<std::uintptr_t>(user) == 1;
+    const auto oldFrame = cursorFrame; cursorFrame = {next, frame};
+    const auto oldActive = activeCursorFrame; activeCursorFrame = &cursorFrame;
+    if (grabbing) onGrabCursor(args->self); else onReleaseCursor(args->self);
+    activeCursorFrame = oldActive; cursorFrame = oldFrame;
+}
+void BDS_HOOK_CALL fovMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
+    auto* args = static_cast<BDS_FovArgs*>(raw);
+    const auto old = fovFrame; fovFrame = {next, frame};
+    args->result = onGetFov(args->self, args->input_fov, args->a3, args->a4);
+    fovFrame = old;
+}
+void BDS_HOOK_CALL levelMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
+    auto* args = static_cast<BDS_LevelArgs*>(raw);
+    const auto old = levelFrame; levelFrame = {next, frame};
+    onLevelSubTick(args->level);
+    levelFrame = old;
+}
+
 void drawTabList(void*) {
     if (!loggedRenderer.exchange(true, std::memory_order_acq_rel))
         diagnostic("DXGI render callback active");
@@ -476,19 +525,11 @@ bool loadConfig(const std::filesystem::path& path, bedrock::Logger& logger) {
     return true;
 }
 
-template <class Original>
-bool createHook(void* target, void* detour, std::atomic<Original>& original) {
-    Original captured = nullptr;
-    if (MH_CreateHook(target, detour, reinterpret_cast<void**>(&captured)) != MH_OK)
-        return false;
-    original.store(captured, std::memory_order_release);
-    return true;
-}
-
 void removeNativeHooks() noexcept {
-    for (void* target : hookTargets) if (target) MH_DisableHook(target);
-    for (void* target : hookTargets) if (target) MH_RemoveHook(target);
-    hookTargets.fill(nullptr);
+    for (auto& token : hookTokens) {
+        if (token) BDS_HookUnsubscribe(token);
+        token = nullptr;
+    }
     originalKeyboardFeed.store(nullptr);
     originalGrabCursor.store(nullptr);
     originalReleaseCursor.store(nullptr);
@@ -553,19 +594,18 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("resolver ready");
     std::optional<bedrock::Resolution> keyboard, grab, release, fov, levelTick;
-    const auto exact = [](const auto& symbol) {
-        return symbol && symbol->exact_build && symbol->method == "exact-rva";
-    };
     const auto resolveRequired = [&] {
-        keyboard = resolver.resolve("Keyboard::feed");
-        grab = resolver.resolve("ClientInstance::grabCursor", true);
-        release = resolver.resolve("ClientInstance::releaseCursor", true);
-        fov = resolver.resolve("LevelRendererPlayer::getFov");
-        levelTick = resolver.resolve("MultiPlayerLevel::_subTick", true);
+        keyboard = bedrock::resolveSharedHook(resolver, "Keyboard::feed", BDS_HOOK_KEYBOARD_FEED);
+        grab = bedrock::resolveSharedHook(resolver, "ClientInstance::grabCursor", BDS_HOOK_GRAB_CURSOR);
+        release = bedrock::resolveSharedHook(resolver, "ClientInstance::releaseCursor", BDS_HOOK_RELEASE_CURSOR);
+        fov = bedrock::resolveSharedHook(resolver, "LevelRendererPlayer::getFov", BDS_HOOK_GET_FOV);
+        levelTick = bedrock::resolveSharedHook(resolver, "MultiPlayerLevel::_subTick", BDS_HOOK_LEVEL_SUB_TICK);
+    };
+    const auto valid = [](const auto& symbol) {
+        return symbol && symbol->exact_build && symbol->verified;
     };
     const auto requirementsMet = [&] {
-        return exact(keyboard) && keyboard->verified && exact(grab) && exact(release) &&
-            exact(fov) && fov->verified && exact(levelTick);
+        return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
     resolveRequired();
     if (!requirementsMet() && version.source != bedrock::ProfileSource::Remote) {
@@ -598,39 +638,26 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
 
-    const auto initialized = MH_Initialize();
-    if (initialized != MH_OK && initialized != MH_ERROR_ALREADY_INITIALIZED) {
-        diagnostic("MinHook initialize failed: ", static_cast<int>(initialized));
-        status.store(Status::Failed, std::memory_order_release);
-        return 1;
-    }
-    ownsMinHook = initialized == MH_OK;
-    hookTargets = {reinterpret_cast<void*>(keyboard->address),
-                   reinterpret_cast<void*>(grab->address),
-                   reinterpret_cast<void*>(release->address),
-                   reinterpret_cast<void*>(fov->address),
-                   reinterpret_cast<void*>(levelTick->address)};
-    diagnostic("native hooks create");
+    originalKeyboardFeed.store(&callNextKeyboard);
+    originalGrabCursor.store(&callNextCursor);
+    originalReleaseCursor.store(&callNextCursor);
+    originalGetFov.store(&callNextFov);
+    originalLevelSubTick.store(&callNextLevel);
+    diagnostic("shared hooks register");
     const bool created =
-        createHook(hookTargets[0], reinterpret_cast<void*>(&onKeyboardFeed), originalKeyboardFeed) &&
-        createHook(hookTargets[1], reinterpret_cast<void*>(&onGrabCursor), originalGrabCursor) &&
-        createHook(hookTargets[2], reinterpret_cast<void*>(&onReleaseCursor), originalReleaseCursor) &&
-        createHook(hookTargets[3], reinterpret_cast<void*>(&onGetFov), originalGetFov) &&
-        createHook(hookTargets[4], reinterpret_cast<void*>(&onLevelSubTick), originalLevelSubTick);
-    diagnostic("native hooks created ", created ? 1 : 0);
-    bool queued = created;
-    if (queued) for (void* target : hookTargets)
-        queued = queued && MH_QueueEnableHook(target) == MH_OK;
-    if (!queued || MH_ApplyQueued() != MH_OK) {
-        diagnostic("native hook enable failed");
+        BDS_HookSubscribe(BDS_HOOK_KEYBOARD_FEED, reinterpret_cast<void*>(keyboard->address), keyboardMiddleware, nullptr, &hookTokens[0]) &&
+        BDS_HookSubscribe(BDS_HOOK_GRAB_CURSOR, reinterpret_cast<void*>(grab->address), cursorMiddleware, reinterpret_cast<void*>(1), &hookTokens[1]) &&
+        BDS_HookSubscribe(BDS_HOOK_RELEASE_CURSOR, reinterpret_cast<void*>(release->address), cursorMiddleware, nullptr, &hookTokens[2]) &&
+        BDS_HookSubscribe(BDS_HOOK_GET_FOV, reinterpret_cast<void*>(fov->address), fovMiddleware, nullptr, &hookTokens[3]) &&
+        BDS_HookSubscribe(BDS_HOOK_LEVEL_SUB_TICK, reinterpret_cast<void*>(levelTick->address), levelMiddleware, nullptr, &hookTokens[4]);
+    if (!created) {
+        diagnostic("shared hook registration failed");
         removeNativeHooks();
-        if (ownsMinHook) MH_Uninitialize();
-        ownsMinHook = false;
-        logger.error("Could not enable native TabList hooks");
+        logger.error("Could not subscribe TabList to the shared hook runtime");
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
-    diagnostic("native hooks enabled");
+    diagnostic("shared hooks registered");
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;
@@ -641,8 +668,6 @@ DWORD WINAPI startClient(void*) {
     if (!bedrock::gui::Overlay::install(&drawTabList, nullptr, error, options)) {
         diagnostic("overlay install failed: ", error);
         removeNativeHooks();
-        if (ownsMinHook) MH_Uninitialize();
-        ownsMinHook = false;
         logger.error("Could not install in-game renderer: ", error);
         status.store(Status::Failed, std::memory_order_release);
         return 1;
@@ -668,8 +693,6 @@ DWORD WINAPI startClient(void*) {
 
     bedrock::gui::Overlay::shutdown();
     removeNativeHooks();
-    if (ownsMinHook) MH_Uninitialize();
-    ownsMinHook = false;
     status.store(Status::Stopped, std::memory_order_release);
     return 0;
 }
