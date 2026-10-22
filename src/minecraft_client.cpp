@@ -602,7 +602,7 @@ DWORD WINAPI startClient(void*) {
         levelTick = bedrock::resolveSharedHook(resolver, "MultiPlayerLevel::_subTick", BDS_HOOK_LEVEL_SUB_TICK);
     };
     const auto valid = [](const auto& symbol) {
-        return symbol && symbol->exact_build && symbol->verified;
+        return symbol && bedrock::isUsableSharedHookResolution(*symbol);
     };
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
