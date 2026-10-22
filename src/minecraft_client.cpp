@@ -1178,16 +1178,15 @@ void updateMurderDetection(bool debug) noexcept {
 void __fastcall onLevelSubTick(void* level) {
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
-    // Refresh known Actor tags once per second on the game thread. The getter
-    // hook still updates immediately; this catches changes while labels are
-    // hidden without burdening the tab-open/render path.
+    // Poll a small Actor batch every two seconds as fallback for hidden labels;
+    // visible labels are still captured immediately by the getter hook.
     static unsigned refreshTicks = 0;
     static unsigned itemScanTicks = 0;
-    if (++refreshTicks >= 20) {
+    if (++refreshTicks >= 40) {
         refreshTicks = 0;
-        if (gameApi) (void)gameApi->refreshCachedActorNameTags(64);
+        if (gameApi) (void)gameApi->refreshCachedActorNameTags(8);
     }
-    if (++itemScanTicks >= 5) {
+    if (++itemScanTicks >= 20) {
         itemScanTicks = 0;
         const auto config = liveConfig.load(std::memory_order_acquire);
         if (config->murderDetect) updateMurderDetection(config->debug);
