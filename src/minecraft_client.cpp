@@ -120,6 +120,7 @@ std::mutex actorNameTagMutex;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
 std::unordered_set<std::string> loggedNameTags;
 std::atomic<unsigned> loggedNameTagDetections{0};
+std::atomic<bool> loggedActorNameTagCall{false};
 BDS_HookToken actorNameTagHookToken{};
 std::atomic<std::int64_t> lastActorListRefreshMs{0};
 std::atomic<bool> loggedActorListFailure{false};
@@ -283,30 +284,31 @@ const std::string& __fastcall onActorGetNameTag(void* actor) {
         rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
     }
     const auto& nameTag = reinterpret_cast<ActorGetNameTagFn>(rawOriginal)(actor);
-    const auto config = liveConfig.load(std::memory_order_acquire);
-    if (!captureActorNameTags.load(std::memory_order_acquire) || !config->sortByNameColor ||
+    if (!loggedActorNameTagCall.exchange(true, std::memory_order_acq_rel))
+        diagnostic("Actor::getNameTag called; first result length=", nameTag.size());
+    if (!captureActorNameTags.load(std::memory_order_acquire) ||
         !tabHeld.load(std::memory_order_acquire) || nameTag.empty() || nameTag.size() > 512)
         return nameTag;
 
     try {
         const auto color = tablist::minecraftNameColorOrder(nameTag);
         const auto rawName = tablist::stripMinecraftFormatting(nameTag);
-        if (color >= 16 || rawName.empty()) {
-            std::lock_guard lock(actorNameTagMutex);
-            actorNameTags.erase(actor);
-            return nameTag;
-        }
+        if (rawName.empty()) return nameTag;
         bool firstSeen = false;
         {
             std::lock_guard lock(actorNameTagMutex);
-            if (actorNameTags.size() >= 512 && !actorNameTags.contains(actor))
-                actorNameTags.erase(actorNameTags.begin());
-            actorNameTags.insert_or_assign(actor, ActorNameTagEntry{nameTag, color});
+            if (color < 16) {
+                if (actorNameTags.size() >= 512 && !actorNameTags.contains(actor))
+                    actorNameTags.erase(actorNameTags.begin());
+                actorNameTags.insert_or_assign(actor, ActorNameTagEntry{nameTag, color});
+            } else {
+                actorNameTags.erase(actor);
+            }
             firstSeen = loggedNameTags.size() < 512 && loggedNameTags.insert(nameTag).second;
         }
         if (firstSeen) {
             const auto logCount = loggedNameTagDetections.fetch_add(1, std::memory_order_acq_rel);
-            if (logCount < 64) diagnostic("nametag color detected: ", nameTag);
+            if (logCount < 64) diagnostic("Actor name captured: ", nameTag);
         }
     } catch (...) {
         // Name-tag observation is optional; preserve Minecraft's original result.
