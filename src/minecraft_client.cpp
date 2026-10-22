@@ -193,6 +193,7 @@ std::unordered_map<std::string, unsigned> observedPlayerColorOrders;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
 std::mutex murderDetectMutex;
 std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
+std::unordered_map<std::string, std::chrono::steady_clock::time_point> murderRoleExpiryByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
 std::unordered_set<std::string> loggedHeldItemIdentifiers;
 std::vector<bedrock::Actor> murderScanActors;
@@ -201,6 +202,17 @@ void* murderScanLevel = nullptr;
 std::uint64_t murderScanTick = 0;
 std::uint64_t murderActorSnapshotTick = 0;
 std::atomic<bool> loggedMurderActorReadFault{false};
+
+void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
+    for (auto it = murderRoleExpiryByPlayer.begin(); it != murderRoleExpiryByPlayer.end();) {
+        if (it->second > now) {
+            ++it;
+            continue;
+        }
+        murderRolesByPlayer.erase(it->first);
+        it = murderRoleExpiryByPlayer.erase(it);
+    }
+}
 std::size_t cachedFaceCursor = 0;
 const std::vector<PlayerRow>* cachedFaceSource = nullptr;
 std::atomic<std::shared_ptr<const std::vector<PlayerRow>>> cachedTabRows{
@@ -1253,6 +1265,7 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
         if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
         if (config->murderDetect) {
             std::lock_guard lock(murderDetectMutex);
+            pruneExpiredMurderRolesLocked(std::chrono::steady_clock::now());
             murderRoles = murderRolesByPlayer;
         }
         if (!collectRows(rows, false, config->sortByNameColor,
@@ -1389,6 +1402,8 @@ void updateMurderDetection(bool debug) noexcept {
         std::string previous;
         {
             std::lock_guard lock(murderDetectMutex);
+            const auto now = std::chrono::steady_clock::now();
+            pruneExpiredMurderRolesLocked(now);
             const auto old = lastHeldItemByPlayer.find(snapshot.name);
             changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
             if (old != lastHeldItemByPlayer.end()) previous = old->second;
@@ -1397,8 +1412,11 @@ void updateMurderDetection(bool debug) noexcept {
                 lastHeldItemByPlayer.insert_or_assign(snapshot.name, itemKey);
                 firstSeen = loggedHeldItemIdentifiers.insert(itemKey).second;
             }
-            if (role == tablist::MurderRole::None) murderRolesByPlayer.erase(snapshot.name);
-            else murderRolesByPlayer.insert_or_assign(snapshot.name, role);
+            if (role != tablist::MurderRole::None) {
+                murderRolesByPlayer.insert_or_assign(snapshot.name, role);
+                murderRoleExpiryByPlayer.insert_or_assign(
+                    snapshot.name, now + std::chrono::minutes(5));
+            }
         }
         if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
         if (debug && changed && item) {
