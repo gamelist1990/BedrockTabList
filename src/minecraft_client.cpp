@@ -159,7 +159,11 @@ std::unordered_set<std::string> loggedHeldItemIdentifiers;
 std::vector<bedrock::Actor> murderScanActors;
 std::size_t murderScanCursor = 0;
 void* murderScanLevel = nullptr;
+std::uint64_t murderScanTick = 0;
+std::uint64_t murderActorSnapshotTick = 0;
 std::atomic<bool> loggedMurderActorReadFault{false};
+std::size_t cachedFaceCursor = 0;
+const std::vector<PlayerRow>* cachedFaceSource = nullptr;
 std::atomic<std::shared_ptr<const std::vector<PlayerRow>>> cachedTabRows{
     std::make_shared<const std::vector<PlayerRow>>()};
 std::atomic<bool> loggedTabRowsReady{false};
@@ -1064,6 +1068,55 @@ bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
     }
 }
 
+bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
+    if (!level || !row || row->name.empty()) return false;
+    NativePlayerList* nativePlayers = nullptr;
+    if (!safeRead(level, levelPlayerListOffset, nativePlayers) || !nativePlayers ||
+        !readable(nativePlayers, sizeof(NativePlayerList)) || nativePlayers->size() > 512)
+        return false;
+    for (const auto& [_, entry] : *nativePlayers) {
+        const auto& nativeName = entry.name;
+        if (nativeName.empty() || nativeName.size() > 128 ||
+            !readable(nativeName.data(), nativeName.size())) continue;
+        if (tablist::stripMinecraftFormatting(nativeName) != row->name) continue;
+        return extractFace(entry, *row);
+    }
+    return false;
+}
+
+bool fillOneFaceSeh(void* level, PlayerRow* row) noexcept {
+    __try {
+        return fillOneFaceUnsafe(level, row);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void refreshOneCachedFace(const std::shared_ptr<const tablist::Config>& config) noexcept {
+    if (!config || !config->showFaces) return;
+    try {
+        auto current = cachedTabRows.load(std::memory_order_acquire);
+        if (!current || current->empty()) return;
+        if (cachedFaceSource != current.get()) {
+            cachedFaceSource = current.get();
+            cachedFaceCursor = 0;
+        }
+        for (std::size_t scanned = 0; scanned < current->size(); ++scanned) {
+            const auto index = cachedFaceCursor++ % current->size();
+            if ((*current)[index].hasFace) continue;
+            auto updated = std::make_shared<std::vector<PlayerRow>>(*current);
+            if (!fillOneFaceSeh(levelInstance.load(std::memory_order_acquire),
+                                &(*updated)[index])) return;
+            cachedTabRows.store(
+                std::shared_ptr<const std::vector<PlayerRow>>(std::move(updated)),
+                std::memory_order_release);
+            return; // Exactly one native skin/face read per game tick.
+        }
+    } catch (...) {
+        // Face extraction is optional; leave the cached row unchanged on error.
+    }
+}
+
 void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) noexcept {
     if (!config || !config->enabled) return;
     try {
@@ -1075,9 +1128,20 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
             std::lock_guard lock(murderDetectMutex);
             murderRoles = murderRolesByPlayer;
         }
-        if (!collectRows(rows, config->showFaces, config->sortByNameColor,
+        if (!collectRows(rows, false, config->sortByNameColor,
                          config->murderDetect, murderRoles, actorTags)) {
             return; // Keep the previous immutable snapshot on a transient read failure.
+        }
+        const auto previous = cachedTabRows.load(std::memory_order_acquire);
+        if (config->showFaces && previous) {
+            for (auto& row : rows) {
+                const auto old = std::find_if(previous->begin(), previous->end(),
+                    [&](const PlayerRow& candidate) { return candidate.name == row.name; });
+                if (old != previous->end() && old->hasFace) {
+                    row.face = old->face;
+                    row.hasFace = true;
+                }
+            }
         }
         auto snapshot = std::make_shared<const std::vector<PlayerRow>>(std::move(rows));
         cachedTabRows.store(std::move(snapshot), std::memory_order_release);
@@ -1159,12 +1223,18 @@ void updateMurderDetection(bool debug) noexcept {
             murderScanActors.clear();
             murderScanCursor = 0;
             murderScanLevel = level;
+            murderScanTick = 0;
+            murderActorSnapshotTick = 0;
         }
-        if (murderScanCursor >= murderScanActors.size()) {
+        ++murderScanTick;
+        if (murderActorSnapshotTick == 0 ||
+            murderScanTick - murderActorSnapshotTick >= 100) {
             murderScanActors = gameApi->actors(level);
             murderScanCursor = 0;
+            murderActorSnapshotTick = murderScanTick;
         }
         if (murderScanActors.empty()) return;
+        if (murderScanCursor >= murderScanActors.size()) murderScanCursor = 0;
 
         const auto& actor = murderScanActors[murderScanCursor++];
         ActorMurderSnapshot snapshot;
@@ -1226,9 +1296,10 @@ void __fastcall onLevelSubTick(void* level) {
         if (gameApi) (void)gameApi->refreshCachedActorNameTags(1);
     }
     const auto config = liveConfig.load(std::memory_order_acquire);
+    refreshOneCachedFace(config);
     if (config->murderDetect) updateMurderDetection(config->debug);
     static unsigned rowsCacheTicks = 0;
-    if (++rowsCacheTicks >= 40) {
+    if (++rowsCacheTicks >= 20) {
         rowsCacheTicks = 0;
         refreshTabRowsCache(config);
     }
