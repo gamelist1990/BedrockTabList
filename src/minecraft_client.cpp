@@ -114,7 +114,7 @@ std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
-std::atomic<std::size_t> runtimeActorListVtableSlot{0};
+std::atomic<void*> runtimeActorListFunction{nullptr};
 struct ActorNameTagEntry {
     std::string nameTag;
     unsigned colorOrder = 16;
@@ -287,18 +287,13 @@ bool executable(const void* pointer) noexcept {
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
-// Keep native vtable dispatch inside a tiny SEH boundary with no owning C++
-// objects on its stack. This protects the caller's vector if a profile is bad.
-bool invokeRuntimeActorList(void* level, std::size_t slot,
+// Keep native dispatch inside a tiny SEH boundary with no owning C++ objects
+// on its stack. The candidate signature is only usable on an exact build.
+bool invokeRuntimeActorList(void* level, void* function,
                             std::vector<void*>* actors) noexcept {
-    void** vtable = nullptr;
-    void* target = nullptr;
-    if (!safeRead(level, 0, vtable) || !vtable ||
-        slot > (std::numeric_limits<std::size_t>::max() / sizeof(void*)) ||
-        !safeRead(vtable, slot * sizeof(void*), target) || !executable(target))
-        return false;
+    if (!level || !actors || !readable(level, sizeof(void*)) || !executable(function)) return false;
     __try {
-        reinterpret_cast<RuntimeActorListFn>(target)(level, actors);
+        reinterpret_cast<RuntimeActorListFn>(function)(level, actors);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -329,14 +324,14 @@ bool copyActorNameTag(void* actor, std::string* output) {
 }
 
 void updateRuntimeActorNameTags(void* level) {
-    const auto slot = runtimeActorListVtableSlot.load(std::memory_order_acquire);
-    if (!slot || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
+    auto* function = runtimeActorListFunction.load(std::memory_order_acquire);
+    if (!function || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
     std::vector<void*> actors;
-    if (!invokeRuntimeActorList(level, slot, &actors) || actors.size() > 4096 ||
+    if (!invokeRuntimeActorList(level, function, &actors) || actors.size() > 4096 ||
         (actors.size() && !readable(actors.data(), actors.size() * sizeof(void*)))) {
-        runtimeActorListVtableSlot.store(0, std::memory_order_release);
+        runtimeActorListFunction.store(nullptr, std::memory_order_release);
         if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
-            diagnostic("Level::getRuntimeActorList call failed; actor color sort inactive");
+            diagnostic("Level::getRuntimeActorList signature call failed; actor color sort inactive");
         return;
     }
 
@@ -717,7 +712,7 @@ void removeNativeHooks() noexcept {
     originalGetFov.store(nullptr);
     originalLevelSubTick.store(nullptr);
     originalActorGetNameTag.store(nullptr, std::memory_order_release);
-    runtimeActorListVtableSlot.store(0, std::memory_order_release);
+    runtimeActorListFunction.store(nullptr, std::memory_order_release);
     gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
     levelInstance.store(nullptr);
@@ -788,14 +783,13 @@ DWORD WINAPI startClient(void*) {
         return symbol && bedrock::isUsableSharedHookResolution(*symbol);
     };
     std::optional<bedrock::Resolution> actorNameTag;
-    std::optional<std::size_t> actorListSlot;
-    std::string actorListSlotSource = "remote-profile";
+    std::optional<bedrock::Resolution> actorListFunction;
     const auto resolveActorNameTag = [&] {
         actorNameTag = resolver.resolve("Actor::getNameTag", true);
         if (actorNameTag &&
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
-        actorListSlot = resolver.resolveVirtualSlot("Level::getRuntimeActorList", true);
+        actorListFunction = resolver.resolve("Level::getRuntimeActorList", true);
     };
     resolveActorNameTag();
     const auto requirementsMet = [&] {
@@ -828,7 +822,7 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag || !actorListSlot) {
+    if (!actorNameTag || !actorListFunction) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -840,10 +834,8 @@ DWORD WINAPI startClient(void*) {
                     (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
                     actorNameTag.reset();
             }
-            if (!actorListSlot) {
-                actorListSlot = embeddedResolver.resolveVirtualSlot(
-                    "Level::getRuntimeActorList", true);
-                if (actorListSlot) actorListSlotSource = "embedded-exact-build-candidate";
+            if (!actorListFunction) {
+                actorListFunction = embeddedResolver.resolve("Level::getRuntimeActorList", true);
             }
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
@@ -885,17 +877,19 @@ DWORD WINAPI startClient(void*) {
                                       std::memory_order_release);
     else
         originalActorGetNameTag.store(nullptr, std::memory_order_release);
-    if (actorListSlot && actorNameTag) {
-        runtimeActorListVtableSlot.store(*actorListSlot, std::memory_order_release);
+    if (actorListFunction && actorNameTag) {
+        runtimeActorListFunction.store(reinterpret_cast<void*>(actorListFunction->address),
+                                       std::memory_order_release);
     } else {
-        runtimeActorListVtableSlot.store(0, std::memory_order_release);
+        runtimeActorListFunction.store(nullptr, std::memory_order_release);
     }
     diagnostic("world Actor source: runtimeActorList=",
-               actorListSlot && actorNameTag ? "available" : "unavailable",
+               actorListFunction && actorNameTag ? "available" : "unavailable",
                " Actor::getNameTag=", actorNameTag ? "available" : "missing");
-    if (runtimeActorListVtableSlot.load(std::memory_order_acquire))
-        diagnostic("world Actor list ready [slot=", *actorListSlot,
-                   " source=", actorListSlotSource, "]");
+    if (runtimeActorListFunction.load(std::memory_order_acquire))
+        diagnostic("world Actor list ready [method=", actorListFunction->method,
+                   " exact_build=", actorListFunction->exact_build,
+                   " verified=", actorListFunction->verified, "]");
     else
         diagnostic("world Actor list unavailable; color sorting cannot collect Actor names");
 
