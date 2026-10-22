@@ -123,7 +123,9 @@ std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
 std::atomic<void*> runtimeActorListFunction{nullptr};
+std::atomic<void*> resolvedRuntimeActorListFunction{nullptr};
 std::atomic<int> runtimeActorPointerOffset{-1};
+std::atomic<int> runtimeActorReceiverAdjustment{std::numeric_limits<int>::min()};
 struct ActorNameTagEntry {
     std::string nameTag;
     unsigned colorOrder = 16;
@@ -138,6 +140,7 @@ std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorListRefreshMs{0};
 std::atomic<bool> loggedActorListFailure{false};
 std::atomic<bool> loggedActorListSuccess{false};
+std::atomic<bool> loggedActorReceiverAdjustment{false};
 std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
     std::make_shared<const tablist::Config>()};
 std::array<BDS_HookToken, 5> hookTokens{};
@@ -284,8 +287,13 @@ void recordLevel(void* level) noexcept {
         loggedNameTagDetections.store(0, std::memory_order_release);
         lastActorListRefreshMs.store(0, std::memory_order_release);
         runtimeActorPointerOffset.store(-1, std::memory_order_release);
+        runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(), std::memory_order_release);
+        runtimeActorListFunction.store(
+            resolvedRuntimeActorListFunction.load(std::memory_order_acquire),
+            std::memory_order_release);
         loggedActorListFailure.store(false, std::memory_order_release);
         loggedActorListSuccess.store(false, std::memory_order_release);
+        loggedActorReceiverAdjustment.store(false, std::memory_order_release);
         diagnostic("level ready");
     }
 }
@@ -300,6 +308,86 @@ bool executable(const void* pointer) noexcept {
 }
 
 bool copyActorNameTag(void* actor, std::string* output);
+
+struct RuntimeActorReceiverProbe {
+    void* receiver{};
+    std::ptrdiff_t adjustment{};
+    std::uintptr_t begin{};
+    std::uintptr_t end{};
+    std::uintptr_t capacity{};
+    std::size_t count{};
+    unsigned score{};
+};
+
+std::optional<RuntimeActorReceiverProbe> probeRuntimeActorReceiver(
+    void* level, std::ptrdiff_t adjustment) noexcept {
+    const auto levelAddress = reinterpret_cast<std::uintptr_t>(level);
+    const auto receiverAddress = adjustment < 0
+        ? levelAddress - static_cast<std::uintptr_t>(-adjustment)
+        : levelAddress + static_cast<std::uintptr_t>(adjustment);
+    if ((adjustment < 0 && receiverAddress > levelAddress) ||
+        (adjustment >= 0 && receiverAddress < levelAddress)) return std::nullopt;
+    auto* receiver = reinterpret_cast<void*>(receiverAddress);
+    const auto managerAddress = receiverAddress + 0x2E8;
+    if (managerAddress < receiverAddress) return std::nullopt;
+
+    RuntimeActorReceiverProbe probe{};
+    probe.receiver = receiver;
+    probe.adjustment = adjustment;
+    if (!safeRead(reinterpret_cast<void*>(managerAddress), 0x1A0, probe.begin) ||
+        !safeRead(reinterpret_cast<void*>(managerAddress), 0x1A8, probe.end) ||
+        !safeRead(reinterpret_cast<void*>(managerAddress), 0x1B0, probe.capacity))
+        return std::nullopt;
+    if (!probe.begin || probe.end < probe.begin || probe.capacity < probe.end ||
+        (probe.begin & (alignof(void*) - 1)) != 0) return std::nullopt;
+    const auto bytes = probe.end - probe.begin;
+    const auto capacityBytes = probe.capacity - probe.begin;
+    if (bytes == 0 || bytes % sizeof(RuntimeActorRecord) != 0 ||
+        capacityBytes % sizeof(RuntimeActorRecord) != 0 ||
+        bytes > 4096 * sizeof(RuntimeActorRecord) ||
+        capacityBytes > 4096 * sizeof(RuntimeActorRecord) ||
+        !readable(reinterpret_cast<const void*>(probe.begin), bytes)) return std::nullopt;
+    probe.count = bytes / sizeof(RuntimeActorRecord);
+
+    // Ghidra shows the helper entering a Windows critical section at
+    // receiver + 0x370. Reject offsets whose adjacent bytes do not resemble
+    // an initialized CRITICAL_SECTION before allowing the native call.
+    const auto lockAddress = managerAddress + 0x88;
+    std::uintptr_t debugInfo = 0, owner = 0, semaphore = 0, spinCount = 0;
+    std::int32_t lockCount = 0, recursionCount = 0;
+    if (lockAddress < managerAddress ||
+        !safeRead(reinterpret_cast<void*>(lockAddress), 0, debugInfo) ||
+        !safeRead(reinterpret_cast<void*>(lockAddress), 8, lockCount) ||
+        !safeRead(reinterpret_cast<void*>(lockAddress), 12, recursionCount) ||
+        !safeRead(reinterpret_cast<void*>(lockAddress), 16, owner) ||
+        !safeRead(reinterpret_cast<void*>(lockAddress), 24, semaphore) ||
+        !safeRead(reinterpret_cast<void*>(lockAddress), 32, spinCount)) return std::nullopt;
+    if (lockCount < -1 || lockCount > 4096 || recursionCount < 0 ||
+        recursionCount > 1024 || owner > UINT32_MAX || spinCount > 0x7FFFFFFFu)
+        return std::nullopt;
+    probe.score = 1;
+    if (debugInfo && readable(reinterpret_cast<const void*>(debugInfo), sizeof(void*)))
+        probe.score += 2;
+    if (semaphore == 0 || readable(reinterpret_cast<const void*>(semaphore), sizeof(void*)))
+        ++probe.score;
+    return probe;
+}
+
+std::optional<RuntimeActorReceiverProbe> findRuntimeActorReceiver(void* level) noexcept {
+    std::optional<RuntimeActorReceiverProbe> best;
+    bool ambiguous = false;
+    for (std::ptrdiff_t adjustment = -0x200; adjustment <= 0x200; adjustment += 8) {
+        auto candidate = probeRuntimeActorReceiver(level, adjustment);
+        if (!candidate) continue;
+        if (!best || candidate->score > best->score) {
+            best = std::move(candidate);
+            ambiguous = false;
+        } else if (candidate->score == best->score) {
+            ambiguous = true;
+        }
+    }
+    return ambiguous ? std::nullopt : best;
+}
 
 int captureRuntimeActorException(EXCEPTION_POINTERS* exception,
                                  unsigned long* exceptionCode,
@@ -401,13 +489,31 @@ bool copyActorNameTag(void* actor, std::string* output) {
 void updateRuntimeActorNameTags(void* level) {
     auto* function = runtimeActorListFunction.load(std::memory_order_acquire);
     if (!function || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
+    const auto cachedAdjustment = runtimeActorReceiverAdjustment.load(std::memory_order_acquire);
+    auto receiver = cachedAdjustment == std::numeric_limits<int>::min()
+        ? findRuntimeActorReceiver(level)
+        : probeRuntimeActorReceiver(level, cachedAdjustment);
+    if (!receiver) {
+        runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(),
+                                             std::memory_order_release);
+        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
+            diagnostic("runtime Actor receiver validation failed; no unique Level adjustment has a valid lock and 0x40-byte actor vector; color sort inactive");
+        return;
+    }
+    runtimeActorReceiverAdjustment.store(static_cast<int>(receiver->adjustment),
+                                         std::memory_order_release);
+    if (receiver->adjustment != 0 &&
+        !loggedActorReceiverAdjustment.exchange(true, std::memory_order_acq_rel))
+        diagnostic("runtime Actor receiver adjustment=0x", std::hex,
+                   receiver->adjustment, std::dec, "; preflight records=", receiver->count);
     std::vector<RuntimeActorRecord> actors;
     unsigned long exceptionCode = 0;
     std::uintptr_t exceptionAddress = 0;
-    if (!invokeRuntimeActorList(level, function, &actors, &exceptionCode, &exceptionAddress)) {
+    if (!invokeRuntimeActorList(receiver->receiver, function, &actors,
+                                &exceptionCode, &exceptionAddress)) {
         runtimeActorListFunction.store(nullptr, std::memory_order_release);
         if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel)) {
-            const auto levelAddress = reinterpret_cast<std::uintptr_t>(level);
+            const auto levelAddress = reinterpret_cast<std::uintptr_t>(receiver->receiver);
             const auto managerAddress = levelAddress + 0x2E8;
             const auto lockAddress = managerAddress + 0x88;
             std::array<std::uintptr_t, 3> actorVector{};
@@ -1001,9 +1107,11 @@ DWORD WINAPI startClient(void*) {
     else
         originalActorGetNameTag.store(nullptr, std::memory_order_release);
     if (actorListFunction && actorNameTag) {
-        runtimeActorListFunction.store(reinterpret_cast<void*>(actorListFunction->address),
-                                       std::memory_order_release);
+        auto* actorListAddress = reinterpret_cast<void*>(actorListFunction->address);
+        resolvedRuntimeActorListFunction.store(actorListAddress, std::memory_order_release);
+        runtimeActorListFunction.store(actorListAddress, std::memory_order_release);
     } else {
+        resolvedRuntimeActorListFunction.store(nullptr, std::memory_order_release);
         runtimeActorListFunction.store(nullptr, std::memory_order_release);
     }
     diagnostic("world Actor source: runtimeActorList=",
