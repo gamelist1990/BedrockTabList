@@ -65,6 +65,7 @@ ctest --test-dir build -C Release --output-on-failure
 DLLローダーからロードしてください。SDK依存はデフォルトで `main` を使用するため、
 通常ビルドではBedrockDynamicSDKの最新版を取得します。
 
-対象Minecraft実行ファイルのハッシュがSDKプロファイルと一致しない場合、ゲーム内部の
-レイアウトを読み取らず安全に起動を中止します。
+起動時にはSDKのGitHub `main` からmanifestと実行中Minecraftに対応するバージョン別JSONを
+取得します。対象Minecraft実行ファイルのハッシュがプロファイルと一致しない場合、ゲーム
+内部のレイアウトを読み取らず安全に起動を中止します。
 

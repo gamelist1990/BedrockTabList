@@ -6,9 +6,9 @@
 #include <shlobj.h>
 
 #include <MinHook.h>
-#include <bedrock/generated_symbols.hpp>
 #include <bedrock/gui_overlay.hpp>
 #include <bedrock/logger.hpp>
+#include <bedrock/remote_catalog.hpp>
 #include <bedrock/resolver.hpp>
 #include <imgui.h>
 #include "tablist/config.hpp"
@@ -494,13 +494,22 @@ DWORD WINAPI startClient(void*) {
     diagnosticLog.open(path.parent_path() / L"TabList.log",
                        std::ios::binary | std::ios::trunc);
     diagnostic("BedrockTabList starting");
+    bedrock::ProfileChoice version;
+    std::string profile;
+    if (!bedrock::fetchSupportedProfile(profile, version, error)) {
+        logger.error("Unsupported Minecraft build or profile download failed: ", error);
+        diagnostic("Version profile unavailable: ", error);
+        status.store(Status::Failed, std::memory_order_release);
+        return 1;
+    }
     bedrock::Resolver resolver;
-    if (!resolver.loadJson(bedrock::generated::kSymbolDatabase, error) ||
+    if (!resolver.loadJson(profile, error) ||
         !resolver.attachWindowsMainModule(error) || !resolver.exactBuild()) {
         logger.error("Unsupported Minecraft executable: ", error);
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
+    diagnostic("Runtime profile active: Minecraft ", version.version);
     const auto keyboard = resolver.resolve("Keyboard::feed");
     const auto grab = resolver.resolve("ClientInstance::grabCursor", true);
     const auto release = resolver.resolve("ClientInstance::releaseCursor", true);
