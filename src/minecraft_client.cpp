@@ -122,6 +122,8 @@ std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
+std::atomic<void*> resolvedActorGetNameTag{nullptr};
+BDS_HookToken actorNameTagHookToken{};
 std::atomic<void*> runtimeActorListFunction{nullptr};
 std::atomic<void*> resolvedRuntimeActorListFunction{nullptr};
 std::atomic<int> runtimeActorPointerOffset{-1};
@@ -481,6 +483,45 @@ bool getActorNameTagView(void* actor, const char** data, std::size_t* size) noex
     }
 }
 
+void captureQueriedActorNameTag(void* actor, const std::string& nameTag) noexcept {
+    if (!actor || nameTag.empty() || nameTag.size() > 512 ||
+        tablist::stripMinecraftFormatting(nameTag).empty()) return;
+    try {
+        const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        bool logName = false;
+        {
+            std::lock_guard lock(actorNameTagMutex);
+            const auto existing = actorNameTags.find(actor);
+            if (existing != actorNameTags.end() && existing->second.nameTag == nameTag) {
+                existing->second.sequence = sequence;
+                return;
+            }
+            if (!actorNameTags.contains(actor) && actorNameTags.size() >= 4096)
+                actorNameTags.clear();
+            const auto color = tablist::minecraftNameColorOrder(nameTag);
+            actorNameTags.insert_or_assign(actor,
+                ActorNameTagEntry{nameTag, color, sequence});
+            if (loggedNameTags.size() < 512 && loggedNameTags.insert(nameTag).second) {
+                const auto count = loggedNameTagDetections.fetch_add(1, std::memory_order_acq_rel);
+                logName = count < 64;
+            }
+        }
+        if (logName) diagnostic("Actor name captured: ", nameTag);
+    } catch (...) {
+        // Never allow diagnostics/cache allocation failures to escape into
+        // Minecraft's native Actor::getNameTag call.
+    }
+}
+
+const std::string& __fastcall actorGetNameTagDetour(void* actor) {
+    static const std::string unavailable;
+    auto* rawFunction = originalActorGetNameTag.load(std::memory_order_acquire);
+    if (!actor || !rawFunction) return unavailable;
+    const auto& nameTag = reinterpret_cast<ActorGetNameTagFn>(rawFunction)(actor);
+    captureQueriedActorNameTag(actor, nameTag);
+    return nameTag;
+}
+
 bool copyActorNameTag(void* actor, std::string* output) {
     const char* data = nullptr;
     std::size_t size = 0;
@@ -778,13 +819,6 @@ float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
 void __fastcall onLevelSubTick(void* level) {
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
-    const auto config = liveConfig.load(std::memory_order_acquire);
-    if (!config->sortByNameColor || !tabHeld.load(std::memory_order_acquire)) return;
-    const auto now = steadyMilliseconds();
-    const auto last = lastActorListRefreshMs.load(std::memory_order_acquire);
-    if (now - last < 250) return;
-    lastActorListRefreshMs.store(now, std::memory_order_release);
-    updateRuntimeActorNameTags(level);
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
@@ -962,6 +996,10 @@ bool loadConfig(const std::filesystem::path& path, bedrock::Logger& logger) {
 }
 
 void removeNativeHooks() noexcept {
+    if (actorNameTagHookToken) {
+        BDS_HookDirectRemove(actorNameTagHookToken);
+        actorNameTagHookToken = nullptr;
+    }
     for (auto& token : hookTokens) {
         if (token) BDS_HookUnsubscribe(token);
         token = nullptr;
@@ -972,6 +1010,7 @@ void removeNativeHooks() noexcept {
     originalGetFov.store(nullptr);
     originalLevelSubTick.store(nullptr);
     originalActorGetNameTag.store(nullptr, std::memory_order_release);
+    resolvedActorGetNameTag.store(nullptr, std::memory_order_release);
     runtimeActorListFunction.store(nullptr, std::memory_order_release);
     gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
@@ -1043,13 +1082,11 @@ DWORD WINAPI startClient(void*) {
         return symbol && bedrock::isUsableSharedHookResolution(*symbol);
     };
     std::optional<bedrock::Resolution> actorNameTag;
-    std::optional<bedrock::Resolution> actorListFunction;
     const auto resolveActorNameTag = [&] {
         actorNameTag = resolver.resolve("Actor::getNameTag", true);
         if (actorNameTag &&
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
-        actorListFunction = resolver.resolve("Level::getRuntimeActorList", true);
     };
     resolveActorNameTag();
     const auto requirementsMet = [&] {
@@ -1082,7 +1119,7 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag || !actorListFunction) {
+    if (!actorNameTag) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -1093,9 +1130,6 @@ DWORD WINAPI startClient(void*) {
                 if (actorNameTag &&
                     (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
                     actorNameTag.reset();
-            }
-            if (!actorListFunction) {
-                actorListFunction = embeddedResolver.resolve("Level::getRuntimeActorList", true);
             }
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
@@ -1132,28 +1166,30 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("shared hooks registered");
 
-    if (actorNameTag)
-        originalActorGetNameTag.store(reinterpret_cast<void*>(actorNameTag->address),
-                                      std::memory_order_release);
-    else
-        originalActorGetNameTag.store(nullptr, std::memory_order_release);
-    if (actorListFunction && actorNameTag) {
-        auto* actorListAddress = reinterpret_cast<void*>(actorListFunction->address);
-        resolvedRuntimeActorListFunction.store(actorListAddress, std::memory_order_release);
-        runtimeActorListFunction.store(actorListAddress, std::memory_order_release);
-    } else {
-        resolvedRuntimeActorListFunction.store(nullptr, std::memory_order_release);
-        runtimeActorListFunction.store(nullptr, std::memory_order_release);
+    bool actorNameTagHookReady = false;
+    if (actorNameTag) {
+        auto* target = reinterpret_cast<void*>(actorNameTag->address);
+        resolvedActorGetNameTag.store(target, std::memory_order_release);
+        void* trampoline = nullptr;
+        actorNameTagHookReady = BDS_HookDirectInstall(
+            target, reinterpret_cast<void*>(&actorGetNameTagDetour), &trampoline,
+            &actorNameTagHookToken) != 0 && trampoline != nullptr;
+        if (actorNameTagHookReady) {
+            originalActorGetNameTag.store(trampoline, std::memory_order_release);
+            diagnostic("Actor::getNameTag capture hook active; method=", actorNameTag->method,
+                       " exact_build=", actorNameTag->exact_build,
+                       " verified=", actorNameTag->verified);
+        } else {
+            actorNameTagHookToken = nullptr;
+            originalActorGetNameTag.store(nullptr, std::memory_order_release);
+            diagnostic("Actor::getNameTag capture hook unavailable; color sort has no live Actor source");
+        }
     }
-    diagnostic("world Actor source: runtimeActorList=",
-               actorListFunction && actorNameTag ? "available" : "unavailable",
-               " Actor::getNameTag=", actorNameTag ? "available" : "missing");
-    if (runtimeActorListFunction.load(std::memory_order_acquire))
-        diagnostic("world Actor list ready [method=", actorListFunction->method,
-                   " exact_build=", actorListFunction->exact_build,
-                   " verified=", actorListFunction->verified, "]");
-    else
-        diagnostic("world Actor list unavailable; color sorting cannot collect Actor names");
+    runtimeActorListFunction.store(nullptr, std::memory_order_release);
+    resolvedRuntimeActorListFunction.store(nullptr, std::memory_order_release);
+    diagnostic("world Actor source: dynamic-nameTag-hook=",
+               actorNameTagHookReady ? "active" : "unavailable",
+               " runtimeActorList=disabled");
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;
