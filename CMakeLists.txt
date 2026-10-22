@@ -35,6 +35,7 @@ if(WIN32)
         GIT_REPOSITORY https://github.com/skypjack/entt.git
         GIT_TAG fe8d7d78c4823e8a66a050bf86f5c6318cf76ce7
         GIT_SHALLOW FALSE
+        GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(entt)
     add_library(BedrockTabList SHARED src/minecraft_client.cpp)

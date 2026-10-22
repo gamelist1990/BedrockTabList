@@ -12,7 +12,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - 画面上部中央に、半透明の背景・人数・プレイヤー名を表示
 - Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
-- `Actor::getHeldItem()` を通じ、Actorの `ActorEquipmentComponent.handContainer` にある手持ち枠1件だけからMurderDetectの役割を表示（弓・矢=Sheriff/水色、鉄剣=Murderer/赤）。Player hotbar/Inventory全体は列挙しない
+- SDKの `Actor::getMainHand()` で取得した装備スナップショットからMurderDetectの役割を表示（弓・矢=Sheriff/水色、鉄剣=Murderer/赤）
 - MurderDetectはTab表示前からゲームtickあたりActorを1件ずつ読み、役割キャッシュを準備（Minecraftオブジェクトのネイティブ読み取りは安全のためゲームスレッド上で実行）
 - Actorの装備コンポーネント／手持ち枠の読み取りで例外が出た対象はスキップし、後続Actorの走査を継続
 - TabListの行・色・役割はゲーム更新中に1秒間隔でキャッシュを作り直し、顔画像はtickごとに1人ずつ追加。Tab表示時はキャッシュだけを描画

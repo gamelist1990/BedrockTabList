@@ -13,6 +13,7 @@
 #include <bedrock/generated_symbols.hpp>
 #include <bedrock/game_api.hpp>
 #include <bedrock/game_hooks.hpp>
+#include <bedrock/native_items.hpp>
 #include <imgui.h>
 #include <entt/entt.hpp>
 #include "tablist/config.hpp"
@@ -112,15 +113,6 @@ constexpr std::size_t sessionReadyOffset = 0x28;
 constexpr std::size_t sessionLevelControlOffset = 0x30;
 constexpr std::size_t sessionLevelOffset = 0x40;
 constexpr std::size_t levelPlayerListOffset = 0x4E0;
-// Actor embeds EntityContext at +0x8; its registry reference and entity ID
-// occupy +0x10 and +0x18 respectively (Latite's pinned Bedrock ECS layout).
-constexpr std::size_t actorEntityRegistryOffset = 0x10;
-constexpr std::size_t actorEntityIdOffset = 0x18;
-constexpr std::size_t inventoryGetItemVtableSlot = 7;
-constexpr int actorMainHandSlot = 0;
-constexpr std::size_t itemStackItemPointerOffset = 0x08;
-constexpr std::size_t itemStackCountOffset = 0x22;
-constexpr std::size_t itemNamespacedIdStringOffset = 0x128;
 constexpr int tabInputKey = 0x09;
 constexpr int tabInputKeyGlfw = 258;
 
@@ -219,17 +211,23 @@ std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorNamePollMs{0};
 std::atomic<std::size_t> actorNamePollCursor{0};
 bool copyActorNameTag(void* actor, std::string* output);
+std::optional<bedrock::NativeItemLayout> nativeItemLayout;
 class TabListGameAccess final : public bedrock::GameAccess {
 public:
     bool isActorValid(void* actor) const noexcept override;
-    void* localPlayer() const noexcept override { return nullptr; }
+    void* localPlayer() const noexcept override;
     void* worldOf(void* actor) const noexcept override;
     std::optional<std::string> nameTag(void* actor) const override {
         std::string result;
         return copyActorNameTag(actor, &result) ? std::optional<std::string>{std::move(result)}
                                                : std::nullopt;
     }
-    std::optional<bedrock::HeldItemInfo> heldItem(void* actor) const override;
+    std::optional<bedrock::ItemStack> equipmentItem(
+        void* actor, bedrock::EquipmentSlot slot) const override;
+    std::size_t localInventorySize(void* player) const override;
+    std::optional<bedrock::ItemStack> localInventoryItem(
+        void* player, std::size_t slot) const override;
+    std::optional<std::size_t> selectedHotbarSlot(void* player) const override;
     std::vector<std::string> playerListNames(void* world) const override;
     std::optional<bedrock::ServerAddress> serverAddress(void* player) const override {
         (void)player;
@@ -336,13 +334,16 @@ bool safeCopyBytes(const char* source, char* destination, std::size_t size) noex
 }
 
 bool copyNativeString(const void* object, std::string& output,
-                      std::size_t maximum = 256) noexcept {
+                      const bedrock::NativeItemLayout& layout,
+                      std::size_t maximum) noexcept {
     if (!object) return false;
     std::uintptr_t data = 0;
     std::size_t size = 0;
     std::size_t capacity = 0;
-    if (!safeRead(object, 0, data) || !safeRead(object, 0x10, size) ||
-        !safeRead(object, 0x18, capacity) || size > maximum || capacity < size)
+    if (!safeRead(object, 0, data) ||
+        !safeRead(object, layout.itemStringSizeOffset, size) ||
+        !safeRead(object, layout.itemStringCapacityOffset, capacity) ||
+        size > maximum || capacity < size)
         return false;
     if (size == 0) { output.clear(); return true; }
     const auto* bytes = capacity <= 15
@@ -359,36 +360,20 @@ bool copyNativeString(const void* object, std::string& output,
     }
 }
 
-void* callHandContainerGetItem(void* handContainer, int handSlot) noexcept {
-    if (!handContainer || handSlot != actorMainHandSlot) return nullptr;
+void* callInventoryGetItem(void* inventory, std::size_t slot,
+                           const bedrock::NativeItemLayout& layout) noexcept {
+    if (!inventory || slot >= layout.localInventorySlots) return nullptr;
     void** vtable = nullptr;
-    if (!safeRead(handContainer, 0, vtable) || !vtable ||
-        !readable(vtable, sizeof(void*) * (inventoryGetItemVtableSlot + 1))) return nullptr;
+    if (!safeRead(inventory, 0, vtable) || !vtable ||
+        !readable(vtable, sizeof(void*) * (layout.inventoryGetItemVtableSlot + 1))) return nullptr;
     void* target = nullptr;
-    if (!safeRead(vtable, sizeof(void*) * inventoryGetItemVtableSlot, target) ||
+    if (!safeRead(vtable, sizeof(void*) * layout.inventoryGetItemVtableSlot, target) ||
         !executable(target)) return nullptr;
     using GetItemFn = void*(__fastcall*)(void*, int);
     __try {
-        return reinterpret_cast<GetItemFn>(target)(handContainer, handSlot);
+        return reinterpret_cast<GetItemFn>(target)(inventory, static_cast<int>(slot));
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
-    }
-}
-
-bool getActorHandContainerSeh(void* registry, std::uint32_t rawEntityId,
-                              void** output) noexcept {
-    if (!registry || !output) return false;
-    __try {
-        using Registry = entt::basic_registry<tablist_native::EntityId>;
-        auto* components = static_cast<Registry*>(registry)->try_get<
-            tablist_native::ActorEquipmentComponent>(
-                tablist_native::EntityId{rawEntityId});
-        if (!components) return false;
-        *output = components->handContainer;
-        return *output != nullptr;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        *output = nullptr;
-        return false;
     }
 }
 
@@ -601,48 +586,135 @@ bool TabListGameAccess::isActorValid(void* actor) const noexcept {
     return looksLikeActor(actor);
 }
 
-std::optional<bedrock::HeldItemInfo> TabListGameAccess::heldItem(void* actor) const {
-    if (!isActorValid(actor)) return std::nullopt;
+bool readActorEquipment(void* actor, const bedrock::NativeItemLayout& layout,
+                        tablist_native::ActorEquipmentComponent** output) noexcept {
+    if (output) *output = nullptr;
+    if (!actor || !output) return false;
     void* registry = nullptr;
-    std::uint32_t entityId = 0;
-    if (!safeRead(actor, actorEntityRegistryOffset, registry) || !registry ||
-        !safeRead(actor, actorEntityIdOffset, entityId) ||
-        !readable(registry, sizeof(void*)))
-        return std::nullopt;
+    std::uint32_t rawId = 0;
+    const auto base = layout.actorEntityContextOffset;
+    if (!safeRead(actor, base + layout.contextEnttRegistryOffset, registry) ||
+        !safeRead(actor, base + layout.contextEntityIdOffset, rawId) || !registry ||
+        !readable(registry, sizeof(void*))) return false;
+    __try {
+        auto* typed = static_cast<entt::basic_registry<tablist_native::EntityId>*>(registry);
+        auto* storage = typed->storage(layout.equipmentComponentHash);
+        if (!storage) return false;
+        const auto entity = tablist_native::EntityId{rawId};
+        if (!storage->contains(entity)) return false;
+        *output = static_cast<tablist_native::ActorEquipmentComponent*>(storage->value(entity));
+        return *output != nullptr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        *output = nullptr;
+        return false;
+    }
+}
 
-    void* handContainer = nullptr;
-    if (!getActorHandContainerSeh(registry, entityId, &handContainer) || !handContainer)
-        return std::nullopt;
+void* TabListGameAccess::localPlayer() const noexcept {
+    if (!nativeItemLayout) return nullptr;
+    void* client = clientInstance.load(std::memory_order_acquire);
+    void** vtable = nullptr;
+    if (!client || !safeRead(client, 0, vtable) || !vtable ||
+        !readable(vtable, sizeof(void*) * (nativeItemLayout->localPlayerVtableSlot + 1)))
+        return nullptr;
+    void* target = nullptr;
+    if (!safeRead(vtable, sizeof(void*) * nativeItemLayout->localPlayerVtableSlot, target) ||
+        !executable(target)) return nullptr;
+    using GetLocalPlayerFn = void*(__fastcall*)(void*);
+    __try {
+        void* player = reinterpret_cast<GetLocalPlayerFn>(target)(client);
+        return looksLikeActor(player) ? player : nullptr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
 
-    // ActorEquipmentComponent::handContainer is the replicated equipment API.
-    // Read exactly its main-hand slot; never walk PlayerSupplies or the
-    // player's hotbar/full inventory for remote Actors.
-    void* stack = callHandContainerGetItem(handContainer, actorMainHandSlot);
-    if (!stack || !readable(stack, itemStackCountOffset + sizeof(std::uint8_t)))
-        return std::nullopt;
-
-    bedrock::HeldItemInfo item;
+std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
+    void* actor, bedrock::EquipmentSlot slot) const {
+    if (!nativeItemLayout || !isActorValid(actor)) return std::nullopt;
+    const auto& layout = *nativeItemLayout;
+    tablist_native::ActorEquipmentComponent* component = nullptr;
+    if (!readActorEquipment(actor, layout, &component) || !component) return std::nullopt;
+    std::size_t slotIndex = 0;
+    std::size_t containerOffset = layout.handContainerOffset;
+    switch (slot) {
+    case bedrock::EquipmentSlot::MainHand: slotIndex = layout.handSlots[0]; break;
+    case bedrock::EquipmentSlot::Offhand: slotIndex = layout.handSlots[1]; break;
+    case bedrock::EquipmentSlot::Head:
+        containerOffset = layout.armorContainerOffset; slotIndex = layout.armorSlots[0]; break;
+    case bedrock::EquipmentSlot::Chest:
+        containerOffset = layout.armorContainerOffset; slotIndex = layout.armorSlots[1]; break;
+    case bedrock::EquipmentSlot::Legs:
+        containerOffset = layout.armorContainerOffset; slotIndex = layout.armorSlots[2]; break;
+    case bedrock::EquipmentSlot::Feet:
+        containerOffset = layout.armorContainerOffset; slotIndex = layout.armorSlots[3]; break;
+    }
+    void* container = nullptr;
+    if (!safeRead(component, containerOffset, container) || !container) return std::nullopt;
+    void* stack = callInventoryGetItem(container, slotIndex, layout);
+    if (!stack) return std::nullopt;
+    bedrock::ItemStack item;
     std::uint8_t count = 0;
-    (void)safeRead(stack, itemStackCountOffset, count);
-    item.count = count;
     void** itemReference = nullptr;
     void* nativeItem = nullptr;
-    if (safeRead(stack, itemStackItemPointerOffset, itemReference) && itemReference)
-        (void)safeRead(itemReference, 0, nativeItem);
-    if (nativeItem && readable(static_cast<const std::byte*>(nativeItem) +
-                               itemNamespacedIdStringOffset, 0x20)) {
-        (void)copyNativeString(static_cast<const std::byte*>(nativeItem) +
-                               itemNamespacedIdStringOffset, item.identifier);
-        if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
-            item.identifier.insert(0, "minecraft:");
-    }
-    // Do not call ItemStackBase::getHoverName here. Its signature is not yet
-    // verified for this build, and returning a native std::string across an
-    // unverified ABI can corrupt the heap even when SEH catches access faults.
-    // The canonical identifier is sufficient for role detection and safe logs.
-    item.displayName = item.identifier;
+    if (!safeRead(stack, layout.itemCountOffset, count) || count == 0 ||
+        !safeRead(stack, layout.itemReferenceOffset, itemReference) || !itemReference ||
+        !safeRead(itemReference, 0, nativeItem) || !nativeItem) return std::nullopt;
+    item.count = count;
+    const auto* id = static_cast<const std::byte*>(nativeItem) + layout.itemNamespacedIdOffset;
+    const auto* translation = static_cast<const std::byte*>(nativeItem) +
+                              layout.itemTranslationKeyOffset;
+    if (!copyNativeString(id, item.identifier, layout, layout.maxStringBytes))
+        return std::nullopt;
+    (void)copyNativeString(translation, item.translationKey, layout, layout.maxStringBytes);
+    if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
+        item.identifier.insert(0, "minecraft:");
     if (!item.valid()) return std::nullopt;
     return item;
+}
+
+std::size_t TabListGameAccess::localInventorySize(void* player) const {
+    return nativeItemLayout && player && player == localPlayer()
+        ? nativeItemLayout->localInventorySlots : 0;
+}
+
+std::optional<bedrock::ItemStack> TabListGameAccess::localInventoryItem(
+    void* player, std::size_t slot) const {
+    if (!nativeItemLayout || !player || player != localPlayer() ||
+        slot >= nativeItemLayout->localInventorySlots) return std::nullopt;
+    const auto& layout = *nativeItemLayout;
+    void* supplies = nullptr;
+    void* inventory = nullptr;
+    if (!safeRead(player, layout.localPlayerSuppliesOffset, supplies) || !supplies ||
+        !safeRead(supplies, layout.suppliesInventoryOffset, inventory) || !inventory)
+        return std::nullopt;
+    void* stack = callInventoryGetItem(inventory, slot, layout);
+    if (!stack) return std::nullopt;
+    bedrock::ItemStack item;
+    std::uint8_t count = 0;
+    void** itemReference = nullptr;
+    void* nativeItem = nullptr;
+    if (!safeRead(stack, layout.itemCountOffset, count) || count == 0 ||
+        !safeRead(stack, layout.itemReferenceOffset, itemReference) || !itemReference ||
+        !safeRead(itemReference, 0, nativeItem) || !nativeItem) return std::nullopt;
+    item.count = count;
+    const auto* id = static_cast<const std::byte*>(nativeItem) + layout.itemNamespacedIdOffset;
+    const auto* translation = static_cast<const std::byte*>(nativeItem) +
+                              layout.itemTranslationKeyOffset;
+    if (!copyNativeString(id, item.identifier, layout, layout.maxStringBytes))
+        return std::nullopt;
+    (void)copyNativeString(translation, item.translationKey, layout, layout.maxStringBytes);
+    if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
+        item.identifier.insert(0, "minecraft:");
+    return item.valid() ? std::optional<bedrock::ItemStack>{std::move(item)} : std::nullopt;
+}
+
+std::optional<std::size_t> TabListGameAccess::selectedHotbarSlot(void* player) const {
+    if (!nativeItemLayout || !player || player != localPlayer()) return std::nullopt;
+    void* supplies = nullptr;
+    std::uint32_t selected = 0;
+    if (!safeRead(player, nativeItemLayout->localPlayerSuppliesOffset, supplies) || !supplies ||
+        !safeRead(supplies, nativeItemLayout->suppliesSelectedSlotOffset, selected) || selected > 8)
+        return std::nullopt;
+    return static_cast<std::size_t>(selected);
 }
 
 void* TabListGameAccess::worldOf(void* actor) const noexcept {
@@ -1251,7 +1323,7 @@ void readActorMurderSnapshot(const bedrock::Actor& actor,
     if (!snapshot.isPlayer) return;
     snapshot.name = actor.getName();
     if (snapshot.name.empty() || snapshot.name.size() > 128) return;
-    snapshot.item = actor.getHeldItem();
+    snapshot.item = actor.getMainHand();
 }
 
 // Keep native Actor/inventory access behind a per-actor SEH boundary. One stale
@@ -1331,7 +1403,8 @@ void updateMurderDetection(bool debug) noexcept {
         if (debug && changed && item) {
             diagnostic("MurderDetect actor item: player=", snapshot.name,
                        " item=", itemKey,
-                       " display=", displayName,
+                       " name=", item->getName(),
+                       " translation_key=", item->translationKey,
                        " count=", item->count,
                        previous.empty() ? "" : " previous=", previous);
         }
@@ -1658,12 +1731,16 @@ DWORD WINAPI startClient(void*) {
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
     };
+    bedrock::NativeItemLayout cachedItemLayout;
+    std::string cachedItemLayoutError;
+    bool itemLayoutAvailable = bedrock::parseNativeItemLayout(
+        profile, cachedItemLayout, cachedItemLayoutError);
     resolveActorNameTag();
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
     resolveRequired();
-    if ((!requirementsMet() || !actorNameTag) &&
+    if ((!requirementsMet() || !actorNameTag || !itemLayoutAvailable) &&
         version.source != bedrock::ProfileSource::Remote) {
         diagnostic("required symbols missing in cached profile; refreshing exact-build GitHub definition");
         std::string refreshedProfile;
@@ -1677,6 +1754,8 @@ DWORD WINAPI startClient(void*) {
                 version = std::move(refreshedVersion);
                 resolveRequired();
                 resolveActorNameTag();
+                itemLayoutAvailable = bedrock::parseNativeItemLayout(
+                    profile, cachedItemLayout, cachedItemLayoutError);
                 diagnostic("latest exact-build profile loaded [",
                            bedrock::profileSourceName(version.source), "]");
             } else {
@@ -1715,7 +1794,21 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
 
-    diagnostic("MurderDetect reads Actor hand slot only; full inventory scan disabled; item IDs only");
+    if (itemLayoutAvailable) {
+        nativeItemLayout = std::move(cachedItemLayout);
+        diagnostic("SDK item API ready [versioned layout; actor equipment + local inventory]");
+    } else {
+        bedrock::NativeItemLayout embeddedItemLayout;
+        std::string embeddedItemError;
+        if (bedrock::parseNativeItemLayout(bedrock::generated::kSymbolDatabase,
+                                           embeddedItemLayout, embeddedItemError)) {
+            nativeItemLayout = std::move(embeddedItemLayout);
+            diagnostic("SDK item API ready [embedded exact-build layout]");
+        } else {
+            nativeItemLayout.reset();
+            diagnostic("SDK item API unavailable: no versioned native item layout");
+        }
+    }
 
     originalKeyboardFeed.store(&callNextKeyboard);
     originalGrabCursor.store(&callNextCursor);
