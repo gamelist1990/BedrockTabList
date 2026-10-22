@@ -305,14 +305,22 @@ bool copyActorNameTag(void* actor, std::string* output);
 // on its stack. The candidate signature is only usable on an exact build.
 bool invokeRuntimeActorList(void* level, void* function,
                             std::vector<RuntimeActorRecord>* actors,
-                            unsigned long* exceptionCode) noexcept {
+                            unsigned long* exceptionCode,
+                            std::uintptr_t* exceptionAddress) noexcept {
     if (exceptionCode) *exceptionCode = 0;
+    if (exceptionAddress) *exceptionAddress = 0;
     if (!level || !actors || !readable(level, sizeof(void*)) || !executable(function)) return false;
     __try {
         reinterpret_cast<RuntimeActorListFn>(function)(level, actors);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (exceptionCode) *exceptionCode = GetExceptionCode();
+        if (exceptionAddress) {
+            auto* exception = GetExceptionInformation();
+            if (exception && exception->ExceptionRecord)
+                *exceptionAddress = reinterpret_cast<std::uintptr_t>(
+                    exception->ExceptionRecord->ExceptionAddress);
+        }
         return false;
     }
 }
@@ -390,12 +398,34 @@ void updateRuntimeActorNameTags(void* level) {
     if (!function || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
     std::vector<RuntimeActorRecord> actors;
     unsigned long exceptionCode = 0;
-    if (!invokeRuntimeActorList(level, function, &actors, &exceptionCode)) {
+    std::uintptr_t exceptionAddress = 0;
+    if (!invokeRuntimeActorList(level, function, &actors, &exceptionCode, &exceptionAddress)) {
         runtimeActorListFunction.store(nullptr, std::memory_order_release);
-        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
+        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel)) {
+            const auto levelAddress = reinterpret_cast<std::uintptr_t>(level);
+            const auto managerAddress = levelAddress + 0x2E8;
+            const auto lockAddress = managerAddress + 0x88;
+            std::array<std::uintptr_t, 3> actorVector{};
+            std::array<std::uintptr_t, 5> criticalSection{};
+            const bool vectorReadable = safeRead(reinterpret_cast<void*>(managerAddress), 0x1A0,
+                                                 actorVector[0]) &&
+                safeRead(reinterpret_cast<void*>(managerAddress), 0x1A8, actorVector[1]) &&
+                safeRead(reinterpret_cast<void*>(managerAddress), 0x1B0, actorVector[2]);
+            const bool lockReadable = safeRead(reinterpret_cast<void*>(lockAddress), 0,
+                                               criticalSection);
             diagnostic("Level::getRuntimeActorList invocation raised SEH exception=0x",
-                       std::hex, exceptionCode, std::dec,
+                       std::hex, exceptionCode, " at=0x", exceptionAddress,
+                       " level=0x", levelAddress, " manager=0x", managerAddress,
+                       " lock=0x", lockAddress,
+                       " lock_state=", lockReadable ? "readable" : "unreadable",
+                       " lock_words=0x", criticalSection[0], ",0x", criticalSection[1],
+                       ",0x", criticalSection[2], ",0x", criticalSection[3],
+                       ",0x", criticalSection[4],
+                       " actor_vector=", vectorReadable ? "readable" : "unreadable",
+                       " begin=0x", actorVector[0], " end=0x", actorVector[1],
+                       " capacity=0x", actorVector[2], std::dec,
                        "; actor color sort inactive");
+        }
         return;
     }
     if (actors.size() > 4096 ||
