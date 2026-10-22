@@ -126,6 +126,7 @@ std::atomic<void*> runtimeActorListFunction{nullptr};
 std::atomic<void*> resolvedRuntimeActorListFunction{nullptr};
 std::atomic<int> runtimeActorPointerOffset{-1};
 std::atomic<int> runtimeActorReceiverAdjustment{std::numeric_limits<int>::min()};
+std::atomic<void*> runtimeActorReceiverLevel{nullptr};
 struct ActorNameTagEntry {
     std::string nameTag;
     unsigned colorOrder = 16;
@@ -288,6 +289,7 @@ void recordLevel(void* level) noexcept {
         lastActorListRefreshMs.store(0, std::memory_order_release);
         runtimeActorPointerOffset.store(-1, std::memory_order_release);
         runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(), std::memory_order_release);
+        runtimeActorReceiverLevel.store(nullptr, std::memory_order_release);
         runtimeActorListFunction.store(
             resolvedRuntimeActorListFunction.load(std::memory_order_acquire),
             std::memory_order_release);
@@ -388,6 +390,8 @@ std::optional<RuntimeActorReceiverProbe> findRuntimeActorReceiver(void* level) n
     }
     return ambiguous ? std::nullopt : best;
 }
+
+bool tryAcquireLevelPointerFromClient(void** output) noexcept;
 
 int captureRuntimeActorException(EXCEPTION_POINTERS* exception,
                                  unsigned long* exceptionCode,
@@ -490,9 +494,26 @@ void updateRuntimeActorNameTags(void* level) {
     auto* function = runtimeActorListFunction.load(std::memory_order_acquire);
     if (!function || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
     const auto cachedAdjustment = runtimeActorReceiverAdjustment.load(std::memory_order_acquire);
-    auto receiver = cachedAdjustment == std::numeric_limits<int>::min()
+    const bool cachedForThisLevel = runtimeActorReceiverLevel.load(std::memory_order_acquire) == level;
+    auto receiver = !cachedForThisLevel || cachedAdjustment == std::numeric_limits<int>::min()
         ? findRuntimeActorReceiver(level)
         : probeRuntimeActorReceiver(level, cachedAdjustment);
+    void* receiverLevel = level;
+    // _subTick's `this` may be a derived-level subobject, while the SDK method
+    // is declared on Level. Cross-check the Level pointer reached through the
+    // live ClientInstance/session chain before declaring the exact-build
+    // candidate unusable. The session path is already used for player-list
+    // recovery, but normally is skipped while the tick hook is fresh.
+    void* sessionLevel = nullptr;
+    if (!receiver && tryAcquireLevelPointerFromClient(&sessionLevel) &&
+        sessionLevel && sessionLevel != level) {
+        receiver = findRuntimeActorReceiver(sessionLevel);
+        receiverLevel = sessionLevel;
+        if (receiver && !loggedActorReceiverAdjustment.exchange(true, std::memory_order_acq_rel))
+            diagnostic("runtime Actor receiver validated via ClientInstance session Level; tick_level=0x",
+                       std::hex, reinterpret_cast<std::uintptr_t>(level), " session_level=0x",
+                       reinterpret_cast<std::uintptr_t>(sessionLevel), std::dec);
+    }
     if (!receiver) {
         runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(),
                                              std::memory_order_release);
@@ -502,6 +523,7 @@ void updateRuntimeActorNameTags(void* level) {
     }
     runtimeActorReceiverAdjustment.store(static_cast<int>(receiver->adjustment),
                                          std::memory_order_release);
+    runtimeActorReceiverLevel.store(receiverLevel, std::memory_order_release);
     if (receiver->adjustment != 0 &&
         !loggedActorReceiverAdjustment.exchange(true, std::memory_order_acq_rel))
         diagnostic("runtime Actor receiver adjustment=0x", std::hex,
@@ -601,7 +623,9 @@ bool levelIsFresh() noexcept {
     return heartbeat > 0 && steadyMilliseconds() - heartbeat <= 1500;
 }
 
-bool tryAcquireLevelFromClient() noexcept {
+bool tryAcquireLevelPointerFromClient(void** output) noexcept {
+    if (!output) return false;
+    *output = nullptr;
     void* client = clientInstance.load(std::memory_order_acquire);
     if (!validateClient(client)) return false;
     void* minecraft = nullptr;
@@ -616,6 +640,13 @@ bool tryAcquireLevelFromClient() noexcept {
         !safeRead(session, sessionLevelControlOffset, control) || !control ||
         !safeRead(control, 0, controlReady) || controlReady != 1 ||
         !safeRead(session, sessionLevelOffset, level) || !level) return false;
+    *output = level;
+    return true;
+}
+
+bool tryAcquireLevelFromClient() noexcept {
+    void* level = nullptr;
+    if (!tryAcquireLevelPointerFromClient(&level)) return false;
     recordLevel(level);
     return true;
 }
