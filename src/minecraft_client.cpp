@@ -50,7 +50,6 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
-using ItemStackHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 struct RuntimeActorRecord { std::array<std::byte, 0x40> bytes{}; };
 static_assert(sizeof(RuntimeActorRecord) == 0x40);
 using RuntimeActorListFn = void*(__fastcall*)(void*, std::vector<RuntimeActorRecord>*);
@@ -132,7 +131,6 @@ std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
-std::atomic<ItemStackHoverNameFn> itemStackHoverName{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
 std::atomic<void*> resolvedActorGetNameTag{nullptr};
 BDS_HookToken actorNameTagHookToken{};
@@ -156,6 +154,7 @@ std::mutex murderDetectMutex;
 std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
 std::unordered_set<std::string> loggedHeldItemIdentifiers;
+std::atomic<bool> murderDetectDisabledByFault{false};
 std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorNamePollMs{0};
@@ -315,18 +314,6 @@ void* callInventoryGetItem(void* inventory, int slot) noexcept {
         return reinterpret_cast<GetItemFn>(target)(inventory, slot);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
-    }
-}
-
-bool callItemStackHoverName(void* itemStack, std::string* output) noexcept {
-    const auto function = itemStackHoverName.load(std::memory_order_acquire);
-    if (!itemStack || !output || !function || !executable(reinterpret_cast<void*>(function)))
-        return false;
-    __try {
-        function(itemStack, output);
-        return output->size() <= 256;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
     }
 }
 
@@ -522,7 +509,7 @@ bool invokeRuntimeActorList(void* level, void* function,
 bool looksLikeActor(void* actor) noexcept {
     if (!actor || !readable(actor, sizeof(void*))) return false;
     void** vtable = nullptr;
-    std::memcpy(&vtable, actor, sizeof(vtable));
+    if (!safeRead(actor, 0, vtable)) return false;
     if (!vtable || !readable(vtable, sizeof(void*) * 3)) return false;
     unsigned executableSlots = 0;
     for (std::size_t i = 0; i < 3; ++i) {
@@ -568,7 +555,10 @@ std::optional<bedrock::HeldItemInfo> TabListGameAccess::heldItem(void* actor) co
         if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
             item.identifier.insert(0, "minecraft:");
     }
-    (void)callItemStackHoverName(stack, &item.displayName);
+    // The hover-name RVA is an unverified, version-specific C++ ABI. Calling it
+    // while scanning every player's inventory can crash the game even when the
+    // pointer is executable. Role detection only needs the stable item ID;
+    // keep displayName empty until the SDK exposes a verified item-name API.
     if (!item.valid()) return std::nullopt;
     return item;
 }
@@ -1083,7 +1073,36 @@ float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
     return inputFov;
 }
 
+struct ActorMurderSnapshot {
+    bool isPlayer = false;
+    std::string name;
+    std::optional<bedrock::HeldItemInfo> item;
+};
+
+void readActorMurderSnapshot(const bedrock::Actor& actor,
+                             ActorMurderSnapshot& snapshot) {
+    snapshot.isPlayer = actor.isPlayer();
+    if (!snapshot.isPlayer) return;
+    snapshot.name = actor.getName();
+    if (snapshot.name.empty() || snapshot.name.size() > 128) return;
+    snapshot.item = actor.getHeldItem();
+}
+
+// Keep native Actor/inventory access behind a per-actor SEH boundary. One stale
+// cached Actor or invalid inventory layout must not take down Minecraft.
+bool readActorMurderSnapshotSeh(const bedrock::Actor* actor,
+                                ActorMurderSnapshot* snapshot) noexcept {
+    if (!actor || !snapshot) return false;
+    __try {
+        readActorMurderSnapshot(*actor, *snapshot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void updateMurderDetection(bool debug) noexcept {
+    if (murderDetectDisabledByFault.load(std::memory_order_acquire)) return;
     if (!gameApi) return;
     try {
         void* level = levelInstance.load(std::memory_order_acquire);
@@ -1094,10 +1113,21 @@ void updateMurderDetection(bool debug) noexcept {
         roles.reserve(actors.size());
         currentItems.reserve(actors.size());
         for (const auto& actor : actors) {
-            if (!actor.isPlayer()) continue;
-            auto playerName = actor.getName();
+            ActorMurderSnapshot snapshot;
+            if (!readActorMurderSnapshotSeh(&actor, &snapshot)) {
+                murderDetectDisabledByFault.store(true, std::memory_order_release);
+                {
+                    std::lock_guard lock(murderDetectMutex);
+                    murderRolesByPlayer.clear();
+                    lastHeldItemByPlayer.clear();
+                }
+                diagnostic("MurderDetect stopped after unsafe Actor/inventory read; restart Minecraft after updating the DLL");
+                return;
+            }
+            if (!snapshot.isPlayer) continue;
+            auto playerName = std::move(snapshot.name);
             if (playerName.empty() || playerName.size() > 128) continue;
-            const auto item = actor.getHeldItem();
+            const auto& item = snapshot.item;
             if (!item) {
                 currentItems.try_emplace(std::move(playerName), std::string{});
                 continue;
@@ -1458,7 +1488,6 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("resolver ready");
     std::optional<bedrock::Resolution> keyboard, grab, release, fov, levelTick;
-    std::optional<bedrock::Resolution> hoverName;
     const auto resolveRequired = [&] {
         keyboard = bedrock::resolveSharedHook(resolver, "Keyboard::feed", BDS_HOOK_KEYBOARD_FEED);
         grab = bedrock::resolveSharedHook(resolver, "ClientInstance::grabCursor", BDS_HOOK_GRAB_CURSOR);
@@ -1476,19 +1505,12 @@ DWORD WINAPI startClient(void*) {
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
     };
-    const auto resolveHoverName = [&] {
-        hoverName = resolver.resolve("ItemStackBase::getHoverName", true);
-        if (hoverName && (!hoverName->exact_build ||
-            (hoverName->method != "exact-rva" && hoverName->method != "aob-candidate")))
-            hoverName.reset();
-    };
     resolveActorNameTag();
-    resolveHoverName();
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
     resolveRequired();
-    if ((!requirementsMet() || !actorNameTag || !hoverName) &&
+    if ((!requirementsMet() || !actorNameTag) &&
         version.source != bedrock::ProfileSource::Remote) {
         diagnostic("required symbols missing in cached profile; refreshing exact-build GitHub definition");
         std::string refreshedProfile;
@@ -1502,7 +1524,6 @@ DWORD WINAPI startClient(void*) {
                 version = std::move(refreshedVersion);
                 resolveRequired();
                 resolveActorNameTag();
-                resolveHoverName();
                 diagnostic("latest exact-build profile loaded [",
                            bedrock::profileSourceName(version.source), "]");
             } else {
@@ -1515,7 +1536,7 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag || !hoverName) {
+    if (!actorNameTag) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -1526,13 +1547,6 @@ DWORD WINAPI startClient(void*) {
                 if (actorNameTag &&
                     (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
                     actorNameTag.reset();
-            }
-            if (!hoverName) {
-                hoverName = embeddedResolver.resolve("ItemStackBase::getHoverName", true);
-                if (hoverName && (!hoverName->exact_build ||
-                    (hoverName->method != "exact-rva" &&
-                     hoverName->method != "aob-candidate")))
-                    hoverName.reset();
             }
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
@@ -1548,17 +1562,7 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
 
-    if (hoverName) {
-        itemStackHoverName.store(
-            reinterpret_cast<ItemStackHoverNameFn>(hoverName->address),
-            std::memory_order_release);
-        diagnostic("held-item name resolver ready [", hoverName->method,
-                   " exact_build=", hoverName->exact_build,
-                   " verified=", hoverName->verified, "]");
-    } else {
-        itemStackHoverName.store(nullptr, std::memory_order_release);
-        diagnostic("held-item name resolver unavailable; canonical item ids may still be read");
-    }
+    diagnostic("held-item scan uses canonical item IDs; unsafe unverified hover-name call disabled");
 
     originalKeyboardFeed.store(&callNextKeyboard);
     originalGrabCursor.store(&callNextCursor);
