@@ -1337,8 +1337,16 @@ DWORD WINAPI startClient(void*) {
     gameApi = std::make_unique<bedrock::GameApi>(tabListGameAccess);
     gameHooks = std::make_unique<bedrock::GameHooks>(*gameApi);
     bool actorNameTagHookReady = false;
-    if (actorNameTag)
+    if (actorNameTag) {
+        diagnostic("Actor::getNameTag subscribe attempt: target=0x", std::hex,
+                   actorNameTag->address, std::dec, " method=", actorNameTag->method,
+                   " exact_build=", actorNameTag->exact_build,
+                   " verified=", actorNameTag->verified,
+                   " broker_owned=",
+                   BDS_HookOwnsTarget(BDS_HOOK_ACTOR_GET_NAME_TAG,
+                       reinterpret_cast<void*>(actorNameTag->address)));
         actorNameTagHookReady = gameHooks->installActorNameTag(resolver, error);
+    }
     if (actorNameTagHookReady) {
         diagnostic("SDK GameHooks::ActorNameTag active; method=", actorNameTag->method,
                    " exact_build=", actorNameTag->exact_build,
