@@ -156,7 +156,10 @@ std::mutex murderDetectMutex;
 std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
 std::unordered_set<std::string> loggedHeldItemIdentifiers;
-std::atomic<bool> murderDetectDisabledByFault{false};
+std::vector<bedrock::Actor> murderScanActors;
+std::size_t murderScanCursor = 0;
+void* murderScanLevel = nullptr;
+std::atomic<bool> loggedMurderActorReadFault{false};
 std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorNamePollMs{0};
@@ -1118,73 +1121,66 @@ bool readActorMurderSnapshotSeh(const bedrock::Actor* actor,
 }
 
 void updateMurderDetection(bool debug) noexcept {
-    if (murderDetectDisabledByFault.load(std::memory_order_acquire)) return;
-    if (!gameApi) return;
+    // Native Minecraft objects are thread-affine. Only inspect one cached
+    // Actor per game tick, and only while the player list is actually open.
+    if (!gameApi || !tabHeld.load(std::memory_order_acquire)) return;
     try {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
-        std::unordered_map<std::string, tablist::MurderRole> roles;
-        std::unordered_map<std::string, std::string> currentItems;
-        auto actors = gameApi->actors(level);
-        roles.reserve(actors.size());
-        currentItems.reserve(actors.size());
-        for (const auto& actor : actors) {
-            ActorMurderSnapshot snapshot;
-            if (!readActorMurderSnapshotSeh(&actor, &snapshot)) {
-                murderDetectDisabledByFault.store(true, std::memory_order_release);
-                {
-                    std::lock_guard lock(murderDetectMutex);
-                    murderRolesByPlayer.clear();
-                    lastHeldItemByPlayer.clear();
-                }
-                diagnostic("MurderDetect stopped after unsafe Actor/inventory read; restart Minecraft after updating the DLL");
-                return;
-            }
-            if (!snapshot.isPlayer) continue;
-            auto playerName = std::move(snapshot.name);
-            if (playerName.empty() || playerName.size() > 128) continue;
-            const auto& item = snapshot.item;
-            if (!item) {
-                currentItems.try_emplace(std::move(playerName), std::string{});
-                continue;
-            }
-            const auto& identifier = item->identifier;
-            const auto& displayName = item->displayName;
-            std::string itemKey = identifier.empty() ? displayName : identifier;
-            if (itemKey.empty() || itemKey.size() > 256) continue;
-            std::string normalized = itemKey;
-            std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            const auto role = tablist::murderRoleForHeldItem(identifier, displayName);
-            currentItems.insert_or_assign(playerName, normalized);
-            if (role != tablist::MurderRole::None)
-                roles.insert_or_assign(playerName, role);
-
-            bool firstSeen = false;
-            bool changed = false;
-            std::string previous;
-            {
-                std::lock_guard lock(murderDetectMutex);
-                firstSeen = loggedHeldItemIdentifiers.insert(normalized).second;
-                const auto old = lastHeldItemByPlayer.find(playerName);
-                changed = old == lastHeldItemByPlayer.end() || old->second != normalized;
-                if (old != lastHeldItemByPlayer.end()) previous = old->second;
-            }
-            if (firstSeen) {
-                diagnostic("MurderDetect held-item candidate: ", normalized);
-            }
-            if (debug && changed) {
-                diagnostic("MurderDetect actor item: player=", playerName,
-                           " item=", normalized,
-                           " display=", displayName,
-                           " count=", item->count,
-                           previous.empty() ? "" : " previous=", previous);
-            }
+        if (murderScanLevel != level) {
+            murderScanActors.clear();
+            murderScanCursor = 0;
+            murderScanLevel = level;
         }
+        if (murderScanCursor >= murderScanActors.size()) {
+            murderScanActors = gameApi->actors(level);
+            murderScanCursor = 0;
+        }
+        if (murderScanActors.empty()) return;
+
+        const auto& actor = murderScanActors[murderScanCursor++];
+        ActorMurderSnapshot snapshot;
+        if (!readActorMurderSnapshotSeh(&actor, &snapshot)) {
+            if (!loggedMurderActorReadFault.exchange(true, std::memory_order_acq_rel))
+                diagnostic("MurderDetect skipped an Actor whose native read raised an exception");
+            return;
+        }
+        if (!snapshot.isPlayer || snapshot.name.empty() || snapshot.name.size() > 128)
+            return;
+
+        const auto& item = snapshot.item;
+        const auto identifier = item ? item->identifier : std::string{};
+        const auto displayName = item ? item->displayName : std::string{};
+        std::string itemKey = identifier.empty() ? displayName : identifier;
+        if (itemKey.size() > 256) return;
+        std::transform(itemKey.begin(), itemKey.end(), itemKey.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const auto role = item ? tablist::murderRoleForHeldItem(identifier, displayName)
+                               : tablist::MurderRole::None;
+
+        bool firstSeen = false;
+        bool changed = false;
+        std::string previous;
         {
             std::lock_guard lock(murderDetectMutex);
-            lastHeldItemByPlayer = std::move(currentItems);
-            murderRolesByPlayer = std::move(roles);
+            const auto old = lastHeldItemByPlayer.find(snapshot.name);
+            changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
+            if (old != lastHeldItemByPlayer.end()) previous = old->second;
+            if (itemKey.empty()) lastHeldItemByPlayer.erase(snapshot.name);
+            else {
+                lastHeldItemByPlayer.insert_or_assign(snapshot.name, itemKey);
+                firstSeen = loggedHeldItemIdentifiers.insert(itemKey).second;
+            }
+            if (role == tablist::MurderRole::None) murderRolesByPlayer.erase(snapshot.name);
+            else murderRolesByPlayer.insert_or_assign(snapshot.name, role);
+        }
+        if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
+        if (debug && changed && item) {
+            diagnostic("MurderDetect actor item: player=", snapshot.name,
+                       " item=", itemKey,
+                       " display=", displayName,
+                       " count=", item->count,
+                       previous.empty() ? "" : " previous=", previous);
         }
     } catch (...) {
         // Item inspection is observational; never interfere with the game tick.
@@ -1194,19 +1190,15 @@ void updateMurderDetection(bool debug) noexcept {
 void __fastcall onLevelSubTick(void* level) {
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
-    // Poll a small Actor batch every two seconds as fallback for hidden labels;
-    // visible labels are still captured immediately by the getter hook.
+    // Poll at most one cached Actor per second as a fallback for hidden labels;
+    // visible labels are captured immediately by the getter hook.
     static unsigned refreshTicks = 0;
-    static unsigned itemScanTicks = 0;
-    if (++refreshTicks >= 40) {
+    if (++refreshTicks >= 20) {
         refreshTicks = 0;
-        if (gameApi) (void)gameApi->refreshCachedActorNameTags(8);
+        if (gameApi) (void)gameApi->refreshCachedActorNameTags(1);
     }
-    if (++itemScanTicks >= 20) {
-        itemScanTicks = 0;
-        const auto config = liveConfig.load(std::memory_order_acquire);
-        if (config->murderDetect) updateMurderDetection(config->debug);
-    }
+    const auto config = liveConfig.load(std::memory_order_acquire);
+    if (config->murderDetect) updateMurderDetection(config->debug);
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
