@@ -50,7 +50,6 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
-using ItemStackHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 struct RuntimeActorRecord { std::array<std::byte, 0x40> bytes{}; };
 static_assert(sizeof(RuntimeActorRecord) == 0x40);
 using RuntimeActorListFn = void*(__fastcall*)(void*, std::vector<RuntimeActorRecord>*);
@@ -132,7 +131,6 @@ std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
-std::atomic<ItemStackHoverNameFn> itemStackHoverName{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
 std::atomic<void*> resolvedActorGetNameTag{nullptr};
 BDS_HookToken actorNameTagHookToken{};
@@ -325,18 +323,6 @@ void* callInventoryGetItem(void* inventory, int slot) noexcept {
         return reinterpret_cast<GetItemFn>(target)(inventory, slot);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
-    }
-}
-
-bool callItemStackHoverName(void* itemStack, std::string* output) noexcept {
-    const auto function = itemStackHoverName.load(std::memory_order_acquire);
-    if (!itemStack || !output || !function || !executable(reinterpret_cast<void*>(function)))
-        return false;
-    __try {
-        function(itemStack, output);
-        return output->size() <= 256;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
     }
 }
 
@@ -580,12 +566,11 @@ std::optional<bedrock::HeldItemInfo> TabListGameAccess::heldItem(void* actor) co
         if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
             item.identifier.insert(0, "minecraft:");
     }
-    // Only use a hover-name function resolved from the exact executable build;
-    // the adapter catches native faults and the scan is deliberately throttled.
+    // Do not call ItemStackBase::getHoverName here. Its signature is not yet
+    // verified for this build, and returning a native std::string across an
+    // unverified ABI can corrupt the heap even when SEH catches access faults.
+    // The canonical identifier is sufficient for role detection and safe logs.
     item.displayName = item.identifier;
-    std::string localizedName;
-    if (callItemStackHoverName(stack, &localizedName) && !localizedName.empty())
-        item.displayName = std::move(localizedName);
     if (!item.valid()) return std::nullopt;
     return item;
 }
@@ -1597,20 +1582,13 @@ DWORD WINAPI startClient(void*) {
         return symbol && bedrock::isUsableSharedHookResolution(*symbol);
     };
     std::optional<bedrock::Resolution> actorNameTag;
-    std::optional<bedrock::Resolution> hoverName;
     const auto resolveActorNameTag = [&] {
         actorNameTag = resolver.resolve("Actor::getNameTag", true);
         if (actorNameTag &&
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
     };
-    const auto resolveHoverName = [&] {
-        hoverName = resolver.resolve("ItemStackBase::getHoverName", true);
-        if (hoverName && (!hoverName->exact_build || hoverName->method != "exact-rva"))
-            hoverName.reset();
-    };
     resolveActorNameTag();
-    resolveHoverName();
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
@@ -1629,7 +1607,6 @@ DWORD WINAPI startClient(void*) {
                 version = std::move(refreshedVersion);
                 resolveRequired();
                 resolveActorNameTag();
-                resolveHoverName();
                 diagnostic("latest exact-build profile loaded [",
                            bedrock::profileSourceName(version.source), "]");
             } else {
@@ -1642,7 +1619,7 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag || !hoverName) {
+    if (!actorNameTag) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -1653,12 +1630,6 @@ DWORD WINAPI startClient(void*) {
                 if (actorNameTag &&
                     (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
                     actorNameTag.reset();
-            }
-            if (!hoverName) {
-                hoverName = embeddedResolver.resolve("ItemStackBase::getHoverName", true);
-                if (hoverName && (!hoverName->exact_build ||
-                    hoverName->method != "exact-rva"))
-                    hoverName.reset();
             }
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
@@ -1674,14 +1645,7 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
 
-    if (hoverName) {
-        itemStackHoverName.store(reinterpret_cast<ItemStackHoverNameFn>(hoverName->address),
-                                 std::memory_order_release);
-        diagnostic("held-item display-name resolver ready [exact-build exact-rva]");
-    } else {
-        itemStackHoverName.store(nullptr, std::memory_order_release);
-        diagnostic("held-item display-name resolver unavailable; IDs will be shown");
-    }
+    diagnostic("held-item scan uses canonical IDs only; unverified native hover-name call disabled");
 
     originalKeyboardFeed.store(&callNextKeyboard);
     originalGrabCursor.store(&callNextCursor);
