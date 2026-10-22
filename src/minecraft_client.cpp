@@ -875,7 +875,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                 const auto colorName = [](unsigned order) -> std::string_view {
                     static constexpr std::array<std::string_view, 28> names{
                         "black", "dark_blue", "dark_green", "dark_aqua",
-                        "dark_red", "dark_purple", "gold", "gray", "dark_gray",
+                        "dark_red", "dark_purple", "orange", "gray", "dark_gray",
                         "blue", "green", "aqua", "red", "light_purple", "yellow",
                         "white", "minecoin_gold", "material_quartz", "server_purple",
                         "material_netherite", "material_redstone", "material_copper",

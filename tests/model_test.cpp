@@ -10,11 +10,13 @@ int main() {
     assert(tablist::stripMinecraftFormatting("\xC2\xA7" "aAlex") == "Alex");
     assert(tablist::actorNameColorForPlayerName(
         "Alex", "\xC2\xA7" "7[VIP] \xC2\xA7" "cAlex\xC2\xA7" "8 [L]") == 12);
-    // Extended nameTag codes and the target server's §p green convention.
+    // Extended nameTag codes and target-server overrides for §p/§s.
     assert(tablist::actorNameColorForPlayerName(
         "DamerDilly", "\xC2\xA7" "pDamerDilly") == 10);
     assert(tablist::actorNameColorForPlayerName(
         "Emerald", "\xC2\xA7" "qEmerald") == 23);
+    assert(tablist::actorNameColorForPlayerName(
+        "wiwphix94", "\xC2\xA7" "swiwphix94") == 6);
     assert(tablist::actorNameColorForPlayerName(
         "Biruplayz", "\xC2\xA7" "iBiruplayz\xC2\xA7" "8 [U]") == 18);
     assert(tablist::actorNameColorForPlayerName(

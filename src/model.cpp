@@ -36,11 +36,12 @@ FormattedText parseFormatting(std::string_view text) {
             const auto code = static_cast<char>(std::tolower(
                 static_cast<unsigned char>(text[codeIndex])));
             const auto color = colorCodes.find(code);
-            // The target server uses §p for green PlayerList/nameTag names,
-            // even though vanilla Bedrock's extended palette assigns it a
-            // material tone. Prefer the observed server convention here.
+            // Target-server formatting differs from the vanilla extended
+            // palette for these live nameTag codes: §p is green and §s orange.
             if (code == 'p')
                 activeColor = 10;
+            else if (code == 's')
+                activeColor = 6;
             else if (color != std::string_view::npos)
                 activeColor = static_cast<unsigned>(color);
             else if (code == 'r')
