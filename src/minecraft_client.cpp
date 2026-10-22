@@ -44,6 +44,7 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
+using RuntimeActorListFn = void(__fastcall*)(void*, std::vector<void*>*);
 
 // These layouts come from the matching Latite SDK revision and are used only
 // after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
@@ -111,11 +112,13 @@ std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
-std::atomic<bool> captureActorNameTags{false};
+std::atomic<std::size_t> runtimeActorListVtableSlot{0};
 struct ActorNameTagEntry { std::string nameTag; unsigned colorOrder = 16; };
 std::mutex actorNameTagMutex;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
-BDS_HookToken actorNameTagHookToken{};
+std::atomic<std::int64_t> lastActorListRefreshMs{0};
+std::atomic<bool> loggedActorListFailure{false};
+std::atomic<bool> loggedActorListSuccess{false};
 std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
     std::make_shared<const tablist::Config>()};
 std::array<BDS_HookToken, 5> hookTokens{};
@@ -257,37 +260,89 @@ void recordLevel(void* level) noexcept {
             std::lock_guard lock(actorNameTagMutex);
             actorNameTags.clear();
         }
+        lastActorListRefreshMs.store(0, std::memory_order_release);
         diagnostic("level ready");
     }
 }
 
-// Actor::getNameTag returns a reference to its native std::string on the
-// supported x64 build. Keep the direct hook installed as a passthrough after
-// TabList stops, since SDK DirectRemove does not drain an in-flight call.
-const std::string& __fastcall onActorGetNameTag(void* actor) {
-    auto* rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
-    while (!rawOriginal) {
-        std::this_thread::yield();
-        rawOriginal = originalActorGetNameTag.load(std::memory_order_acquire);
+bool executable(const void* pointer) noexcept {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!pointer || !VirtualQuery(pointer, &info, sizeof(info)) ||
+        info.State != MEM_COMMIT || info.Type != MEM_IMAGE) return false;
+    const DWORD protection = info.Protect & 0xFFu;
+    return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+           protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+}
+
+// Keep native vtable dispatch inside a tiny SEH boundary with no owning C++
+// objects on its stack. This protects the caller's vector if a profile is bad.
+bool invokeRuntimeActorList(void* level, std::size_t slot,
+                            std::vector<void*>* actors) noexcept {
+    void** vtable = nullptr;
+    void* target = nullptr;
+    if (!safeRead(level, 0, vtable) || !vtable ||
+        slot > (std::numeric_limits<std::size_t>::max() / sizeof(void*)) ||
+        !safeRead(vtable, slot * sizeof(void*), target) || !executable(target))
+        return false;
+    __try {
+        reinterpret_cast<RuntimeActorListFn>(target)(level, actors);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
-    const auto original = reinterpret_cast<ActorGetNameTagFn>(rawOriginal);
-    const auto& nameTag = original(actor);
-    if (!captureActorNameTags.load(std::memory_order_acquire)) return nameTag;
-    try {
-        if (nameTag.size() > 512) return nameTag;
+}
+
+bool getActorNameTagView(void* actor, const char** data, std::size_t* size) noexcept {
+    auto* rawFunction = originalActorGetNameTag.load(std::memory_order_acquire);
+    if (!actor || !data || !size || !rawFunction || !readable(actor, sizeof(void*)) ||
+        !executable(rawFunction)) return false;
+    __try {
+        const auto& nameTag = reinterpret_cast<ActorGetNameTagFn>(rawFunction)(actor);
+        *size = nameTag.size();
+        *data = nameTag.data();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool copyActorNameTag(void* actor, std::string* output) {
+    const char* data = nullptr;
+    std::size_t size = 0;
+    if (!output || !getActorNameTagView(actor, &data, &size) || size > 512 ||
+        (size && !readable(data, size))) return false;
+    output->assign(data, size);
+    return true;
+}
+
+void updateRuntimeActorNameTags(void* level) {
+    const auto slot = runtimeActorListVtableSlot.load(std::memory_order_acquire);
+    if (!slot) return;
+    std::vector<void*> actors;
+    if (!invokeRuntimeActorList(level, slot, &actors) || actors.size() > 4096 ||
+        (actors.size() && !readable(actors.data(), actors.size() * sizeof(void*)))) {
+        runtimeActorListVtableSlot.store(0, std::memory_order_release);
+        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
+            diagnostic("Level::getRuntimeActorList unavailable; color sort inactive");
+        return;
+    }
+
+    std::unordered_map<void*, ActorNameTagEntry> updated;
+    updated.reserve(std::min<std::size_t>(actors.size(), 512));
+    for (void* actor : actors) {
+        std::string nameTag;
+        if (!copyActorNameTag(actor, &nameTag) || nameTag.empty()) continue;
         const auto color = tablist::minecraftNameColorOrder(nameTag);
-        const auto rawName = tablist::stripMinecraftFormatting(nameTag);
-        std::lock_guard lock(actorNameTagMutex);
-        if (color < 16 && !rawName.empty()) {
-            actorNameTags[actor] = {nameTag, color};
-            if (actorNameTags.size() > 512) actorNameTags.clear();
-        } else {
-            actorNameTags.erase(actor);
-        }
-    } catch (...) {
-        // Name-tag observation is optional; preserve Minecraft's original result.
+        if (color >= 16 || tablist::stripMinecraftFormatting(nameTag).empty()) continue;
+        updated.insert_or_assign(actor, ActorNameTagEntry{std::move(nameTag), color});
+        if (updated.size() >= 512) break;
     }
-    return nameTag;
+    {
+        std::lock_guard lock(actorNameTagMutex);
+        actorNameTags.swap(updated);
+    }
+    if (!loggedActorListSuccess.exchange(true, std::memory_order_acq_rel))
+        diagnostic("Level::getRuntimeActorList active; ", actors.size(), " actor(s)");
 }
 
 bool levelIsFresh() noexcept {
@@ -417,6 +472,13 @@ float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
 void __fastcall onLevelSubTick(void* level) {
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
+    const auto config = liveConfig.load(std::memory_order_acquire);
+    if (!config->sortByNameColor || !tabHeld.load(std::memory_order_acquire)) return;
+    const auto now = steadyMilliseconds();
+    const auto last = lastActorListRefreshMs.load(std::memory_order_acquire);
+    if (now - last < 250) return;
+    lastActorListRefreshMs.store(now, std::memory_order_release);
+    updateRuntimeActorNameTags(level);
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
@@ -673,18 +735,20 @@ DWORD WINAPI startClient(void*) {
         return symbol && bedrock::isUsableSharedHookResolution(*symbol);
     };
     std::optional<bedrock::Resolution> actorNameTag;
+    std::optional<std::size_t> actorListSlot;
     const auto resolveActorNameTag = [&] {
         actorNameTag = resolver.resolve("Actor::getNameTag", true);
         if (actorNameTag &&
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
+        actorListSlot = resolver.resolveVirtualSlot("Level::getRuntimeActorList", true);
     };
     resolveActorNameTag();
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
     resolveRequired();
-    if ((!requirementsMet() || !actorNameTag) &&
+    if ((!requirementsMet() || !actorNameTag || !actorListSlot) &&
         version.source != bedrock::ProfileSource::Remote) {
         diagnostic("required symbols missing in cached profile; refreshing exact-build GitHub definition");
         std::string refreshedProfile;
@@ -738,19 +802,16 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("shared hooks registered");
 
-    if (actorNameTag) {
-        void* trampoline = nullptr;
-        if (BDS_HookDirectInstall(reinterpret_cast<void*>(actorNameTag->address),
-                                  reinterpret_cast<void*>(&onActorGetNameTag),
-                                  &trampoline, &actorNameTagHookToken)) {
-            originalActorGetNameTag.store(trampoline, std::memory_order_release);
-            captureActorNameTags.store(true, std::memory_order_release);
-            diagnostic("Actor::getNameTag color source active [guarded exact RVA]");
-        } else {
-            diagnostic("Actor::getNameTag direct hook unavailable; color sort inactive");
-        }
+    if (actorNameTag && actorListSlot) {
+        originalActorGetNameTag.store(reinterpret_cast<void*>(actorNameTag->address),
+                                      std::memory_order_release);
+        runtimeActorListVtableSlot.store(*actorListSlot, std::memory_order_release);
+        diagnostic("runtime Actor list color source ready [exact-build profile slot ",
+                   *actorListSlot, "]");
     } else {
-        diagnostic("Actor::getNameTag exact-build candidate unavailable; color sort inactive");
+        originalActorGetNameTag.store(nullptr, std::memory_order_release);
+        runtimeActorListVtableSlot.store(0, std::memory_order_release);
+        diagnostic("runtime Actor list color source unavailable; color sort inactive");
     }
 
     bedrock::gui::OverlayOptions options;
@@ -787,7 +848,6 @@ DWORD WINAPI startClient(void*) {
 
     bedrock::gui::Overlay::shutdown();
     removeNativeHooks();
-    captureActorNameTags.store(false, std::memory_order_release);
     status.store(Status::Stopped, std::memory_order_release);
     return 0;
 }
