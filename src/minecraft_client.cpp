@@ -160,6 +160,9 @@ std::vector<bedrock::Actor> murderScanActors;
 std::size_t murderScanCursor = 0;
 void* murderScanLevel = nullptr;
 std::atomic<bool> loggedMurderActorReadFault{false};
+std::atomic<std::shared_ptr<const std::vector<PlayerRow>>> cachedTabRows{
+    std::make_shared<const std::vector<PlayerRow>>()};
+std::atomic<bool> loggedTabRowsReady{false};
 std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorNamePollMs{0};
@@ -221,7 +224,6 @@ void __fastcall callNextLevel(void* level) {
 std::mutex diagnosticMutex;
 std::ofstream diagnosticLog;
 std::atomic<bool> loggedRenderer{false};
-std::atomic<bool> loggedListFailure{false};
 std::atomic<bool> loggedListSuccess{false};
 
 template <class... Args>
@@ -395,6 +397,8 @@ void recordLevel(void* level) noexcept {
     levelHeartbeatMs.store(steadyMilliseconds(), std::memory_order_release);
     if (previous != level) {
         if (gameApi) gameApi->clearObservedActors();
+        cachedTabRows.store({}, std::memory_order_release);
+        loggedTabRowsReady.store(false, std::memory_order_release);
         {
             std::lock_guard lock(actorNameTagMutex);
             observedPlayerColorOrders.clear();
@@ -1060,6 +1064,30 @@ bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
     }
 }
 
+void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) noexcept {
+    if (!config || !config->enabled) return;
+    try {
+        std::vector<PlayerRow> rows;
+        std::vector<ActorNameTagEntry> actorTags;
+        std::unordered_map<std::string, tablist::MurderRole> murderRoles;
+        if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
+        if (config->murderDetect) {
+            std::lock_guard lock(murderDetectMutex);
+            murderRoles = murderRolesByPlayer;
+        }
+        if (!collectRows(rows, config->showFaces, config->sortByNameColor,
+                         config->murderDetect, murderRoles, actorTags)) {
+            return; // Keep the previous immutable snapshot on a transient read failure.
+        }
+        auto snapshot = std::make_shared<const std::vector<PlayerRow>>(std::move(rows));
+        cachedTabRows.store(std::move(snapshot), std::memory_order_release);
+        if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
+            diagnostic("TabList row cache ready; renderer uses cached rows only");
+    } catch (...) {
+        // Cache construction is best-effort and never runs from the render callback.
+    }
+}
+
 bool __fastcall onKeyboardFeed(int inputKey, bool down) {
     if (inputKey == tabInputKey || inputKey == tabInputKeyGlfw) {
         const bool previous = tabHeld.exchange(down, std::memory_order_acq_rel);
@@ -1121,9 +1149,9 @@ bool readActorMurderSnapshotSeh(const bedrock::Actor* actor,
 }
 
 void updateMurderDetection(bool debug) noexcept {
-    // Native Minecraft objects are thread-affine. Only inspect one cached
-    // Actor per game tick, and only while the player list is actually open.
-    if (!gameApi || !tabHeld.load(std::memory_order_acquire)) return;
+    // Native Minecraft objects are thread-affine. Warm the cache gradually
+    // during gameplay so opening the player list never starts a scan burst.
+    if (!gameApi) return;
     try {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
@@ -1199,6 +1227,11 @@ void __fastcall onLevelSubTick(void* level) {
     }
     const auto config = liveConfig.load(std::memory_order_acquire);
     if (config->murderDetect) updateMurderDetection(config->debug);
+    static unsigned rowsCacheTicks = 0;
+    if (++rowsCacheTicks >= 40) {
+        rowsCacheTicks = 0;
+        refreshTabRowsCache(config);
+    }
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
@@ -1240,22 +1273,9 @@ void drawTabList(void*) {
     if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire)) return;
     if (!gameplayActive.load(std::memory_order_acquire)) return;
-    if (!levelIsFresh() && !tryAcquireLevelFromClient()) return;
-
-    std::vector<PlayerRow> players;
-    std::vector<ActorNameTagEntry> actorTags;
-    std::unordered_map<std::string, tablist::MurderRole> murderRoles;
-    if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
-    if (config->murderDetect) {
-        std::lock_guard lock(murderDetectMutex);
-        murderRoles = murderRolesByPlayer;
-    }
-    if (!collectRows(players, config->showFaces, config->sortByNameColor,
-                     config->murderDetect, murderRoles, actorTags) || players.empty()) {
-        if (!loggedListFailure.exchange(true, std::memory_order_acq_rel))
-            diagnostic("Tab detected but native player list is unavailable");
-        return;
-    }
+    const auto playersSnapshot = cachedTabRows.load(std::memory_order_acquire);
+    if (!playersSnapshot || playersSnapshot->empty()) return;
+    const auto& players = *playersSnapshot;
     if (!loggedListSuccess.exchange(true, std::memory_order_acq_rel))
         diagnostic("Native player list active: ", players.size(), " player(s)");
     const auto layout = tablist::layoutFor(players.size(), config->maximumRows);

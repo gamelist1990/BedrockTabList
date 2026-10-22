@@ -13,8 +13,9 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
 - `Actor::getHeldItem()` で観測した選択アイテムからMurderDetectの役割を表示（弓・矢=Sheriff/水色、鉄剣=Murderer/赤）
-- MurderDetectはTab表示中にゲームtickあたりActorを1件だけ読み取り、負荷を分散（Minecraftオブジェクトのネイティブ読み取りは安全のためゲームスレッド上で実行）
+- MurderDetectはTab表示前からゲームtickあたりActorを1件ずつ読み、役割キャッシュを準備（Minecraftオブジェクトのネイティブ読み取りは安全のためゲームスレッド上で実行）
 - Actor/Inventory読み取りで例外が出た対象はスキップし、後続Actorの走査を継続
+- TabListの行・顔・色・役割はゲーム更新中に2秒間隔でキャッシュを作り直し、Tab表示時は完成済みキャッシュだけを描画
 - 16人を超える場合は自動的に複数列へ分割
 - メニュー、チャット、インベントリでは自動的に非表示
 - Minecraftの `Keyboard::feed(InputKey, down)` を直接使用
