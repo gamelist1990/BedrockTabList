@@ -1319,9 +1319,10 @@ struct ActorMurderSnapshot {
 
 void readActorMurderSnapshot(const bedrock::Actor& actor,
                              ActorMurderSnapshot& snapshot) {
-    snapshot.isPlayer = actor.isPlayer();
+    const auto identity = actor.getIdentity();
+    snapshot.isPlayer = identity.isPlayer;
     if (!snapshot.isPlayer) return;
-    snapshot.name = actor.getName();
+    snapshot.name = identity.name;
     if (snapshot.name.empty() || snapshot.name.size() > 128) return;
     snapshot.item = actor.getMainHand();
 }
@@ -1355,7 +1356,7 @@ void updateMurderDetection(bool debug) noexcept {
         }
         ++murderScanTick;
         if (murderActorSnapshotTick == 0 ||
-            murderScanTick - murderActorSnapshotTick >= 100) {
+            murderScanTick - murderActorSnapshotTick >= 25) {
             murderScanActors = gameApi->actors(level);
             murderScanCursor = 0;
             murderActorSnapshotTick = murderScanTick;
@@ -1425,7 +1426,15 @@ void __fastcall onLevelSubTick(void* level) {
     }
     const auto config = liveConfig.load(std::memory_order_acquire);
     refreshOneCachedFace(config);
-    if (config->murderDetect) updateMurderDetection(config->debug);
+    static unsigned murderScanCadence = 0;
+    if (config->murderDetect) {
+        if (++murderScanCadence >= config->murderScanIntervalTicks) {
+            murderScanCadence = 0;
+            updateMurderDetection(config->debug);
+        }
+    } else {
+        murderScanCadence = 0;
+    }
     static unsigned rowsCacheTicks = 0;
     if (++rowsCacheTicks >= 20) {
         rowsCacheTicks = 0;

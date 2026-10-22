@@ -40,6 +40,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
   "show_faces": true,
   "sort_by_name_color": false,
   "murder_detect": true,
+  "murder_scan_interval_ticks": 4,
   "debug": false,
   "background_color": "#0A0D14CC",
   "text_color": "#F2F5FBFF",
@@ -65,8 +66,10 @@ Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDK�
 プレイヤーは、アクセント色の小さな丸で表示します。
 
 `murder_detect` は手持ちの弓/矢を `[Sheriff]`（水色）、鉄剣を `[Murderer]`（赤）で
-表示します。SDKが把握しているActorのアイテムを5 tickごとに更新するため、通常は最大約250msで
-切替が反映されます。未知のアイテムIDは `TabList.log` に一度だけ候補として記録されます。
+表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
+`murder_scan_interval_ticks` は次のActorを読む間隔（既定4、最小1、最大40 tick）です。
+間隔を増やすほど負荷は下がりますが、全Actorのアイテム状態が揃うまでの時間は長くなります。
+未知のアイテムIDは `TabList.log` に一度だけ候補として記録されます。
 `debug` を `true` にするとActor名・表示名・個数・アイテム切替の詳細ログも出ます。
 
 同じフォルダの `TabList.log` には、起動結果、Level取得、Tab遷移、プレイヤー一覧の
