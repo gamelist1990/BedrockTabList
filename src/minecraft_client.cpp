@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <sstream>
@@ -551,16 +552,44 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
     diagnostic("resolver ready");
-    const auto keyboard = resolver.resolve("Keyboard::feed");
-    const auto grab = resolver.resolve("ClientInstance::grabCursor", true);
-    const auto release = resolver.resolve("ClientInstance::releaseCursor", true);
-    const auto fov = resolver.resolve("LevelRendererPlayer::getFov");
-    const auto levelTick = resolver.resolve("MultiPlayerLevel::_subTick", true);
+    std::optional<bedrock::Resolution> keyboard, grab, release, fov, levelTick;
     const auto exact = [](const auto& symbol) {
         return symbol && symbol->exact_build && symbol->method == "exact-rva";
     };
-    if (!exact(keyboard) || !keyboard->verified || !exact(grab) || !exact(release) ||
-        !exact(fov) || !fov->verified || !exact(levelTick)) {
+    const auto resolveRequired = [&] {
+        keyboard = resolver.resolve("Keyboard::feed");
+        grab = resolver.resolve("ClientInstance::grabCursor", true);
+        release = resolver.resolve("ClientInstance::releaseCursor", true);
+        fov = resolver.resolve("LevelRendererPlayer::getFov");
+        levelTick = resolver.resolve("MultiPlayerLevel::_subTick", true);
+    };
+    const auto requirementsMet = [&] {
+        return exact(keyboard) && keyboard->verified && exact(grab) && exact(release) &&
+            exact(fov) && fov->verified && exact(levelTick);
+    };
+    resolveRequired();
+    if (!requirementsMet() && version.source != bedrock::ProfileSource::Remote) {
+        diagnostic("required symbols missing in cached profile; refreshing exact-build GitHub definition");
+        std::string refreshedProfile;
+        bedrock::ProfileChoice refreshedVersion;
+        if (bedrock::refreshSupportedProfile(version.identity, refreshedProfile, refreshedVersion, error,
+                [](std::string_view stage) { diagnostic("profile ", stage); })) {
+            if (resolver.loadJson(refreshedProfile, error) &&
+                resolver.attachWindowsMainModule(refreshedVersion.identity, error) &&
+                resolver.exactBuild()) {
+                profile = std::move(refreshedProfile);
+                version = std::move(refreshedVersion);
+                resolveRequired();
+                diagnostic("latest exact-build profile loaded [",
+                           bedrock::profileSourceName(version.source), "]");
+            } else {
+                diagnostic("refreshed profile attach failed: ", error);
+            }
+        } else {
+            diagnostic("exact-build profile refresh failed: ", error);
+        }
+    }
+    if (!requirementsMet()) {
         diagnostic("required symbols unavailable keyboard=", bool(keyboard),
                    " grab=", bool(grab), " release=", bool(release),
                    " fov=", bool(fov), " level=", bool(levelTick));
