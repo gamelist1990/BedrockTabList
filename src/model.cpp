@@ -4,6 +4,30 @@
 #include <cctype>
 
 namespace tablist {
+
+MurderRole murderRoleForHeldItem(std::string_view identifier,
+                                 std::string_view displayName) {
+    const auto equalsIgnoreCase = [](std::string_view left, std::string_view right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(left[i])) !=
+                std::tolower(static_cast<unsigned char>(right[i]))) return false;
+        }
+        return true;
+    };
+    const auto idIs = [&](std::string_view id) {
+        return equalsIgnoreCase(identifier, id) ||
+            (identifier.size() > id.size() && identifier[identifier.size() - id.size() - 1] == ':' &&
+             equalsIgnoreCase(identifier.substr(identifier.size() - id.size()), id));
+    };
+    if (idIs("iron_sword") || equalsIgnoreCase(displayName, "iron sword"))
+        return MurderRole::Murderer;
+    if (idIs("bow") || idIs("arrow") || equalsIgnoreCase(displayName, "bow") ||
+        equalsIgnoreCase(displayName, "arrow"))
+        return MurderRole::Sheriff;
+    return MurderRole::None;
+}
+
 namespace {
 
 struct FormattedText {

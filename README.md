@@ -12,6 +12,8 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - 画面上部中央に、半透明の背景・人数・プレイヤー名を表示
 - Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
+- `Actor::getHeldItem()` で観測した選択アイテムからMurderDetectの役割を表示（弓・矢=Sheriff/水色、鉄剣=Murderer/赤）
+- 手持ちアイテムはゲームtickごとにキャッシュし、Tabを押した時の同期スキャンを避ける
 - 16人を超える場合は自動的に複数列へ分割
 - メニュー、チャット、インベントリでは自動的に非表示
 - Minecraftの `Keyboard::feed(InputKey, down)` を直接使用
@@ -35,6 +37,8 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
   "enabled": true,
   "show_faces": true,
   "sort_by_name_color": false,
+  "murder_detect": true,
+  "debug": false,
   "background_color": "#0A0D14CC",
   "text_color": "#F2F5FBFF",
   "accent_color": "#64DC9BFF",
@@ -57,6 +61,11 @@ Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDK�
 `Level::getRuntimeActorList` は実機でSEH例外を起こしたため、現在の経路では呼び出していません。Hookが観測できないActorも含むView系のActor一覧取得は、現状まだ別経路として検証が必要です。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
+
+`murder_detect` は手持ちの弓/矢を `[Sheriff]`（水色）、鉄剣を `[Murderer]`（赤）で
+表示します。SDKが把握しているActorのアイテムを5 tickごとに更新するため、通常は最大約250msで
+切替が反映されます。未知のアイテムIDは `TabList.log` に一度だけ候補として記録されます。
+`debug` を `true` にするとActor名・表示名・個数・アイテム切替の詳細ログも出ます。
 
 同じフォルダの `TabList.log` には、起動結果、Level取得、Tab遷移、プレイヤー一覧の
 取得結果だけをコンパクトに記録します。メインメニューでinjectした場合も、Level tickと

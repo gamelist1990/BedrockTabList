@@ -42,16 +42,29 @@ int main() {
     std::string error;
     const auto config = tablist::parseConfig(R"({
       "show_faces":false, "background_color":"#112233CC",
-      "text_color":"#FFEEDD", "corner_radius":12, "maximum_rows":20
+      "text_color":"#FFEEDD", "corner_radius":12, "maximum_rows":20,
+      "murder_detect":true, "debug":true
     })", error);
     assert(error.empty());
     assert(!config.showFaces);
     assert(config.cornerRadius == 12.0f);
     assert(config.maximumRows == 20);
+    assert(config.murderDetect && config.debug);
     std::string roundTripError;
     const auto roundTrip = tablist::parseConfig(tablist::configJson(config), roundTripError);
     assert(roundTripError.empty());
     assert(!roundTrip.showFaces && roundTrip.maximumRows == 20);
+    assert(roundTrip.murderDetect && roundTrip.debug);
+    assert(tablist::murderRoleForHeldItem("minecraft:bow", "Bow") ==
+           tablist::MurderRole::Sheriff);
+    assert(tablist::murderRoleForHeldItem("minecraft:arrow", "Arrow") ==
+           tablist::MurderRole::Sheriff);
+    assert(tablist::murderRoleForHeldItem("minecraft:iron_sword", "Iron Sword") ==
+           tablist::MurderRole::Murderer);
+    assert(tablist::murderRoleForHeldItem("minecraft:golden_sword", "Golden Sword") ==
+           tablist::MurderRole::None);
+    assert(tablist::murderRoleForHeldItem("minecraft:crossbow", "Crossbow") ==
+           tablist::MurderRole::None);
 
     std::cout << "tablist_test: PASS\n";
 }

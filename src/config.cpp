@@ -59,6 +59,8 @@ Config parseConfig(std::string_view jsonText, std::string& error) noexcept {
         config.enabled = root.value("enabled", config.enabled);
         config.showFaces = root.value("show_faces", config.showFaces);
         config.sortByNameColor = root.value("sort_by_name_color", config.sortByNameColor);
+        config.murderDetect = root.value("murder_detect", config.murderDetect);
+        config.debug = root.value("debug", config.debug);
         config.background = parseColor(root, "background_color", config.background);
         config.text = parseColor(root, "text_color", config.text);
         config.accent = parseColor(root, "accent_color", config.accent);
@@ -89,6 +91,8 @@ std::string configJson(const Config& config) {
     root["enabled"] = config.enabled;
     root["show_faces"] = config.showFaces;
     root["sort_by_name_color"] = config.sortByNameColor;
+    root["murder_detect"] = config.murderDetect;
+    root["debug"] = config.debug;
     root["background_color"] = colorString(config.background);
     root["text_color"] = colorString(config.text);
     root["accent_color"] = colorString(config.accent);
