@@ -11,6 +11,8 @@
 #include <bedrock/remote_catalog.hpp>
 #include <bedrock/resolver.hpp>
 #include <bedrock/generated_symbols.hpp>
+#include <bedrock/game_api.hpp>
+#include <bedrock/game_hooks.hpp>
 #include <imgui.h>
 #include "tablist/config.hpp"
 #include "tablist/model.hpp"
@@ -47,11 +49,7 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
-// 1.26.52.3's runtime actor-list routine copies 0x40-byte values into its
-// output vector (not 8-byte Actor* elements). Preserve that native stride.
-struct RuntimeActorRecord {
-    std::array<std::byte, 0x40> bytes{};
-};
+struct RuntimeActorRecord { std::array<std::byte, 0x40> bytes{}; };
 static_assert(sizeof(RuntimeActorRecord) == 0x40);
 using RuntimeActorListFn = void*(__fastcall*)(void*, std::vector<RuntimeActorRecord>*);
 
@@ -133,15 +131,42 @@ struct ActorNameTagEntry {
     std::string nameTag;
     unsigned colorOrder = 28;
     std::uint64_t sequence = 0;
+    std::string playerName;
 };
-std::mutex actorNameTagMutex;
-std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
 // Keep only the latest observed color per player for concise transition logs.
 // A value of 28 means the current Actor nameTag has no supported color.
+std::mutex actorNameTagMutex;
 std::unordered_map<std::string, unsigned> observedPlayerColorOrders;
+std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
 std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
-std::atomic<std::int64_t> lastActorListRefreshMs{0};
+std::atomic<std::int64_t> lastActorNamePollMs{0};
+std::atomic<std::size_t> actorNamePollCursor{0};
+class TabListGameAccess final : public bedrock::GameAccess {
+public:
+    bool isActorValid(void* actor) const noexcept override;
+    void* localPlayer() const noexcept override { return nullptr; }
+    void* worldOf(void* actor) const noexcept override;
+    std::optional<std::string> nameTag(void* actor) const override {
+        (void)actor;
+        // Names are supplied to GameApi by the SDK's ActorNameTag event. Do
+        // not invoke a native Actor method from the overlay/render thread.
+        return std::nullopt;
+    }
+    std::vector<std::string> playerListNames(void* world) const override;
+    std::optional<bedrock::ServerAddress> serverAddress(void* player) const override {
+        (void)player;
+        return std::nullopt;
+    }
+private:
+    mutable std::mutex playerNamesMutex_;
+    mutable void* cachedWorld_{};
+    mutable std::int64_t playerNamesCacheMs_{};
+    mutable std::vector<std::string> playerNamesCache_;
+};
+TabListGameAccess tabListGameAccess;
+std::unique_ptr<bedrock::GameApi> gameApi;
+std::unique_ptr<bedrock::GameHooks> gameHooks;
 std::atomic<bool> loggedActorListFailure{false};
 std::atomic<bool> loggedActorListSuccess{false};
 std::atomic<bool> loggedActorReceiverAdjustment{false};
@@ -282,22 +307,11 @@ void recordLevel(void* level) noexcept {
     void* previous = levelInstance.exchange(level, std::memory_order_acq_rel);
     levelHeartbeatMs.store(steadyMilliseconds(), std::memory_order_release);
     if (previous != level) {
+        if (gameApi) gameApi->clearObservedActors();
         {
             std::lock_guard lock(actorNameTagMutex);
-            actorNameTags.clear();
             observedPlayerColorOrders.clear();
         }
-        loggedFirstNameTag.store(false, std::memory_order_release);
-        lastActorListRefreshMs.store(0, std::memory_order_release);
-        runtimeActorPointerOffset.store(-1, std::memory_order_release);
-        runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(), std::memory_order_release);
-        runtimeActorReceiverLevel.store(nullptr, std::memory_order_release);
-        runtimeActorListFunction.store(
-            resolvedRuntimeActorListFunction.load(std::memory_order_acquire),
-            std::memory_order_release);
-        loggedActorListFailure.store(false, std::memory_order_release);
-        loggedActorListSuccess.store(false, std::memory_order_release);
-        loggedActorReceiverAdjustment.store(false, std::memory_order_release);
         diagnostic("level ready");
     }
 }
@@ -438,6 +452,41 @@ bool looksLikeActor(void* actor) noexcept {
     return executableSlots >= 2;
 }
 
+bool TabListGameAccess::isActorValid(void* actor) const noexcept {
+    return looksLikeActor(actor);
+}
+
+void* TabListGameAccess::worldOf(void* actor) const noexcept {
+    return isActorValid(actor) ? levelInstance.load(std::memory_order_acquire) : nullptr;
+}
+
+std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
+    std::vector<std::string> names;
+    if (!world || world != levelInstance.load(std::memory_order_acquire)) return names;
+    const auto now = steadyMilliseconds();
+    {
+        std::lock_guard lock(playerNamesMutex_);
+        if (cachedWorld_ == world && now - playerNamesCacheMs_ < 50)
+            return playerNamesCache_;
+    }
+    NativePlayerList* players = nullptr;
+    if (!safeRead(world, levelPlayerListOffset, players) || !players ||
+        !readable(players, sizeof(NativePlayerList)) || players->size() > 512) return names;
+    names.reserve(players->size());
+    for (const auto& item : *players) {
+        const auto& name = item.second.name;
+        if (name.empty() || name.size() > 128 || !readable(name.data(), name.size())) continue;
+        names.push_back(name);
+    }
+    {
+        std::lock_guard lock(playerNamesMutex_);
+        cachedWorld_ = world;
+        playerNamesCacheMs_ = now;
+        playerNamesCache_ = names;
+    }
+    return names;
+}
+
 void* actorPointerFromRecord(const RuntimeActorRecord& record, std::size_t offset) noexcept {
     if (offset + sizeof(void*) > record.bytes.size()) return nullptr;
     void* actor = nullptr;
@@ -484,24 +533,24 @@ bool getActorNameTagView(void* actor, const char** data, std::size_t* size) noex
 }
 
 void captureQueriedActorNameTag(void* actor, const std::string& nameTag) noexcept {
-    if (!actor || nameTag.empty() || nameTag.size() > 512 ||
-        tablist::stripMinecraftFormatting(nameTag).empty()) return;
+    if (!actor || nameTag.size() > 512) return;
     try {
+        const bool hasVisibleName = !tablist::stripMinecraftFormatting(nameTag).empty();
         const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
         bool logFirstName = false;
         {
             std::lock_guard lock(actorNameTagMutex);
             const auto existing = actorNameTags.find(actor);
-            if (existing != actorNameTags.end() && existing->second.nameTag == nameTag) {
-                existing->second.sequence = sequence;
-                return;
-            }
+            if (existing != actorNameTags.end() && existing->second.nameTag == nameTag) return;
             if (!actorNameTags.contains(actor) && actorNameTags.size() >= 4096)
                 actorNameTags.clear();
-            const auto color = tablist::minecraftNameColorOrder(nameTag);
+            // Preserve an empty/reset nametag as a state change so stale colors
+            // do not remain attached to an Actor after its formatting changes.
+            const auto color = hasVisibleName ? tablist::minecraftNameColorOrder(nameTag) : 28u;
             actorNameTags.insert_or_assign(actor,
                 ActorNameTagEntry{nameTag, color, sequence});
-            logFirstName = !loggedFirstNameTag.exchange(true, std::memory_order_acq_rel);
+            logFirstName = hasVisibleName &&
+                !loggedFirstNameTag.exchange(true, std::memory_order_acq_rel);
         }
         if (logFirstName) diagnostic("Actor nameTag capture active; live color updates enabled");
     } catch (...) {
@@ -526,6 +575,52 @@ bool copyActorNameTag(void* actor, std::string* output) {
         (size && !readable(data, size))) return false;
     output->assign(data, size);
     return true;
+}
+
+// Actor::getNameTag is normally called by the renderer, so a hook alone only
+// refreshes actors whose labels happen to be queried that frame. Once an Actor
+// has been observed, poll a bounded batch on the game tick (20 Hz maximum).
+// This refreshes color/name changes even when its nametag is currently hidden.
+// It intentionally does not guess a Level actor-list ABI or discover new actors.
+void refreshObservedActorNameTags() noexcept {
+    constexpr std::int64_t intervalMs = 50;
+    constexpr std::size_t maximumBatch = 256;
+    if (!originalActorGetNameTag.load(std::memory_order_acquire)) return;
+    const auto now = steadyMilliseconds();
+    auto previous = lastActorNamePollMs.load(std::memory_order_acquire);
+    if (now - previous < intervalMs ||
+        !lastActorNamePollMs.compare_exchange_strong(previous, now,
+            std::memory_order_acq_rel, std::memory_order_acquire)) return;
+
+    try {
+        std::vector<void*> actors;
+        {
+            std::lock_guard lock(actorNameTagMutex);
+            actors.reserve(actorNameTags.size());
+            for (const auto& [actor, _] : actorNameTags) actors.push_back(actor);
+        }
+        if (actors.empty()) return;
+        const auto start = actorNamePollCursor.fetch_add(maximumBatch,
+            std::memory_order_acq_rel) % actors.size();
+        const auto count = std::min(maximumBatch, actors.size());
+        std::vector<void*> stale;
+        for (std::size_t i = 0; i < count; ++i) {
+            auto* actor = actors[(start + i) % actors.size()];
+            if (!looksLikeActor(actor)) {
+                stale.push_back(actor);
+                continue;
+            }
+            std::string nameTag;
+            if (copyActorNameTag(actor, &nameTag))
+                captureQueriedActorNameTag(actor, nameTag);
+        }
+        if (!stale.empty()) {
+            std::lock_guard lock(actorNameTagMutex);
+            for (auto* actor : stale) actorNameTags.erase(actor);
+        }
+    } catch (...) {
+        // Keep allocation/cache failures outside Minecraft's tick path.
+    }
 }
 
 void updateRuntimeActorNameTags(void* level) {
@@ -679,6 +774,26 @@ bool tryAcquireLevelFromClient() noexcept {
     return true;
 }
 
+std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
+    std::vector<ActorNameTagEntry> result;
+    if (!gameApi) return result;
+    const auto actors = gameApi->actors();
+    result.reserve(actors.size());
+    for (const auto& actor : actors) {
+        if (!actor.isValid() || !actor.isPlayer()) continue;
+        auto tag = actor.getNameTag();
+        if (tag.empty() || tag.size() > 512 ||
+            tablist::stripMinecraftFormatting(tag).empty()) continue;
+        auto playerName = actor.getName();
+        if (playerName.empty()) continue;
+        const auto sequence = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(actor.handle()));
+        result.push_back(ActorNameTagEntry{
+            std::move(tag), 28u, sequence, std::move(playerName)});
+    }
+    return result;
+}
+
 bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                        bool sortByNameColor,
                        const std::vector<ActorNameTagEntry>& actorTags) {
@@ -688,37 +803,48 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
         level = levelInstance.load(std::memory_order_acquire);
         if (!level) return false;
     }
-    NativePlayerList* players = nullptr;
-    if (!safeRead(level, levelPlayerListOffset, players) || !players ||
-        !readable(players, sizeof(NativePlayerList))) return false;
+    if (!gameApi) return false;
+    const auto playerNames = gameApi->world(level).getPlayerNames();
+    if (playerNames.size() > 512) return false;
 
-    const auto count = players->size();
-    if (count > 512) return false;
+    NativePlayerList* nativePlayers = nullptr;
+    std::unordered_map<std::string, const NativePlayerListEntry*> faceEntries;
+    if (includeFaces && safeRead(level, levelPlayerListOffset, nativePlayers) &&
+        nativePlayers && readable(nativePlayers, sizeof(NativePlayerList)) &&
+        nativePlayers->size() <= 512) {
+        faceEntries.reserve(nativePlayers->size());
+        for (const auto& item : *nativePlayers) {
+            const auto& nativeName = item.second.name;
+            if (nativeName.empty() || nativeName.size() > 128 ||
+                !readable(nativeName.data(), nativeName.size())) continue;
+            auto plain = tablist::stripMinecraftFormatting(nativeName);
+            if (!plain.empty()) faceEntries.try_emplace(std::move(plain), &item.second);
+        }
+    }
     rows.clear();
-    rows.reserve(count);
-    std::size_t visited = 0;
-    for (const auto& item : *players) {
-        if (++visited > 512) return false;
-        const auto& nativeName = item.second.name;
+    rows.reserve(playerNames.size());
+    for (const auto& nativeName : playerNames) {
         const auto length = nativeName.size();
         if (length == 0 || length > 128 || !readable(nativeName.data(), length)) continue;
         PlayerRow row;
-        row.name = tablist::stripMinecraftFormatting(
-            std::string_view(nativeName.data(), length));
+        row.name = tablist::stripMinecraftFormatting(nativeName);
         if (row.name.empty()) continue;
         if (sortByNameColor) {
             bool foundColor = false;
             bool bestWasExact = false;
             std::uint64_t bestSequence = 0;
             for (const auto& actorTag : actorTags) {
-                const auto color = tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag);
-                if (!color) continue;
-                const auto rawActorName = tablist::stripMinecraftFormatting(actorTag.nameTag);
-                const bool exact = rawActorName.size() == row.name.size() &&
-                    std::equal(rawActorName.begin(), rawActorName.end(), row.name.begin(),
+                if (actorTag.playerName.empty()) continue;
+                const auto canonical = tablist::stripMinecraftFormatting(actorTag.playerName);
+                const bool canonicalMatch = canonical.size() == row.name.size() &&
+                    std::equal(canonical.begin(), canonical.end(), row.name.begin(),
                         [](unsigned char a, unsigned char b) {
                             return std::tolower(a) == std::tolower(b);
                         });
+                if (!canonicalMatch) continue;
+                const auto color = tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag);
+                if (!color) continue;
+                const bool exact = true;
                 if (foundColor && (exact < bestWasExact ||
                     (exact == bestWasExact && actorTag.sequence <= bestSequence))) continue;
                 row.nameColorOrder = *color;
@@ -750,11 +876,27 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                     constexpr std::string_view codes = "0123456789abcdefghijmnpqstuv";
                     return order < codes.size() ? codes[order] : '-';
                 };
+                const auto colorName = [](unsigned order) -> std::string_view {
+                    static constexpr std::array<std::string_view, 28> names{
+                        "black", "dark_blue", "dark_green", "dark_aqua",
+                        "dark_red", "dark_purple", "gold", "gray", "dark_gray",
+                        "blue", "green", "aqua", "red", "light_purple", "yellow",
+                        "white", "minecoin_gold", "material_quartz", "server_purple",
+                        "material_netherite", "material_redstone", "material_copper",
+                        "material_gold", "material_emerald", "material_diamond",
+                        "material_lapis", "material_amethyst", "material_resin"};
+                    return order < names.size() ? names[order] : "none";
+                };
                 diagnostic("PlayerList name color updated: player=", row.name,
-                           " ", colorLabel(oldOrder), "->", colorLabel(newOrder));
+                           " ", colorLabel(oldOrder), "->", colorLabel(newOrder),
+                           " (", colorName(newOrder), "; match=",
+                           bestWasExact ? "exact" : "none", ")");
             }
         }
-        if (includeFaces) extractFace(item.second, row);
+        if (includeFaces) {
+            const auto face = faceEntries.find(row.name);
+            if (face != faceEntries.end()) extractFace(*face->second, row);
+        }
         rows.push_back(std::move(row));
     }
     std::stable_sort(rows.begin(), rows.end(), [sortByNameColor](const auto& left, const auto& right) {
@@ -865,14 +1007,7 @@ void drawTabList(void*) {
 
     std::vector<PlayerRow> players;
     std::vector<ActorNameTagEntry> actorTags;
-    if (config->sortByNameColor) {
-        std::lock_guard lock(actorNameTagMutex);
-        actorTags.reserve(actorNameTags.size());
-        for (const auto& [actor, entry] : actorNameTags) {
-            (void)actor;
-            actorTags.push_back(entry);
-        }
-    }
+    if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
     if (!collectRows(players, config->showFaces, config->sortByNameColor, actorTags) || players.empty()) {
         if (!loggedListFailure.exchange(true, std::memory_order_acq_rel))
             diagnostic("Tab detected but native player list is unavailable");
@@ -907,7 +1042,7 @@ void drawTabList(void*) {
         IM_COL32(255, 255, 255, 255), // §f white
         IM_COL32(221, 214, 5, 255),   // §g minecoin gold
         IM_COL32(227, 212, 209, 255), // §h material quartz
-        IM_COL32(206, 202, 202, 255), // §i material iron
+        IM_COL32(154, 92, 198, 255),  // §i rendered purple on the observed server
         IM_COL32(68, 58, 59, 255),    // §j material netherite
         IM_COL32(151, 22, 7, 255),    // §m material redstone
         IM_COL32(180, 104, 77, 255),  // §n material copper
@@ -1031,14 +1166,12 @@ bool loadConfig(const std::filesystem::path& path, bedrock::Logger& logger) {
 }
 
 void removeNativeHooks() noexcept {
-    if (actorNameTagHookToken) {
-        BDS_HookDirectRemove(actorNameTagHookToken);
-        actorNameTagHookToken = nullptr;
-    }
     for (auto& token : hookTokens) {
         if (token) BDS_HookUnsubscribe(token);
         token = nullptr;
     }
+    gameHooks.reset();
+    gameApi.reset();
     originalKeyboardFeed.store(nullptr);
     originalGrabCursor.store(nullptr);
     originalReleaseCursor.store(nullptr);
@@ -1201,28 +1334,22 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("shared hooks registered");
 
+    gameApi = std::make_unique<bedrock::GameApi>(tabListGameAccess);
+    gameHooks = std::make_unique<bedrock::GameHooks>(*gameApi);
     bool actorNameTagHookReady = false;
-    if (actorNameTag) {
-        auto* target = reinterpret_cast<void*>(actorNameTag->address);
-        resolvedActorGetNameTag.store(target, std::memory_order_release);
-        void* trampoline = nullptr;
-        actorNameTagHookReady = BDS_HookDirectInstall(
-            target, reinterpret_cast<void*>(&actorGetNameTagDetour), &trampoline,
-            &actorNameTagHookToken) != 0 && trampoline != nullptr;
-        if (actorNameTagHookReady) {
-            originalActorGetNameTag.store(trampoline, std::memory_order_release);
-            diagnostic("Actor::getNameTag capture hook active; method=", actorNameTag->method,
-                       " exact_build=", actorNameTag->exact_build,
-                       " verified=", actorNameTag->verified);
-        } else {
-            actorNameTagHookToken = nullptr;
-            originalActorGetNameTag.store(nullptr, std::memory_order_release);
-            diagnostic("Actor::getNameTag capture hook unavailable; color sort has no live Actor source");
-        }
+    if (actorNameTag)
+        actorNameTagHookReady = gameHooks->installActorNameTag(resolver, error);
+    if (actorNameTagHookReady) {
+        diagnostic("SDK GameHooks::ActorNameTag active; method=", actorNameTag->method,
+                   " exact_build=", actorNameTag->exact_build,
+                   " verified=", actorNameTag->verified);
+    } else {
+        diagnostic("SDK ActorNameTag hook unavailable; color sorting has no live Actor source",
+                   error.empty() ? "" : ": ", error);
     }
     runtimeActorListFunction.store(nullptr, std::memory_order_release);
     resolvedRuntimeActorListFunction.store(nullptr, std::memory_order_release);
-    diagnostic("world Actor source: dynamic-nameTag-hook=",
+    diagnostic("world Actor source: SDK ActorNameTag event=",
                actorNameTagHookReady ? "active" : "unavailable",
                " runtimeActorList=disabled");
 

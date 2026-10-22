@@ -53,7 +53,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 
 色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
 `sort_by_name_color` を `true` にすると、装飾コードを除いたPlayerList名を、Actor::getNameTag Hookで観測したActor名に部分一致させ、名前部分に適用されている色順に並べます。同色内は名前順です。
-Actor名はゲームが `Actor::getNameTag()` を呼ぶたび更新します。NameTagの色が後から変わった場合もTabListを開き直さず、描画ごとに色とソートへ反映します。Java共通色とBedrock material色（§g、§h、§i、§j、§m、§n、§p、§q、§s、§t、§u、§v）を扱い、色の遷移時のみ `PlayerList name color updated` を記録します。Actor名そのもののログは出さず、診断をコンパクトに保ちます。
+Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDKの `GameHooks` / `GameApi` / `Actor` API経由です。TabList固有のActor HookやRuntimeActorList呼び出しは使いません。SDKが観測したActorのNameTag変更をTabList描画時に反映し、PlayerList名との照合はSDKの `Actor::getName()` が返す正規名で行います。色遷移時のみ `PlayerList name color updated` を記録し、コード・色名・完全一致の有無を表示します。Hive上で実際に紫に描画される `§i` はTabListでも紫として表示します。
 `Level::getRuntimeActorList` は実機でSEH例外を起こしたため、現在の経路では呼び出していません。Hookが観測できないActorも含むView系のActor一覧取得は、現状まだ別経路として検証が必要です。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。

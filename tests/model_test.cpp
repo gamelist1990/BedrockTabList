@@ -15,6 +15,8 @@ int main() {
     assert(tablist::actorNameColorForPlayerName(
         "DamerDilly", "\xC2\xA7" "pDamerDilly") == 22);
     assert(tablist::actorNameColorForPlayerName(
+        "Emerald", "\xC2\xA7" "qEmerald") == 23);
+    assert(tablist::actorNameColorForPlayerName(
         "Biruplayz", "\xC2\xA7" "iBiruplayz\xC2\xA7" "8 [U]") == 18);
     assert(tablist::actorNameColorForPlayerName(
         "Copper", "\xC2\xA7" "nCopper") == 21);
