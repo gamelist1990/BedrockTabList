@@ -776,20 +776,17 @@ bool tryAcquireLevelFromClient() noexcept {
 
 std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
     std::vector<ActorNameTagEntry> result;
-    if (!gameApi) return result;
-    const auto actors = gameApi->actors();
-    result.reserve(actors.size());
-    for (const auto& actor : actors) {
-        if (!actor.isValid() || !actor.isPlayer()) continue;
-        auto tag = actor.getNameTag();
-        if (tag.empty() || tag.size() > 512 ||
-            tablist::stripMinecraftFormatting(tag).empty()) continue;
-        auto playerName = actor.getName();
-        if (playerName.empty()) continue;
-        const auto sequence = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(actor.handle()));
-        result.push_back(ActorNameTagEntry{
-            std::move(tag), 28u, sequence, std::move(playerName)});
+    // Never enumerate GameApi::actors() from the DXGI/render callback. On a
+    // busy world that walks every Actor and resolves PlayerList membership,
+    // making the first Tab frame stall. Actor::getNameTag observations are
+    // collected independently; the render path only takes a bounded cache
+    // snapshot and matches those strings against the native PlayerList rows.
+    std::lock_guard lock(actorNameTagMutex);
+    result.reserve(actorNameTags.size());
+    for (const auto& [_, entry] : actorNameTags) {
+        if (entry.nameTag.empty() || entry.nameTag.size() > 512 ||
+            tablist::stripMinecraftFormatting(entry.nameTag).empty()) continue;
+        result.push_back(entry);
     }
     return result;
 }
@@ -834,14 +831,6 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
             bool bestWasExact = false;
             std::uint64_t bestSequence = 0;
             for (const auto& actorTag : actorTags) {
-                if (actorTag.playerName.empty()) continue;
-                const auto canonical = tablist::stripMinecraftFormatting(actorTag.playerName);
-                const bool canonicalMatch = canonical.size() == row.name.size() &&
-                    std::equal(canonical.begin(), canonical.end(), row.name.begin(),
-                        [](unsigned char a, unsigned char b) {
-                            return std::tolower(a) == std::tolower(b);
-                        });
-                if (!canonicalMatch) continue;
                 const auto color = tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag);
                 if (!color) continue;
                 const bool exact = true;
@@ -1348,6 +1337,14 @@ DWORD WINAPI startClient(void*) {
         actorNameTagHookReady = gameHooks->installActorNameTag(resolver, error);
     }
     if (actorNameTagHookReady) {
+        gameApi->Event.Enum.ActorNameTag.then([](const bedrock::ActorNameTagEvent& event) {
+            if (!event.actor || event.nameTag.empty() || event.nameTag.size() > 512) return;
+            try {
+                captureQueriedActorNameTag(event.actor, std::string(event.nameTag));
+            } catch (...) {
+                // Cache updates are best-effort; never interfere with rendering.
+            }
+        });
         diagnostic("SDK GameHooks::ActorNameTag active; method=", actorNameTag->method,
                    " exact_build=", actorNameTag->exact_build,
                    " verified=", actorNameTag->verified);
