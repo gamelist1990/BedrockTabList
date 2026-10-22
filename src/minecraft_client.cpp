@@ -530,12 +530,27 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
     bedrock::Resolver resolver;
-    if (!resolver.loadJson(profile, error) ||
-        !resolver.attachWindowsMainModule(error) || !resolver.exactBuild()) {
+    diagnostic("resolver load");
+    if (!resolver.loadJson(profile, error)) {
+        diagnostic("resolver JSON failed: ", error);
         logger.error("Unsupported Minecraft executable: ", error);
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
+    diagnostic("resolver attach");
+    if (!resolver.attachWindowsMainModule(version.identity, error)) {
+        diagnostic("resolver attach failed: ", error);
+        logger.error("Unsupported Minecraft executable: ", error);
+        status.store(Status::Failed, std::memory_order_release);
+        return 1;
+    }
+    if (!resolver.exactBuild()) {
+        diagnostic("resolver build mismatch");
+        logger.error("Unsupported Minecraft executable: ", error);
+        status.store(Status::Failed, std::memory_order_release);
+        return 1;
+    }
+    diagnostic("resolver ready");
     const auto keyboard = resolver.resolve("Keyboard::feed");
     const auto grab = resolver.resolve("ClientInstance::grabCursor", true);
     const auto release = resolver.resolve("ClientInstance::releaseCursor", true);
@@ -546,6 +561,9 @@ DWORD WINAPI startClient(void*) {
     };
     if (!exact(keyboard) || !keyboard->verified || !exact(grab) || !exact(release) ||
         !exact(fov) || !fov->verified || !exact(levelTick)) {
+        diagnostic("required symbols unavailable keyboard=", bool(keyboard),
+                   " grab=", bool(grab), " release=", bool(release),
+                   " fov=", bool(fov), " level=", bool(levelTick));
         logger.error("Required native input/render symbols are unavailable");
         status.store(Status::Failed, std::memory_order_release);
         return 1;
@@ -553,6 +571,7 @@ DWORD WINAPI startClient(void*) {
 
     const auto initialized = MH_Initialize();
     if (initialized != MH_OK && initialized != MH_ERROR_ALREADY_INITIALIZED) {
+        diagnostic("MinHook initialize failed: ", static_cast<int>(initialized));
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
@@ -562,16 +581,19 @@ DWORD WINAPI startClient(void*) {
                    reinterpret_cast<void*>(release->address),
                    reinterpret_cast<void*>(fov->address),
                    reinterpret_cast<void*>(levelTick->address)};
+    diagnostic("native hooks create");
     const bool created =
         createHook(hookTargets[0], reinterpret_cast<void*>(&onKeyboardFeed), originalKeyboardFeed) &&
         createHook(hookTargets[1], reinterpret_cast<void*>(&onGrabCursor), originalGrabCursor) &&
         createHook(hookTargets[2], reinterpret_cast<void*>(&onReleaseCursor), originalReleaseCursor) &&
         createHook(hookTargets[3], reinterpret_cast<void*>(&onGetFov), originalGetFov) &&
         createHook(hookTargets[4], reinterpret_cast<void*>(&onLevelSubTick), originalLevelSubTick);
+    diagnostic("native hooks created ", created ? 1 : 0);
     bool queued = created;
     if (queued) for (void* target : hookTargets)
         queued = queued && MH_QueueEnableHook(target) == MH_OK;
     if (!queued || MH_ApplyQueued() != MH_OK) {
+        diagnostic("native hook enable failed");
         removeNativeHooks();
         if (ownsMinHook) MH_Uninitialize();
         ownsMinHook = false;
@@ -579,13 +601,16 @@ DWORD WINAPI startClient(void*) {
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
+    diagnostic("native hooks enabled");
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;
     options.initiallyVisible = true;
     options.captureInput = false;
     options.nativeCursor = false;
+    diagnostic("overlay install");
     if (!bedrock::gui::Overlay::install(&drawTabList, nullptr, error, options)) {
+        diagnostic("overlay install failed: ", error);
         removeNativeHooks();
         if (ownsMinHook) MH_Uninitialize();
         ownsMinHook = false;
@@ -596,6 +621,7 @@ DWORD WINAPI startClient(void*) {
 
     logger.info("Minecraft native TabList ready; hold Tab in a world. Config: ",
                 path.string());
+    diagnostic("hooks and overlay ready");
     diagnostic("ready ", version.version, " ", bedrock::profileSourceName(version.source));
     status.store(Status::Running, std::memory_order_release);
     auto lastWrite = std::filesystem::last_write_time(path);
