@@ -115,12 +115,18 @@ std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
 std::atomic<bool> captureActorNameTags{false};
 std::atomic<std::size_t> runtimeActorListVtableSlot{0};
-struct ActorNameTagEntry { std::string nameTag; unsigned colorOrder = 16; };
+struct ActorNameTagEntry {
+    std::string nameTag;
+    unsigned colorOrder = 16;
+    std::uint64_t sequence = 0;
+};
 std::mutex actorNameTagMutex;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
 std::unordered_set<std::string> loggedNameTags;
+std::unordered_set<std::string> loggedPlayerColorMatches;
 std::atomic<unsigned> loggedNameTagDetections{0};
 std::atomic<bool> loggedActorNameTagCall{false};
+std::atomic<std::uint64_t> actorNameTagSequence{0};
 BDS_HookToken actorNameTagHookToken{};
 std::atomic<std::int64_t> lastActorListRefreshMs{0};
 std::atomic<bool> loggedActorListFailure{false};
@@ -266,6 +272,7 @@ void recordLevel(void* level) noexcept {
             std::lock_guard lock(actorNameTagMutex);
             actorNameTags.clear();
             loggedNameTags.clear();
+            loggedPlayerColorMatches.clear();
         }
         loggedNameTagDetections.store(0, std::memory_order_release);
         lastActorListRefreshMs.store(0, std::memory_order_release);
@@ -300,7 +307,8 @@ const std::string& __fastcall onActorGetNameTag(void* actor) {
             if (color < 16) {
                 if (actorNameTags.size() >= 512 && !actorNameTags.contains(actor))
                     actorNameTags.erase(actorNameTags.begin());
-                actorNameTags.insert_or_assign(actor, ActorNameTagEntry{nameTag, color});
+                const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+                actorNameTags.insert_or_assign(actor, ActorNameTagEntry{nameTag, color, sequence});
             } else {
                 actorNameTags.erase(actor);
             }
@@ -387,7 +395,8 @@ void updateRuntimeActorNameTags(void* level) {
         if (!copyActorNameTag(actor, &nameTag) || nameTag.empty()) continue;
         const auto color = tablist::minecraftNameColorOrder(nameTag);
         if (color >= 16 || tablist::stripMinecraftFormatting(nameTag).empty()) continue;
-        updated.insert_or_assign(actor, ActorNameTagEntry{std::move(nameTag), color});
+        const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        updated.insert_or_assign(actor, ActorNameTagEntry{std::move(nameTag), color, sequence});
         if (updated.size() >= 512) break;
     }
     {
@@ -450,13 +459,37 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
             std::string_view(nativeName.data(), length));
         if (row.name.empty()) continue;
         if (sortByNameColor) {
-            std::size_t bestActorNameLength = std::numeric_limits<std::size_t>::max();
+            bool foundColor = false;
+            bool bestWasExact = false;
+            std::uint64_t bestSequence = 0;
+            std::string matchedActorNameTag;
             for (const auto& actorTag : actorTags) {
-                if (actorTag.nameTag.size() >= bestActorNameLength) continue;
-                if (tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag)) {
-                    row.nameColorOrder = actorTag.colorOrder;
-                    bestActorNameLength = actorTag.nameTag.size();
+                const auto color = tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag);
+                if (!color) continue;
+                const auto rawActorName = tablist::stripMinecraftFormatting(actorTag.nameTag);
+                const bool exact = rawActorName.size() == row.name.size() &&
+                    std::equal(rawActorName.begin(), rawActorName.end(), row.name.begin(),
+                        [](unsigned char a, unsigned char b) {
+                            return std::tolower(a) == std::tolower(b);
+                        });
+                if (foundColor && (exact < bestWasExact ||
+                    (exact == bestWasExact && actorTag.sequence <= bestSequence))) continue;
+                row.nameColorOrder = *color;
+                bestWasExact = exact;
+                bestSequence = actorTag.sequence;
+                matchedActorNameTag = actorTag.nameTag;
+                foundColor = true;
+            }
+            if (foundColor) {
+                bool firstMatch = false;
+                {
+                    std::lock_guard lock(actorNameTagMutex);
+                    firstMatch = loggedPlayerColorMatches.insert(row.name).second;
                 }
+                if (firstMatch)
+                    diagnostic("PlayerList color matched: player=", row.name,
+                               " actor=", matchedActorNameTag,
+                               " order=", row.nameColorOrder);
             }
         }
         if (includeFaces) extractFace(item.second, row);

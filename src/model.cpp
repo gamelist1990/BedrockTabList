@@ -4,70 +4,88 @@
 #include <cctype>
 
 namespace tablist {
+namespace {
 
-std::string stripMinecraftFormatting(std::string_view text) {
-    std::string result;
-    result.reserve(text.size());
-    for (std::size_t i = 0; i < text.size(); ++i) {
+struct FormattedText {
+    std::string plain;
+    std::vector<unsigned> colorAtByte;
+};
+
+FormattedText parseFormatting(std::string_view text) {
+    FormattedText result;
+    result.plain.reserve(text.size());
+    result.colorAtByte.reserve(text.size());
+    constexpr std::string_view colorCodes = "0123456789abcdef";
+    unsigned activeColor = 16;
+    for (std::size_t i = 0; i < text.size();) {
         const auto current = static_cast<unsigned char>(text[i]);
+        std::size_t codeIndex = std::string_view::npos;
+        std::size_t sequenceLength = 0;
         if (current == 0xC2 && i + 2 < text.size() &&
             static_cast<unsigned char>(text[i + 1]) == 0xA7) {
-            i += 2;
+            codeIndex = i + 2;
+            sequenceLength = 3;
+        } else if (current == 0xA7 && i + 1 < text.size()) {
+            codeIndex = i + 1;
+            sequenceLength = 2;
+        }
+        if (sequenceLength != 0) {
+            const auto code = static_cast<char>(std::tolower(
+                static_cast<unsigned char>(text[codeIndex])));
+            const auto color = colorCodes.find(code);
+            if (color != std::string_view::npos)
+                activeColor = static_cast<unsigned>(color);
+            else if (code == 'r')
+                activeColor = 16;
+            i += sequenceLength;
             continue;
         }
-        if (current == 0xA7 && i + 1 < text.size()) {
-            ++i;
-            continue;
-        }
-        result.push_back(text[i]);
+        result.plain.push_back(text[i]);
+        result.colorAtByte.push_back(activeColor);
+        ++i;
     }
     return result;
 }
 
+bool equalsIgnoreAsciiCase(std::string_view left, std::string_view right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) !=
+            std::tolower(static_cast<unsigned char>(right[i]))) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+std::string stripMinecraftFormatting(std::string_view text) {
+    return parseFormatting(text).plain;
+}
+
 unsigned minecraftNameColorOrder(std::string_view text) noexcept {
-    constexpr std::string_view colorCodes = "0123456789abcdef";
-    for (std::size_t i = 0; i + 1 < text.size(); ++i) {
-        std::size_t codeIndex = i;
-        const auto current = static_cast<unsigned char>(text[i]);
-        if (current == 0xC2 && i + 2 < text.size() &&
-            static_cast<unsigned char>(text[i + 1]) == 0xA7) {
-            codeIndex = i + 2;
-            i += 2;
-        } else if (current == 0xA7) {
-            codeIndex = i + 1;
-            ++i;
-        } else {
-            continue;
-        }
-        if (codeIndex >= text.size()) break;
-        const auto code = static_cast<char>(std::tolower(
-            static_cast<unsigned char>(text[codeIndex])));
-        const auto found = colorCodes.find(code);
-        if (found != std::string_view::npos) return static_cast<unsigned>(found);
+    try {
+        const auto parsed = parseFormatting(text);
+        for (const auto color : parsed.colorAtByte)
+            if (color < 16) return color;
+    } catch (...) {
+        // Keep the legacy lookup noexcept; allocation failure means no color.
     }
     return 16;
 }
 
 std::optional<unsigned> actorNameColorForPlayerName(
     std::string_view playerListName, std::string_view actorNameTag) {
-    const auto color = minecraftNameColorOrder(actorNameTag);
-    if (color >= 16) return std::nullopt;
-    const auto actorRawName = stripMinecraftFormatting(actorNameTag);
+    const auto parsed = parseFormatting(actorNameTag);
+    const auto& actorRawName = parsed.plain;
     if (playerListName.empty() || actorRawName.empty() ||
         playerListName.size() > actorRawName.size()) return std::nullopt;
-    const auto equalsIgnoreAsciiCase = [](std::string_view left, std::string_view right) {
-        if (left.size() != right.size()) return false;
-        for (std::size_t i = 0; i < left.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(left[i])) !=
-                std::tolower(static_cast<unsigned char>(right[i]))) return false;
-        }
-        return true;
-    };
     for (std::size_t offset = 0;
          offset + playerListName.size() <= actorRawName.size(); ++offset) {
         if (equalsIgnoreAsciiCase(playerListName,
-                                  std::string_view(actorRawName).substr(offset, playerListName.size())))
-            return color;
+                                  std::string_view(actorRawName).substr(offset, playerListName.size()))) {
+            const auto color = parsed.colorAtByte[offset];
+            if (color < 16) return color;
+        }
     }
     return std::nullopt;
 }

@@ -8,6 +8,12 @@
 int main() {
     assert(tablist::stripMinecraftFormatting("Steve") == "Steve");
     assert(tablist::stripMinecraftFormatting("\xC2\xA7" "aAlex") == "Alex");
+    assert(tablist::actorNameColorForPlayerName(
+        "Alex", "\xC2\xA7" "7[VIP] \xC2\xA7" "cAlex\xC2\xA7" "8 [L]") == 12);
+    assert(!tablist::actorNameColorForPlayerName(
+        "kanatans77", "\xC2\xA7" "ikanatans77\xC2\xA7" "8 [\xC2\xA7" "iU\xC2\xA7" "8]"));
+    assert(!tablist::actorNameColorForPlayerName(
+        "Alex", "\xC2\xA7" "cPrefix \xC2\xA7" "rAlex\xC2\xA7" "8 rank"));
 
     std::vector<std::string> names{"zed", "Alex", "bob"};
     tablist::sortPlayerNames(names);
