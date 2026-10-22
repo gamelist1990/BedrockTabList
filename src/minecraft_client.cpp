@@ -142,16 +142,16 @@ std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorNamePollMs{0};
 std::atomic<std::size_t> actorNamePollCursor{0};
+bool copyActorNameTag(void* actor, std::string* output);
 class TabListGameAccess final : public bedrock::GameAccess {
 public:
     bool isActorValid(void* actor) const noexcept override;
     void* localPlayer() const noexcept override { return nullptr; }
     void* worldOf(void* actor) const noexcept override;
     std::optional<std::string> nameTag(void* actor) const override {
-        (void)actor;
-        // Names are supplied to GameApi by the SDK's ActorNameTag event. Do
-        // not invoke a native Actor method from the overlay/render thread.
-        return std::nullopt;
+        std::string result;
+        return copyActorNameTag(actor, &result) ? std::optional<std::string>{std::move(result)}
+                                               : std::nullopt;
     }
     std::vector<std::string> playerListNames(void* world) const override;
     std::optional<bedrock::ServerAddress> serverAddress(void* player) const override {
@@ -324,8 +324,6 @@ bool executable(const void* pointer) noexcept {
     return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
-
-bool copyActorNameTag(void* actor, std::string* output);
 
 struct RuntimeActorReceiverProbe {
     void* receiver{};
@@ -776,18 +774,26 @@ bool tryAcquireLevelFromClient() noexcept {
 
 std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
     std::vector<ActorNameTagEntry> result;
-    // Never enumerate GameApi::actors() from the DXGI/render callback. On a
-    // busy world that walks every Actor and resolves PlayerList membership,
-    // making the first Tab frame stall. Actor::getNameTag observations are
-    // collected independently; the render path only takes a bounded cache
-    // snapshot and matches those strings against the native PlayerList rows.
-    std::lock_guard lock(actorNameTagMutex);
-    result.reserve(actorNameTags.size());
-    for (const auto& [_, entry] : actorNameTags) {
-        if (entry.nameTag.empty() || entry.nameTag.size() > 512 ||
-            tablist::stripMinecraftFormatting(entry.nameTag).empty()) continue;
-        result.push_back(entry);
-    }
+    // Read immutable SDK snapshots only; no GameApi::actors() walk, native
+    // Actor calls, or PlayerList matching is done by the DXGI render callback.
+    if (!gameApi) return result;
+    std::unordered_map<void*, ActorNameTagEntry> byActor;
+    const auto append = [&](bedrock::NameTagSource source) {
+        const auto snapshot = gameApi->cachedActorNameTags(source);
+        for (const auto& item : *snapshot) {
+            if (!item.actor || item.nameTag.empty() || item.nameTag.size() > 512 ||
+                tablist::stripMinecraftFormatting(item.nameTag).empty()) continue;
+            const auto existing = byActor.find(item.actor);
+            if (existing != byActor.end() && existing->second.sequence > item.sequence) continue;
+            const auto color = tablist::minecraftNameColorOrder(item.nameTag);
+            byActor.insert_or_assign(item.actor,
+                ActorNameTagEntry{item.nameTag, color, item.sequence});
+        }
+    };
+    append(bedrock::NameTagSource::View);
+    append(bedrock::NameTagSource::ActorGetter); // getter is newest/authoritative on duplicates
+    result.reserve(byActor.size());
+    for (auto& [_, entry] : byActor) result.push_back(std::move(entry));
     return result;
 }
 
@@ -863,6 +869,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
             if (colorChanged) {
                 const auto colorLabel = [](unsigned order) {
                     constexpr std::string_view codes = "0123456789abcdefghijmnpqstuv";
+                    if (order == 10) return 'p'; // target server's §p green
                     return order < codes.size() ? codes[order] : '-';
                 };
                 const auto colorName = [](unsigned order) -> std::string_view {
@@ -951,6 +958,14 @@ float __fastcall onGetFov(void* self, float inputFov, void* a3, void* a4) {
 void __fastcall onLevelSubTick(void* level) {
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
+    // Refresh known Actor tags once per second on the game thread. The getter
+    // hook still updates immediately; this catches changes while labels are
+    // hidden without burdening the tab-open/render path.
+    static unsigned refreshTicks = 0;
+    if (++refreshTicks >= 20) {
+        refreshTicks = 0;
+        if (gameApi) (void)gameApi->refreshCachedActorNameTags(64);
+    }
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {

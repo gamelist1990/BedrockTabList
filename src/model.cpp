@@ -36,7 +36,12 @@ FormattedText parseFormatting(std::string_view text) {
             const auto code = static_cast<char>(std::tolower(
                 static_cast<unsigned char>(text[codeIndex])));
             const auto color = colorCodes.find(code);
-            if (color != std::string_view::npos)
+            // The target server uses §p for green PlayerList/nameTag names,
+            // even though vanilla Bedrock's extended palette assigns it a
+            // material tone. Prefer the observed server convention here.
+            if (code == 'p')
+                activeColor = 10;
+            else if (color != std::string_view::npos)
                 activeColor = static_cast<unsigned>(color);
             else if (code == 'r')
                 activeColor = noColor;

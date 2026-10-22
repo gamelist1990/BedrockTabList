@@ -10,10 +10,9 @@ int main() {
     assert(tablist::stripMinecraftFormatting("\xC2\xA7" "aAlex") == "Alex");
     assert(tablist::actorNameColorForPlayerName(
         "Alex", "\xC2\xA7" "7[VIP] \xC2\xA7" "cAlex\xC2\xA7" "8 [L]") == 12);
-    // Bedrock-only material colors must be treated as real colors, not as
-    // formatting codes (notably §i and §p seen in live Hive nameTags).
+    // Extended nameTag codes and the target server's §p green convention.
     assert(tablist::actorNameColorForPlayerName(
-        "DamerDilly", "\xC2\xA7" "pDamerDilly") == 22);
+        "DamerDilly", "\xC2\xA7" "pDamerDilly") == 10);
     assert(tablist::actorNameColorForPlayerName(
         "Emerald", "\xC2\xA7" "qEmerald") == 23);
     assert(tablist::actorNameColorForPlayerName(
