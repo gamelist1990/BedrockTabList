@@ -301,6 +301,17 @@ bool executable(const void* pointer) noexcept {
 
 bool copyActorNameTag(void* actor, std::string* output);
 
+int captureRuntimeActorException(EXCEPTION_POINTERS* exception,
+                                 unsigned long* exceptionCode,
+                                 std::uintptr_t* exceptionAddress) noexcept {
+    if (exceptionCode && exception && exception->ExceptionRecord)
+        *exceptionCode = exception->ExceptionRecord->ExceptionCode;
+    if (exceptionAddress && exception && exception->ExceptionRecord)
+        *exceptionAddress = reinterpret_cast<std::uintptr_t>(
+            exception->ExceptionRecord->ExceptionAddress);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // Keep native dispatch inside a tiny SEH boundary with no owning C++ objects
 // on its stack. The candidate signature is only usable on an exact build.
 bool invokeRuntimeActorList(void* level, void* function,
@@ -313,14 +324,8 @@ bool invokeRuntimeActorList(void* level, void* function,
     __try {
         reinterpret_cast<RuntimeActorListFn>(function)(level, actors);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (exceptionCode) *exceptionCode = GetExceptionCode();
-        if (exceptionAddress) {
-            auto* exception = GetExceptionInformation();
-            if (exception && exception->ExceptionRecord)
-                *exceptionAddress = reinterpret_cast<std::uintptr_t>(
-                    exception->ExceptionRecord->ExceptionAddress);
-        }
+    } __except (captureRuntimeActorException(GetExceptionInformation(),
+                                              exceptionCode, exceptionAddress)) {
         return false;
     }
 }
