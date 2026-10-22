@@ -101,6 +101,7 @@ struct NativeSkinImage {
 struct PlayerRow {
     std::string name;
     unsigned nameColorOrder = 16;
+    bool hasNameColor = false;
     std::array<std::uint32_t, 64> face{};
     bool hasFace = false;
 };
@@ -736,6 +737,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                 if (foundColor && (exact < bestWasExact ||
                     (exact == bestWasExact && actorTag.sequence <= bestSequence))) continue;
                 row.nameColorOrder = *color;
+                row.hasNameColor = true;
                 bestWasExact = exact;
                 bestSequence = actorTag.sequence;
                 matchedActorNameTag = actorTag.nameTag;
@@ -887,6 +889,24 @@ void drawTabList(void*) {
     const auto packed = [](tablist::Color color) {
         return ImGui::ColorConvertFloat4ToU32({color.r, color.g, color.b, color.a});
     };
+    static constexpr std::array<ImU32, 16> minecraftNameColors{
+        IM_COL32(0, 0, 0, 255),       // §0 black
+        IM_COL32(0, 0, 170, 255),     // §1 dark blue
+        IM_COL32(0, 170, 0, 255),     // §2 dark green
+        IM_COL32(0, 170, 170, 255),   // §3 dark aqua
+        IM_COL32(170, 0, 0, 255),     // §4 dark red
+        IM_COL32(170, 0, 170, 255),   // §5 dark purple
+        IM_COL32(255, 170, 0, 255),   // §6 gold
+        IM_COL32(170, 170, 170, 255), // §7 gray
+        IM_COL32(85, 85, 85, 255),    // §8 dark gray
+        IM_COL32(85, 85, 255, 255),   // §9 blue
+        IM_COL32(85, 255, 85, 255),   // §a green
+        IM_COL32(85, 255, 255, 255),  // §b aqua
+        IM_COL32(255, 85, 85, 255),   // §c red
+        IM_COL32(255, 85, 255, 255),  // §d light purple
+        IM_COL32(255, 255, 85, 255),  // §e yellow
+        IM_COL32(255, 255, 255, 255), // §f white
+    };
 
     std::vector<float> widths(layout.columns, config->minimumColumnWidth);
     for (std::size_t i = 0; i < players.size(); ++i) {
@@ -949,8 +969,12 @@ void drawTabList(void*) {
             textX += 9.0f;
         }
         const auto textSize = ImGui::CalcTextSize(players[i].name.c_str());
+        const ImU32 nameColor = players[i].hasNameColor && players[i].nameColorOrder <
+            minecraftNameColors.size()
+            ? minecraftNameColors[players[i].nameColorOrder]
+            : packed(config->text);
         draw->AddText({textX, y + (config->rowHeight - textSize.y) * 0.5f},
-                      packed(config->text), players[i].name.c_str());
+                      nameColor, players[i].name.c_str());
     }
 }
 
