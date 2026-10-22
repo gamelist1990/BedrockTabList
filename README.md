@@ -50,8 +50,9 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
 
-同じフォルダの `TabList.log` には、TabのMinecraft `InputKey`、描画開始、
-プレイヤー一覧取得状態を記録します。
+同じフォルダの `TabList.log` には、起動結果、Level取得、Tab遷移、プレイヤー一覧の
+取得結果だけをコンパクトに記録します。メインメニューでinjectした場合も、Level tickと
+ClientInstance経路を継続的に再確認し、ワールド参加後に自動で有効になります。
 
 ## ビルド
 
