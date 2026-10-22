@@ -87,6 +87,7 @@ struct NativeSkinImage {
 };
 struct PlayerRow {
     std::string name;
+    unsigned nameColorOrder = 16;
     std::array<std::uint32_t, 64> face{};
     bool hasFace = false;
 };
@@ -113,7 +114,6 @@ std::array<BDS_HookToken, 5> hookTokens{};
 struct NextFrame { BDS_HookNext next{}; void* frame{}; };
 thread_local NextFrame keyFrame, cursorFrame, fovFrame, levelFrame;
 thread_local NextFrame* activeCursorFrame{};
-
 bool __fastcall callNextKeyboard(int key, bool down) {
     if (!keyFrame.next) return false;
     BDS_KeyboardArgs args{key, down ? 1 : 0, 0};
@@ -271,7 +271,8 @@ bool tryAcquireLevelFromClient() noexcept {
     return true;
 }
 
-bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces) {
+bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
+                       bool sortByNameColor) {
     void* level = levelInstance.load(std::memory_order_acquire);
     if (!level) {
         if (!tryAcquireLevelFromClient()) return false;
@@ -293,13 +294,17 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces) {
         const auto length = nativeName.size();
         if (length == 0 || length > 128 || !readable(nativeName.data(), length)) continue;
         PlayerRow row;
+        row.nameColorOrder = tablist::minecraftNameColorOrder(
+            std::string_view(nativeName.data(), length));
         row.name = tablist::stripMinecraftFormatting(
             std::string_view(nativeName.data(), length));
         if (row.name.empty()) continue;
         if (includeFaces) extractFace(item.second, row);
         rows.push_back(std::move(row));
     }
-    std::stable_sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+    std::stable_sort(rows.begin(), rows.end(), [sortByNameColor](const auto& left, const auto& right) {
+        if (sortByNameColor && left.nameColorOrder != right.nameColorOrder)
+            return left.nameColorOrder < right.nameColorOrder;
         return std::lexicographical_compare(
             left.name.begin(), left.name.end(), right.name.begin(), right.name.end(),
             [](unsigned char a, unsigned char b) {
@@ -312,11 +317,12 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces) {
     return true;
 }
 
-bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces) noexcept {
+bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
+                 bool sortByNameColor) noexcept {
     // Keep SEH outside the function that owns C++ objects. A player joining or
     // leaving during the read cannot crash Minecraft; that frame is skipped.
     __try {
-        return collectRowsUnsafe(rows, includeFaces);
+        return collectRowsUnsafe(rows, includeFaces, sortByNameColor);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         rows.clear();
         return false;
@@ -402,7 +408,7 @@ void drawTabList(void*) {
     if (!levelIsFresh() && !tryAcquireLevelFromClient()) return;
 
     std::vector<PlayerRow> players;
-    if (!collectRows(players, config->showFaces) || players.empty()) {
+    if (!collectRows(players, config->showFaces, config->sortByNameColor) || players.empty()) {
         if (!loggedListFailure.exchange(true, std::memory_order_acq_rel))
             diagnostic("Tab detected but native player list is unavailable");
         return;

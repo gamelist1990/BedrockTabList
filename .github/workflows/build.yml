@@ -38,5 +38,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: BedrockTabList-windows-x64
-          path: build/Release/BedrockTabList.dll
+          path: |
+            build/Release/BedrockTabList.dll
+            build/Release/BedrockSDKRuntime.dll
 

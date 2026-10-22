@@ -24,6 +24,30 @@ std::string stripMinecraftFormatting(std::string_view text) {
     return result;
 }
 
+unsigned minecraftNameColorOrder(std::string_view text) noexcept {
+    constexpr std::string_view colorCodes = "0123456789abcdef";
+    for (std::size_t i = 0; i + 1 < text.size(); ++i) {
+        std::size_t codeIndex = i;
+        const auto current = static_cast<unsigned char>(text[i]);
+        if (current == 0xC2 && i + 2 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) == 0xA7) {
+            codeIndex = i + 2;
+            i += 2;
+        } else if (current == 0xA7) {
+            codeIndex = i + 1;
+            ++i;
+        } else {
+            continue;
+        }
+        if (codeIndex >= text.size()) break;
+        const auto code = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(text[codeIndex])));
+        const auto found = colorCodes.find(code);
+        if (found != std::string_view::npos) return static_cast<unsigned>(found);
+    }
+    return 16;
+}
+
 void sortPlayerNames(std::vector<std::string>& names) {
     std::stable_sort(names.begin(), names.end(), [](const auto& left, const auto& right) {
         return std::lexicographical_compare(

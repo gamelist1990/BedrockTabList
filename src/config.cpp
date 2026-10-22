@@ -58,6 +58,7 @@ Config parseConfig(std::string_view jsonText, std::string& error) noexcept {
         if (!root.is_object()) throw std::runtime_error("config root must be an object");
         config.enabled = root.value("enabled", config.enabled);
         config.showFaces = root.value("show_faces", config.showFaces);
+        config.sortByNameColor = root.value("sort_by_name_color", config.sortByNameColor);
         config.background = parseColor(root, "background_color", config.background);
         config.text = parseColor(root, "text_color", config.text);
         config.accent = parseColor(root, "accent_color", config.accent);
@@ -87,6 +88,7 @@ std::string configJson(const Config& config) {
     nlohmann::ordered_json root;
     root["enabled"] = config.enabled;
     root["show_faces"] = config.showFaces;
+    root["sort_by_name_color"] = config.sortByNameColor;
     root["background_color"] = colorString(config.background);
     root["text_color"] = colorString(config.text);
     root["accent_color"] = colorString(config.accent);

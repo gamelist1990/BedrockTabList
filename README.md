@@ -11,6 +11,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - ワールド内で `Tab` を押している間だけプレイヤー一覧を表示
 - 画面上部中央に、半透明の背景・人数・プレイヤー名を表示
 - Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
+- Actorの名前に付いたMinecraft `§` 色コードを検出し、設定で色順ソート可能
 - 16人を超える場合は自動的に複数列へ分割
 - メニュー、チャット、インベントリでは自動的に非表示
 - Minecraftの `Keyboard::feed(InputKey, down)` を直接使用
@@ -33,6 +34,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 {
   "enabled": true,
   "show_faces": true,
+  "sort_by_name_color": false,
   "background_color": "#0A0D14CC",
   "text_color": "#F2F5FBFF",
   "accent_color": "#64DC9BFF",
@@ -50,6 +52,9 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 ```
 
 色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
+`sort_by_name_color` を `true` にすると、取得した名前の最初の `§0`〜`§f` 色コードで
+Minecraftの色コード順にグループ化し、同じ色の中は名前順に並べます。色指定がない名前は
+色付きの名前の後ろに並びます。`§l` などの装飾コードは色判定に使いません。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
 
