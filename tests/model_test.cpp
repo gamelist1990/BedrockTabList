@@ -10,8 +10,18 @@ int main() {
     assert(tablist::stripMinecraftFormatting("\xC2\xA7" "aAlex") == "Alex");
     assert(tablist::actorNameColorForPlayerName(
         "Alex", "\xC2\xA7" "7[VIP] \xC2\xA7" "cAlex\xC2\xA7" "8 [L]") == 12);
-    assert(!tablist::actorNameColorForPlayerName(
-        "kanatans77", "\xC2\xA7" "ikanatans77\xC2\xA7" "8 [\xC2\xA7" "iU\xC2\xA7" "8]"));
+    // Bedrock-only material colors must be treated as real colors, not as
+    // formatting codes (notably §i and §p seen in live Hive nameTags).
+    assert(tablist::actorNameColorForPlayerName(
+        "DamerDilly", "\xC2\xA7" "pDamerDilly") == 22);
+    assert(tablist::actorNameColorForPlayerName(
+        "Biruplayz", "\xC2\xA7" "iBiruplayz\xC2\xA7" "8 [U]") == 18);
+    assert(tablist::actorNameColorForPlayerName(
+        "Copper", "\xC2\xA7" "nCopper") == 21);
+    assert(tablist::actorNameColorForPlayerName(
+        "Resin", "\xC2\xA7" "vResin") == 27);
+    assert(tablist::actorNameColorForPlayerName(
+        "kanatans77", "\xC2\xA7" "ikanatans77\xC2\xA7" "8 [\xC2\xA7" "iU\xC2\xA7" "8]") == 18);
     assert(!tablist::actorNameColorForPlayerName(
         "Alex", "\xC2\xA7" "cPrefix \xC2\xA7" "rAlex\xC2\xA7" "8 rank"));
 

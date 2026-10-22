@@ -36,7 +36,6 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -100,7 +99,7 @@ struct NativeSkinImage {
 };
 struct PlayerRow {
     std::string name;
-    unsigned nameColorOrder = 16;
+    unsigned nameColorOrder = 28;
     bool hasNameColor = false;
     std::array<std::uint32_t, 64> face{};
     bool hasFace = false;
@@ -132,14 +131,15 @@ std::atomic<int> runtimeActorReceiverAdjustment{std::numeric_limits<int>::min()}
 std::atomic<void*> runtimeActorReceiverLevel{nullptr};
 struct ActorNameTagEntry {
     std::string nameTag;
-    unsigned colorOrder = 16;
+    unsigned colorOrder = 28;
     std::uint64_t sequence = 0;
 };
 std::mutex actorNameTagMutex;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
-std::unordered_set<std::string> loggedNameTags;
-std::unordered_set<std::string> loggedPlayerColorMatches;
-std::atomic<unsigned> loggedNameTagDetections{0};
+// Keep only the latest observed color per player for concise transition logs.
+// A value of 28 means the current Actor nameTag has no supported color.
+std::unordered_map<std::string, unsigned> observedPlayerColorOrders;
+std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorListRefreshMs{0};
 std::atomic<bool> loggedActorListFailure{false};
@@ -285,10 +285,9 @@ void recordLevel(void* level) noexcept {
         {
             std::lock_guard lock(actorNameTagMutex);
             actorNameTags.clear();
-            loggedNameTags.clear();
-            loggedPlayerColorMatches.clear();
+            observedPlayerColorOrders.clear();
         }
-        loggedNameTagDetections.store(0, std::memory_order_release);
+        loggedFirstNameTag.store(false, std::memory_order_release);
         lastActorListRefreshMs.store(0, std::memory_order_release);
         runtimeActorPointerOffset.store(-1, std::memory_order_release);
         runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(), std::memory_order_release);
@@ -489,7 +488,7 @@ void captureQueriedActorNameTag(void* actor, const std::string& nameTag) noexcep
         tablist::stripMinecraftFormatting(nameTag).empty()) return;
     try {
         const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
-        bool logName = false;
+        bool logFirstName = false;
         {
             std::lock_guard lock(actorNameTagMutex);
             const auto existing = actorNameTags.find(actor);
@@ -502,12 +501,9 @@ void captureQueriedActorNameTag(void* actor, const std::string& nameTag) noexcep
             const auto color = tablist::minecraftNameColorOrder(nameTag);
             actorNameTags.insert_or_assign(actor,
                 ActorNameTagEntry{nameTag, color, sequence});
-            if (loggedNameTags.size() < 512 && loggedNameTags.insert(nameTag).second) {
-                const auto count = loggedNameTagDetections.fetch_add(1, std::memory_order_acq_rel);
-                logName = count < 64;
-            }
+            logFirstName = !loggedFirstNameTag.exchange(true, std::memory_order_acq_rel);
         }
-        if (logName) diagnostic("Actor name captured: ", nameTag);
+        if (logFirstName) diagnostic("Actor nameTag capture active; live color updates enabled");
     } catch (...) {
         // Never allow diagnostics/cache allocation failures to escape into
         // Minecraft's native Actor::getNameTag call.
@@ -629,8 +625,6 @@ void updateRuntimeActorNameTags(void* level) {
 
     std::unordered_map<void*, ActorNameTagEntry> updated;
     updated.reserve(actors.size());
-    std::vector<std::string> observedNames;
-    observedNames.reserve(std::min<std::size_t>(actors.size(), 64));
     for (const auto& record : actors) {
         void* actor = actorPointerFromRecord(record, static_cast<std::size_t>(actorOffset));
         if (!looksLikeActor(actor)) continue;
@@ -638,23 +632,15 @@ void updateRuntimeActorNameTags(void* level) {
         if (!copyActorNameTag(actor, &nameTag) || nameTag.empty() || nameTag.size() > 512)
             continue;
         if (tablist::stripMinecraftFormatting(nameTag).empty()) continue;
-        observedNames.push_back(nameTag);
         const auto color = tablist::minecraftNameColorOrder(nameTag);
         const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
         updated.insert_or_assign(actor, ActorNameTagEntry{std::move(nameTag), color, sequence});
     }
-    std::vector<std::string> namesToLog;
     const auto nameTagCount = updated.size();
     {
         std::lock_guard lock(actorNameTagMutex);
         actorNameTags.swap(updated);
-        for (const auto& nameTag : observedNames) {
-            if (loggedNameTags.size() >= 512 || !loggedNameTags.insert(nameTag).second) continue;
-            const auto logCount = loggedNameTagDetections.fetch_add(1, std::memory_order_acq_rel);
-            if (logCount < 64) namesToLog.push_back(nameTag);
-        }
     }
-    for (const auto& nameTag : namesToLog) diagnostic("World Actor NameTag: ", nameTag);
     if (!loggedActorListSuccess.exchange(true, std::memory_order_acq_rel))
         diagnostic("World Actor list active; ", actors.size(), " actor(s), ",
                    nameTagCount, " NameTag(s) read");
@@ -724,7 +710,6 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
             bool foundColor = false;
             bool bestWasExact = false;
             std::uint64_t bestSequence = 0;
-            std::string matchedActorNameTag;
             for (const auto& actorTag : actorTags) {
                 const auto color = tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag);
                 if (!color) continue;
@@ -740,19 +725,33 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                 row.hasNameColor = true;
                 bestWasExact = exact;
                 bestSequence = actorTag.sequence;
-                matchedActorNameTag = actorTag.nameTag;
                 foundColor = true;
             }
-            if (foundColor) {
-                bool firstMatch = false;
-                {
-                    std::lock_guard lock(actorNameTagMutex);
-                    firstMatch = loggedPlayerColorMatches.insert(row.name).second;
+            // Record every rendered row, including loss of a color. This makes
+            // subsequent Actor::getNameTag changes visible without reopening
+            // the TabList, while avoiding per-frame/per-Actor log spam.
+            bool colorChanged = false;
+            unsigned oldOrder = 28;
+            unsigned newOrder = foundColor ? row.nameColorOrder : 28u;
+            {
+                std::lock_guard lock(actorNameTagMutex);
+                const auto it = observedPlayerColorOrders.find(row.name);
+                if (it == observedPlayerColorOrders.end()) {
+                    observedPlayerColorOrders.emplace(row.name, newOrder);
+                    colorChanged = foundColor;
+                } else if (it->second != newOrder) {
+                    oldOrder = it->second;
+                    it->second = newOrder;
+                    colorChanged = true;
                 }
-                if (firstMatch)
-                    diagnostic("PlayerList color matched: player=", row.name,
-                               " actor=", matchedActorNameTag,
-                               " order=", row.nameColorOrder);
+            }
+            if (colorChanged) {
+                const auto colorLabel = [](unsigned order) {
+                    constexpr std::string_view codes = "0123456789abcdefghijmnpqstuv";
+                    return order < codes.size() ? codes[order] : '-';
+                };
+                diagnostic("PlayerList name color updated: player=", row.name,
+                           " ", colorLabel(oldOrder), "->", colorLabel(newOrder));
             }
         }
         if (includeFaces) extractFace(item.second, row);
@@ -889,7 +888,7 @@ void drawTabList(void*) {
     const auto packed = [](tablist::Color color) {
         return ImGui::ColorConvertFloat4ToU32({color.r, color.g, color.b, color.a});
     };
-    static constexpr std::array<ImU32, 16> minecraftNameColors{
+    static constexpr std::array<ImU32, 28> minecraftNameColors{
         IM_COL32(0, 0, 0, 255),       // §0 black
         IM_COL32(0, 0, 170, 255),     // §1 dark blue
         IM_COL32(0, 170, 0, 255),     // §2 dark green
@@ -906,6 +905,18 @@ void drawTabList(void*) {
         IM_COL32(255, 85, 255, 255),  // §d light purple
         IM_COL32(255, 255, 85, 255),  // §e yellow
         IM_COL32(255, 255, 255, 255), // §f white
+        IM_COL32(221, 214, 5, 255),   // §g minecoin gold
+        IM_COL32(227, 212, 209, 255), // §h material quartz
+        IM_COL32(206, 202, 202, 255), // §i material iron
+        IM_COL32(68, 58, 59, 255),    // §j material netherite
+        IM_COL32(151, 22, 7, 255),    // §m material redstone
+        IM_COL32(180, 104, 77, 255),  // §n material copper
+        IM_COL32(222, 177, 45, 255),  // §p material gold
+        IM_COL32(17, 159, 54, 255),   // §q material emerald
+        IM_COL32(44, 186, 168, 255),  // §s material diamond
+        IM_COL32(33, 73, 123, 255),   // §t material lapis
+        IM_COL32(154, 92, 198, 255),  // §u material amethyst
+        IM_COL32(235, 113, 20, 255),  // §v material resin
     };
 
     std::vector<float> widths(layout.columns, config->minimumColumnWidth);

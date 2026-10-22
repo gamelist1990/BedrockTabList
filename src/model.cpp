@@ -15,8 +15,11 @@ FormattedText parseFormatting(std::string_view text) {
     FormattedText result;
     result.plain.reserve(text.size());
     result.colorAtByte.reserve(text.size());
-    constexpr std::string_view colorCodes = "0123456789abcdef";
-    unsigned activeColor = 16;
+    // Bedrock adds material colors after the shared Java/Bedrock palette.
+    // §k/§l/§o remain formatting codes, while §m/§n are Bedrock colors.
+    constexpr std::string_view colorCodes = "0123456789abcdefghijmnpqstuv";
+    constexpr unsigned noColor = 28;
+    unsigned activeColor = noColor;
     for (std::size_t i = 0; i < text.size();) {
         const auto current = static_cast<unsigned char>(text[i]);
         std::size_t codeIndex = std::string_view::npos;
@@ -36,7 +39,7 @@ FormattedText parseFormatting(std::string_view text) {
             if (color != std::string_view::npos)
                 activeColor = static_cast<unsigned>(color);
             else if (code == 'r')
-                activeColor = 16;
+                activeColor = noColor;
             i += sequenceLength;
             continue;
         }
@@ -66,11 +69,11 @@ unsigned minecraftNameColorOrder(std::string_view text) noexcept {
     try {
         const auto parsed = parseFormatting(text);
         for (const auto color : parsed.colorAtByte)
-            if (color < 16) return color;
+            if (color < 28) return color;
     } catch (...) {
         // Keep the legacy lookup noexcept; allocation failure means no color.
     }
-    return 16;
+    return 28;
 }
 
 std::optional<unsigned> actorNameColorForPlayerName(
@@ -84,7 +87,7 @@ std::optional<unsigned> actorNameColorForPlayerName(
         if (equalsIgnoreAsciiCase(playerListName,
                                   std::string_view(actorRawName).substr(offset, playerListName.size()))) {
             const auto color = parsed.colorAtByte[offset];
-            if (color < 16) return color;
+            if (color < 28) return color;
         }
     }
     return std::nullopt;

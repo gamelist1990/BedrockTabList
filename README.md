@@ -52,22 +52,9 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 ```
 
 色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
-`sort_by_name_color` を `true` にすると、Tabを押している間、ゲームtick上でLevelの
-runtime Actor一覧を250ms間隔で読み、各Actorの`getNameTag()`から取得した最初の
-`§0`〜`§f`色コードを装飾コード除去後のPlayerList名と部分一致で照合します。
-一致したプレイヤーをMinecraftの色コード順にグループ化し、同色内は名前順に並べます。
-一致するActor名や色コードがない名前は最後に並びます。`§l` などの装飾コードは色判定に使いません。
-1.26.52.3の実EXEをGhidraで調べた結果、`Level::getRuntimeActorList` は8バイトの `Actor*` vectorではなく、
-0x40バイト要素のrecord vectorを出力します。従来の `vector<void*>` 解釈では要素数が最大8倍に見え、
-record内の値もActorポインタとして誤読していました。現行コードは実EXEの要素幅に合わせてrecordを受け取り、
-record内でvtableと `Actor::getNameTag()` が有効になるActor*位置をサンプルから検出してから名前を読みます。
-対象ビルドで関数呼び出し自体が例外になる場合、record bufferが不正な場合、Actor*位置を検出できない場合は、
-それぞれ異なるログを残して色ソートだけを停止します。
-
-Nametag描画フックや推定vtable slotには依存せず、ワールドのruntime Actor一覧関数を呼んで各Actorの
-`getNameTag()` を直接読み取ります。ログには解決方式、record件数、検出したActor*のrecord内offset、
-取得したNameTagサンプル（最大64件）を記録します。色ソートへの適用は§色コードがある名前だけです。
-PlayerList名とActor名の一致位置で有効な色コードを判定するため、名前より後ろにあるレベル表示やランクの `§` 色はプレイヤー名色として誤採用しません。最初に一致した色の適用は `PlayerList color matched: player=... actor=... order=...` に記録します。
+`sort_by_name_color` を `true` にすると、装飾コードを除いたPlayerList名を、Actor::getNameTag Hookで観測したActor名に部分一致させ、名前部分に適用されている色順に並べます。同色内は名前順です。
+Actor名はゲームが `Actor::getNameTag()` を呼ぶたび更新します。NameTagの色が後から変わった場合もTabListを開き直さず、描画ごとに色とソートへ反映します。Java共通色とBedrock material色（§g、§h、§i、§j、§m、§n、§p、§q、§s、§t、§u、§v）を扱い、色の遷移時のみ `PlayerList name color updated` を記録します。Actor名そのもののログは出さず、診断をコンパクトに保ちます。
+`Level::getRuntimeActorList` は実機でSEH例外を起こしたため、現在の経路では呼び出していません。Hookが観測できないActorも含むView系のActor一覧取得は、現状まだ別経路として検証が必要です。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
 
