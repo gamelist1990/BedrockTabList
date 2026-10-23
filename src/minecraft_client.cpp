@@ -1439,22 +1439,6 @@ struct ActorMurderSnapshot {
     bool spectator = false;
 };
 
-bool containsNameIgnoreCase(std::string_view text, std::string_view name) noexcept {
-    if (name.empty() || name.size() > text.size()) return false;
-    for (std::size_t start = 0; start + name.size() <= text.size(); ++start) {
-        bool equal = true;
-        for (std::size_t i = 0; i < name.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(text[start + i])) !=
-                std::tolower(static_cast<unsigned char>(name[i]))) {
-                equal = false;
-                break;
-            }
-        }
-        if (equal) return true;
-    }
-    return false;
-}
-
 void readActorMurderSnapshot(void* actor,
                              std::string_view playerName,
                              ActorMurderSnapshot& snapshot,
@@ -1549,6 +1533,14 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderRosterBuildPending = false;
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
+            {
+                std::lock_guard stateLock(murderDetectMutex);
+                murderRolesByPlayer.clear();
+                spectatorPlayers.clear();
+                murderRoleExpiryByPlayer.clear();
+                lastHeldItemByPlayer.clear();
+                heldItemNamesByPlayer.clear();
+            }
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
             lastLoggedMurderActorCount = std::numeric_limits<std::size_t>::max();
             lastLoggedMurderPlayerActorCount = std::numeric_limits<std::size_t>::max();
@@ -1604,15 +1596,12 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderRosterBuildCursor + actorsPerRosterTick);
         for (; murderRosterBuildCursor < end; ++murderRosterBuildCursor) {
             auto* actor = murderRosterBuildActors[murderRosterBuildCursor];
-            std::string nameTag;
-            if (!copyActorNameTag(actor, &nameTag)) continue;
-            const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
-            const auto player = std::find_if(murderRosterBuildPlayerNames.begin(),
-                murderRosterBuildPlayerNames.end(), [&](const std::string& playerName) {
-                    return containsNameIgnoreCase(plainTag, playerName);
-                });
-            if (player != murderRosterBuildPlayerNames.end())
-                murderRosterBuildMatches.push_back({actor, *player});
+            // SDK identity reads the live tag and falls back to its observed
+            // NameTag cache. Directly calling the native getter here missed
+            // Actors whose tag had already been captured by the SDK hook.
+            const auto identity = gameApi->actor(actor).getIdentity();
+            if (identity.isPlayer && !identity.name.empty() && identity.name.size() <= 128)
+                murderRosterBuildMatches.push_back({actor, identity.name});
         }
 
         if (murderRosterBuildPending &&
