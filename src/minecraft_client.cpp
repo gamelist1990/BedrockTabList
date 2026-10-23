@@ -248,7 +248,6 @@ std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
 std::uint64_t murderActorSnapshotTick = 0;
 std::size_t murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
-std::atomic<bool> murderActorRosterDirty{true};
 std::atomic<bool> loggedMurderActorReadFault{false};
 
 void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
@@ -1419,15 +1418,14 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
-            murderActorRosterDirty.store(true, std::memory_order_release);
             murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
         }
-        // Coalesce name-tag discovery bursts to one roster refresh per tick.
-        // When the getter hook is quiet, retain a five-second safety refresh.
+        // Keep the native Level actor-list walk off the hot path. Name-tag
+        // observations can arrive in large bursts while players render, so
+        // they must not trigger a full roster rebuild. Refresh at most once per
+        // second; the first world snapshot is still taken immediately.
         ++murderActorSnapshotTick;
-        const bool dirty = murderActorRosterDirty.load(std::memory_order_acquire);
-        if (!dirty && murderActorSnapshotTick < 100) return;
-        murderActorRosterDirty.store(false, std::memory_order_release);
+        if (murderActorSnapshotTick < 20) return;
         murderActorSnapshotTick = 0;
 
         auto refreshed = gameApi->actors(level);
@@ -1574,20 +1572,30 @@ void drawTabList(void*) {
         IM_COL32(235, 113, 20, 255),  // §v material resin
     };
 
-    std::vector<float> widths(layout.columns, config->minimumColumnWidth);
+    // Player snapshots are capped at 512 in collectRows. Fixed scratch arrays
+    // avoid heap allocations on every DXGI frame while Tab is held.
+    std::array<float, 512> widths{};
+    std::array<float, 512> columnX{};
+    struct RowTextMetrics { ImVec2 name{}, role{}, spectator{}; };
+    std::array<RowTextMetrics, 512> textMetrics{};
+    std::fill_n(widths.begin(), layout.columns, config->minimumColumnWidth);
     for (std::size_t i = 0; i < players.size(); ++i) {
         const auto column = i / config->maximumRows;
         const auto roleText = players[i].murderRole == tablist::MurderRole::Sheriff
             ? " [Sheriff]" : players[i].murderRole == tablist::MurderRole::Murderer
                 ? " [Murderer]" : "";
+        auto& metrics = textMetrics[i];
+        metrics.name = ImGui::CalcTextSize(players[i].name.c_str());
+        metrics.role = ImGui::CalcTextSize(roleText);
+        if (players[i].spectator)
+            metrics.spectator = ImGui::CalcTextSize(" [Spectator]");
         widths[column] = std::max(widths[column],
-            ImGui::CalcTextSize(players[i].name.c_str()).x +
-            ImGui::CalcTextSize(roleText).x +
-            (players[i].spectator ? ImGui::CalcTextSize(" [Spectator]").x : 0.0f) +
+            metrics.name.x + metrics.role.x + metrics.spectator.x +
             horizontalPadding * 2.0f + faceArea);
     }
     float totalWidth = 0.0f;
-    for (float width : widths) totalWidth += width;
+    for (std::size_t column = 0; column < layout.columns; ++column)
+        totalWidth += widths[column];
     totalWidth += config->columnGap * static_cast<float>(layout.columns - 1);
     const float totalHeight = config->headerHeight +
         config->rowHeight * static_cast<float>(layout.rows);
@@ -1608,7 +1616,7 @@ void drawTabList(void*) {
                   {bottomRight.x - 8.0f, topLeft.y + config->headerHeight},
                   packed(separator));
 
-    std::vector<float> columnX(layout.columns, topLeft.x);
+    std::fill_n(columnX.begin(), layout.columns, topLeft.x);
     for (std::size_t column = 1; column < layout.columns; ++column)
         columnX[column] = columnX[column - 1] + widths[column - 1] + config->columnGap;
     for (std::size_t i = 0; i < players.size(); ++i) {
@@ -1628,13 +1636,21 @@ void drawTabList(void*) {
             const float faceX = textX;
             const float faceY = y + (config->rowHeight - config->faceSize) * 0.5f;
             const float pixelSize = config->faceSize / 8.0f;
-            for (std::size_t py = 0; py < 8; ++py) for (std::size_t px = 0; px < 8; ++px) {
-                const auto value = players[i].face[py * 8 + px];
-                const ImU32 color = IM_COL32((value >> 24) & 0xFF, (value >> 16) & 0xFF,
-                                             (value >> 8) & 0xFF, value & 0xFF);
-                draw->AddRectFilled({faceX + px * pixelSize, faceY + py * pixelSize},
-                                    {faceX + (px + 1) * pixelSize,
-                                     faceY + (py + 1) * pixelSize}, color);
+            for (std::size_t py = 0; py < 8; ++py) {
+                std::size_t runStart = 0;
+                while (runStart < 8) {
+                    const auto value = players[i].face[py * 8 + runStart];
+                    std::size_t runEnd = runStart + 1;
+                    while (runEnd < 8 && players[i].face[py * 8 + runEnd] == value)
+                        ++runEnd;
+                    const ImU32 color = IM_COL32((value >> 24) & 0xFF,
+                                                 (value >> 16) & 0xFF,
+                                                 (value >> 8) & 0xFF, value & 0xFF);
+                    draw->AddRectFilled(
+                        {faceX + runStart * pixelSize, faceY + py * pixelSize},
+                        {faceX + runEnd * pixelSize, faceY + (py + 1) * pixelSize}, color);
+                    runStart = runEnd;
+                }
             }
             textX += config->faceSize + 7.0f;
         } else {
@@ -1642,7 +1658,7 @@ void drawTabList(void*) {
                                   2.5f, packed(config->accent));
             textX += 9.0f;
         }
-        const auto textSize = ImGui::CalcTextSize(players[i].name.c_str());
+        const auto textSize = textMetrics[i].name;
         const ImU32 nameColor = players[i].spectator
             ? IM_COL32(145, 150, 165, 210)
             : players[i].hasNameColor && players[i].nameColorOrder <
@@ -1661,7 +1677,7 @@ void drawTabList(void*) {
                           roleColor, roleLabel);
         }
         if (players[i].spectator) {
-            const float suffixX = textX + textSize.x + ImGui::CalcTextSize(roleText).x;
+            const float suffixX = textX + textSize.x + textMetrics[i].role.x;
             draw->AddText({suffixX, y + (config->rowHeight - textSize.y) * 0.5f},
                           IM_COL32(165, 170, 185, 230), " [Spectator]");
         }
@@ -1939,7 +1955,6 @@ DWORD WINAPI startClient(void*) {
     if (actorNameTagHookReady) {
         gameApi->Event.Enum.ActorNameTag.then([](const bedrock::ActorNameTagEvent& event) {
             if (!event.actor || event.nameTag.empty() || event.nameTag.size() > 512) return;
-            murderActorRosterDirty.store(true, std::memory_order_release);
             try {
                 captureQueriedActorNameTag(event.actor, std::string(event.nameTag));
             } catch (...) {
