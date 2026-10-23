@@ -125,6 +125,7 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
+using ItemHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 // Exact 1.26.52.3 disassembly writes a std::vector<Actor*> hidden return area
 // through RDX, then appends one Actor* per runtime entity.
 using LevelRuntimeActorListFn = void(__fastcall*)(void*, std::vector<void*>*);
@@ -202,6 +203,9 @@ std::atomic<void*> resolvedActorGetNameTag{nullptr};
 BDS_HookToken actorNameTagHookToken{};
 std::atomic<std::size_t> runtimeActorListSlot{std::numeric_limits<std::size_t>::max()};
 std::atomic<void*> runtimeActorListTarget{nullptr};
+std::atomic<void*> itemHoverNameTarget{nullptr};
+std::mutex itemDisplayNameMutex;
+std::unordered_map<std::string, std::string> itemDisplayNames;
 thread_local bool allowRuntimeActorListCall = false;
 struct RuntimeActorListTickScope {
     bool previous{allowRuntimeActorListCall};
@@ -224,17 +228,14 @@ std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
 std::unordered_set<std::string> spectatorPlayers;
 std::unordered_map<std::string, std::chrono::steady_clock::time_point> murderRoleExpiryByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
-std::unordered_set<std::string> loggedHeldItemIdentifiers;
 struct MurderSample {
     std::string name;
     std::string identifier;
     std::string displayName;
-    std::string translationKey;
     unsigned count{};
     bool hasItem{};
     bool hasGameType{};
     bool spectator{};
-    bool debug{};
 };
 std::mutex murderQueueMutex;
 std::condition_variable murderQueueReady;
@@ -251,6 +252,7 @@ std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
 std::uint64_t murderActorSnapshotTick = 0;
 std::size_t murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
+bool loggedMurderRosterReady{};
 std::atomic<bool> loggedMurderActorReadFault{false};
 
 void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
@@ -279,6 +281,9 @@ public:
     void setRuntimeActorList(std::size_t slot, void* target) noexcept {
         runtimeActorListTarget.store(target, std::memory_order_release);
         runtimeActorListSlot.store(slot, std::memory_order_release);
+    }
+    void setItemHoverName(void* target) noexcept {
+        itemHoverNameTarget.store(target, std::memory_order_release);
     }
     bool isActorValid(void* actor) const noexcept override;
     void* localPlayer() const noexcept override;
@@ -360,7 +365,6 @@ void processMurderSample(const MurderSample& sample) noexcept {
             ? tablist::murderRoleForHeldItem(sample.identifier, sample.displayName)
             : tablist::MurderRole::None;
 
-        bool firstSeen = false;
         bool changed = false;
         std::string previous;
         {
@@ -372,7 +376,6 @@ void processMurderSample(const MurderSample& sample) noexcept {
             if (!itemKey.empty()) {
                 changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
                 lastHeldItemByPlayer.insert_or_assign(sample.name, itemKey);
-                firstSeen = loggedHeldItemIdentifiers.insert(itemKey).second;
             }
             if (role != tablist::MurderRole::None) {
                 murderRolesByPlayer.insert_or_assign(sample.name, role);
@@ -384,26 +387,13 @@ void processMurderSample(const MurderSample& sample) noexcept {
                 else spectatorPlayers.erase(sample.name);
             }
         }
-        if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
         if (changed && sample.hasItem) {
             const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
                 : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
-            if (previous.empty()) {
-                diagnostic("MurderDetect held item: player=", sample.name,
-                           " item=", itemKey, " count=", sample.count,
-                           " role=", roleName);
-            } else {
-                diagnostic("MurderDetect held item: player=", sample.name,
-                           " item=", itemKey, " count=", sample.count,
-                           " role=", roleName, " previous=", previous);
-            }
-        }
-        if (sample.debug && changed && sample.hasItem) {
-            diagnostic("MurderDetect actor item: player=", sample.name,
-                       " item=", itemKey,
-                       " name=", sample.displayName,
-                       " translation_key=", sample.translationKey,
-                       " count=", sample.count,
+            diagnostic("Item held: player=", sample.name,
+                       " name=", sample.displayName.empty() ? itemKey : sample.displayName,
+                       " id=", itemKey, " count=", sample.count,
+                       " role=", roleName,
                        previous.empty() ? "" : " previous=", previous);
         }
     } catch (...) {
@@ -733,6 +723,39 @@ std::vector<void*> TabListGameAccess::actorHandles(void* world) const {
     return result;
 }
 
+bool invokeItemHoverName(void* stack, void* target, std::string* output) noexcept {
+    if (!stack || !target || !output || !executable(target)) return false;
+    __try {
+        return reinterpret_cast<ItemHoverNameFn>(target)(stack, output) == output;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void populateItemDisplayName(void* stack, bedrock::ItemStack& item) {
+    if (item.identifier.empty()) return;
+    {
+        std::lock_guard lock(itemDisplayNameMutex);
+        const auto it = itemDisplayNames.find(item.identifier);
+        if (it != itemDisplayNames.end()) {
+            item.displayName = it->second;
+            return;
+        }
+    }
+    std::string displayName;
+    auto* target = itemHoverNameTarget.load(std::memory_order_acquire);
+    if (!invokeItemHoverName(stack, target, &displayName) ||
+        displayName.empty() || displayName.size() > 256) return;
+    item.displayName = displayName;
+    try {
+        std::lock_guard lock(itemDisplayNameMutex);
+        if (itemDisplayNames.size() >= 512) itemDisplayNames.clear();
+        itemDisplayNames.insert_or_assign(item.identifier, std::move(displayName));
+    } catch (...) {
+        // Display-name caching is optional; preserve the copied item snapshot.
+    }
+}
+
 bool readActorEquipment(void* actor, const bedrock::NativeItemLayout& layout,
                         tablist_native::ActorEquipmentComponent** output) noexcept {
     if (output) *output = nullptr;
@@ -839,6 +862,7 @@ std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
         return std::nullopt;
     if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
         item.identifier.insert(0, "minecraft:");
+    populateItemDisplayName(stack, item);
     if (!item.valid()) return std::nullopt;
     return item;
 }
@@ -1081,6 +1105,7 @@ std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
 bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                        bool sortByNameColor, bool gamemodeCheck,
                        bool murderDetect,
+                       bool debug,
                        const std::unordered_map<std::string, tablist::MurderRole>& murderRoles,
                        const std::unordered_set<std::string>& spectators,
                        const std::vector<ActorNameTagEntry>& actorTags) {
@@ -1155,7 +1180,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                     colorChanged = true;
                 }
             }
-            if (colorChanged) {
+            if (colorChanged && debug) {
                 const auto colorLabel = [](unsigned order) {
                     constexpr std::string_view codes = "0123456789abcdefghijmnpqstuv";
                     if (order == 10) return 'p'; // target server's §p green
@@ -1201,7 +1226,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
 
 bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
                  bool sortByNameColor, bool gamemodeCheck,
-                 bool murderDetect,
+                 bool murderDetect, bool debug,
                  const std::unordered_map<std::string, tablist::MurderRole>& murderRoles,
                  const std::unordered_set<std::string>& spectators,
                  const std::vector<ActorNameTagEntry>& actorTags) noexcept {
@@ -1209,7 +1234,7 @@ bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
     // leaving during the read cannot crash Minecraft; that frame is skipped.
     __try {
         return collectRowsUnsafe(rows, includeFaces, sortByNameColor, gamemodeCheck, murderDetect,
-                                 murderRoles, spectators, actorTags);
+                                 debug, murderRoles, spectators, actorTags);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         rows.clear();
         return false;
@@ -1282,7 +1307,8 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
             if (config->gamemodeCheck) spectators = spectatorPlayers;
         }
         if (!collectRows(rows, false, config->sortByNameColor, config->gamemodeCheck,
-                         config->murderDetect, murderRoles, spectators, actorTags)) {
+                         config->murderDetect, config->debug, murderRoles, spectators,
+                         actorTags)) {
             return; // Keep the previous immutable snapshot on a transient read failure.
         }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
@@ -1379,8 +1405,7 @@ void readActorMurderSnapshot(void* actor,
     if (!snapshot.isPlayer) return;
     if (snapshot.name.empty() || snapshot.name.size() > 128) return;
     if (readItem)
-        snapshot.item = tabListGameAccess.equipmentItem(
-            actor, bedrock::EquipmentSlot::MainHand);
+        snapshot.item = gameApi->actor(actor).getMainHand();
     if (readGameMode) {
         std::int32_t gameType = -1;
         snapshot.hasGameType = readActorGameType(actor, gameType);
@@ -1403,7 +1428,7 @@ bool readActorMurderSnapshotSeh(void* actor,
     }
 }
 
-void updateMurderDetection(bool debug, bool readItems, bool readGameMode) noexcept {
+void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
     // Keep native Actor/inventory reads thread-affine, but sample a small
     // bounded batch each tick so a brief held-item change is less likely to
     // fall between two samples. Opening the TabList never triggers a scan burst.
@@ -1436,11 +1461,9 @@ void updateMurderDetection(bool debug, bool readItems, bool readGameMode) noexce
             copied.hasItem = item.has_value();
             copied.hasGameType = snapshot.hasGameType;
             copied.spectator = snapshot.spectator;
-            copied.debug = debug;
             if (item) {
                 copied.identifier = item->identifier;
                 copied.displayName = item->displayName;
-                copied.translationKey = item->translationKey;
                 copied.count = item->count;
             }
             enqueueMurderSample(std::move(copied));
@@ -1450,7 +1473,7 @@ void updateMurderDetection(bool debug, bool readItems, bool readGameMode) noexce
     }
 }
 
-void refreshTrackedMurderActors(void* level, bool debug) noexcept {
+void refreshTrackedMurderActors(void* level) noexcept {
     if (!gameApi || !level) return;
     try {
         if (murderScanLevel != level) {
@@ -1461,6 +1484,7 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
             murderLastProcessedActor = 0;
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
             murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
+            loggedMurderRosterReady = false;
         }
         // Keep the native Level actor-list walk off the hot path. Name-tag
         // observations can arrive in large bursts while players render, so
@@ -1470,12 +1494,10 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
         if (murderActorSnapshotTick < 20) return;
         murderActorSnapshotTick = 0;
 
-        auto refreshed = gameApi->actors(level);
-        std::vector<void*> actorHandles;
-        actorHandles.reserve(refreshed.size());
-        for (const auto& actor : refreshed) {
-            if (auto* handle = actor.handle()) actorHandles.push_back(handle);
-        }
+        // The MurderDetect roster comes only from the exact-build, ABI-verified
+        // Level::getRuntimeActorList adapter. Do not merge name-tag observations
+        // or any secondary actor source into this native scan list.
+        auto actorHandles = tabListGameAccess.actorHandles(level);
         std::sort(actorHandles.begin(), actorHandles.end(),
             [](const void* left, const void* right) {
                 return reinterpret_cast<std::uintptr_t>(left) <
@@ -1502,10 +1524,11 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
             });
         murderPlayerNames.erase(std::unique(murderPlayerNames.begin(), murderPlayerNames.end()),
                                 murderPlayerNames.end());
-        if (debug && murderTrackedActorCount != murderScanActors.size()) {
+        if (!loggedMurderRosterReady) {
             murderTrackedActorCount = murderScanActors.size();
-            diagnostic("MurderDetect Actor tracker refreshed: tracked=",
-                       murderTrackedActorCount, " sampling=round-robin");
+            loggedMurderRosterReady = true;
+            diagnostic("MurderDetect roster ready: actors=", murderTrackedActorCount,
+                       " players=", murderPlayerNames.size());
         }
     } catch (...) {
         // Keep the last good roster if native enumeration transiently fails.
@@ -1527,11 +1550,10 @@ void __fastcall onLevelSubTick(void* level) {
     refreshOneCachedFace(config);
     static unsigned murderScanCadence = 0;
     if (config->murderDetect || config->gamemodeCheck) {
-        refreshTrackedMurderActors(level, config->debug);
+        refreshTrackedMurderActors(level);
         if (++murderScanCadence >= config->murderScanIntervalTicks) {
             murderScanCadence = 0;
-            updateMurderDetection(config->debug, config->murderDetect,
-                                  config->gamemodeCheck);
+            updateMurderDetection(config->murderDetect, config->gamemodeCheck);
         }
     } else {
         murderScanCadence = 0;
@@ -1796,6 +1818,7 @@ void removeNativeHooks() noexcept {
     resolvedActorGetNameTag.store(nullptr, std::memory_order_release);
     runtimeActorListSlot.store(std::numeric_limits<std::size_t>::max(), std::memory_order_release);
     runtimeActorListTarget.store(nullptr, std::memory_order_release);
+    itemHoverNameTarget.store(nullptr, std::memory_order_release);
     gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
     levelInstance.store(nullptr);
@@ -1882,17 +1905,27 @@ DWORD WINAPI startClient(void*) {
             reinterpret_cast<void*>(method->address));
         return true;
     };
+    const auto resolveItemHoverName = [](const bedrock::Resolver& source) {
+        if (!source.exactBuild()) return false;
+        const auto method = source.resolve("ItemStackBase::getHoverName");
+        if (!method || !method->exact_build || !method->verified ||
+            method->method != "exact-rva") return false;
+        tabListGameAccess.setItemHoverName(reinterpret_cast<void*>(method->address));
+        return true;
+    };
     bedrock::NativeItemLayout cachedItemLayout;
     std::string cachedItemLayoutError;
     bool itemLayoutAvailable = bedrock::parseNativeItemLayout(
         profile, cachedItemLayout, cachedItemLayoutError);
     resolveActorNameTag();
     bool runtimeActorListReady = resolveRuntimeActorList(resolver);
+    bool itemHoverNameReady = resolveItemHoverName(resolver);
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
     resolveRequired();
-    if ((!requirementsMet() || !actorNameTag || !itemLayoutAvailable) &&
+    if ((!requirementsMet() || !actorNameTag || !itemLayoutAvailable ||
+         !itemHoverNameReady) &&
         version.source != bedrock::ProfileSource::Remote) {
         diagnostic("required symbols missing in cached profile; refreshing exact-build GitHub definition");
         std::string refreshedProfile;
@@ -1906,6 +1939,8 @@ DWORD WINAPI startClient(void*) {
                 version = std::move(refreshedVersion);
                 resolveRequired();
                 resolveActorNameTag();
+                runtimeActorListReady = resolveRuntimeActorList(resolver);
+                itemHoverNameReady = resolveItemHoverName(resolver);
                 itemLayoutAvailable = bedrock::parseNativeItemLayout(
                     profile, cachedItemLayout, cachedItemLayoutError);
                 diagnostic("latest exact-build profile loaded [",
@@ -1920,7 +1955,7 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag || !runtimeActorListReady) {
+    if (!actorNameTag || !runtimeActorListReady || !itemHoverNameReady) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -1934,6 +1969,8 @@ DWORD WINAPI startClient(void*) {
             }
             if (!runtimeActorListReady)
                 runtimeActorListReady = resolveRuntimeActorList(embeddedResolver);
+            if (!itemHoverNameReady)
+                itemHoverNameReady = resolveItemHoverName(embeddedResolver);
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
         }
@@ -1941,6 +1978,9 @@ DWORD WINAPI startClient(void*) {
     diagnostic("world Actor source: Level::getRuntimeActorList=",
                runtimeActorListReady ? "profile ready" : "unavailable",
                runtimeActorListReady ? " [exact vtable slot and ABI]" : "");
+    diagnostic("ItemStackBase::getHoverName=",
+               itemHoverNameReady ? "verified exact-build display name active"
+                                   : "unavailable; item ID fallback");
 
     if (!requirementsMet()) {
         diagnostic("required symbols unavailable keyboard=", bool(keyboard),
@@ -2022,10 +2062,8 @@ DWORD WINAPI startClient(void*) {
         diagnostic("SDK ActorNameTag hook unavailable; color sorting has no live Actor source",
                    error.empty() ? "" : ": ", error);
     }
-    diagnostic("world Actor source: SDK ActorNameTag event=",
-               actorNameTagHookReady ? "active" : "unavailable",
-               " Level::getRuntimeActorList profile=",
-               runtimeActorListReady ? "ready" : "unavailable");
+    diagnostic("Actor NameTag color source: SDK hook ",
+               actorNameTagHookReady ? "active" : "unavailable");
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;

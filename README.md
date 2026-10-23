@@ -14,7 +14,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
 - SDKの `Actor::getMainHand()` で取得した装備スナップショットからMurderDetectの役割を表示（弓=Sheriff/水色、`hivemurder:` ID=Murderer/赤）
 - `gamemode_check` が有効ならSpectatorを灰色にし `[Spectator]` を表示
-- MurderDetectはTab表示前から間隔を空けてActorを1件ずつ読み、役割キャッシュを準備（Minecraftオブジェクトのネイティブ読み取りは安全のためゲームスレッド上で実行）
+- MurderDetectはTab表示前からtickごとに最大2人ずつ読み、役割キャッシュを準備（Minecraftオブジェクトのネイティブ読み取りはゲームスレッド上で実行）
 - Sheriff／Murdererは最後の検知から5分間保持し、期間内に再検知した場合は期限を延長
 - Actorの装備コンポーネント／手持ち枠の読み取りで例外が出た対象はスキップし、後続Actorの走査を継続
 - TabListの行・色・役割はゲーム更新中に1秒間隔でキャッシュを作り直し、顔画像はtickごとに1人ずつ追加。Tab表示時はキャッシュだけを描画
@@ -63,8 +63,8 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 
 色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
 `sort_by_name_color` を `true` にすると、装飾コードを除いたPlayerList名を、Actor::getNameTag Hookで観測したActor名に部分一致させ、名前部分に適用されている色順に並べます。同色内は名前順です。
-Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDKの `GameHooks` / `GameApi` / `Actor` API経由です。Actor一覧の取得もSDK経由で実際に使用しています。TabListのLevel tick処理から `gameApi->actors(level)` を呼び、SDKアダプターの `actorHandles()` が、SDKの1.26.52.3プロファイルで解決した `Level::getRuntimeActorList` を使ってActor一覧を返します。MurderDetectまたはGamemodeCheckが有効な間、一覧を更新して走査します。呼び出し先vtable entryとABIがプロファイルに一致しない場合は呼び出しません。PlayerList名との照合はSDKの `Actor::getName()` が返す正規名で行い、色遷移時のみ `PlayerList name color updated` を記録します。Hive上で実際に紫に描画される `§i` はTabListでも紫として表示します。
-Actor一覧経路は対象バイナリを静的解析して接続しましたが、更新後のMinecraft実機で件数・ワールド再参加を確認する必要があります。native Actorの読み取りはゲームスレッドで行い、コピーした値の判定だけをワーカーへ送ります。
+MurderDetectとGamemodeCheckのActor一覧は、SDKアダプターから `Level::getRuntimeActorList` だけで取得します。SDKのNameTag観測キャッシュなど別経路のActorを走査一覧へ混ぜません。関数の完全一致プロファイルがない場合、検知一覧は空のままにして他のActor取得経路へ切り替えません。PlayerList名との照合にはコピー済みNameTagを使います。
+対象ビルドでRuntimeActorListのslotとABIを検証し、実際のvtable entryが一致した場合だけActor一覧を取得します。native Actorの読み取りはゲームスレッドで行い、コピーした値の判定だけをワーカーへ送ります。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
 
@@ -72,12 +72,11 @@ Actor一覧経路は対象バイナリを静的解析して接続しましたが
 表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
 `murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定1、最小1、最大40 tick）です。
 以前の既定値 `20` が残る設定ファイルも `1` として読み込み、その他の明示値は保持します。
-Actor一覧は新しいActorのNameTag観測を次のtickで反映し、静かな場合のみ5秒ごとに安全更新します。手持ちのNative readは
-1 tickにつき最大2人ずつ行い、20 TPS・20人なら約0.5秒で一巡します。Actor/装備のNative readはゲームスレッドで行い、名前・アイテムID・個数をコピーした後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄してログに記録します。確認できたアイテムが前回から変わった時は、debug設定に関係なく
-`TabList.log` に `player / item / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
+Actor一覧はLevelのRuntimeActorListから1秒ごとに取得します。手持ちのNative readは
+1 tickにつき最大2人ずつ行い、読み取り・識別・表示名のコピーはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player / name / id / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
 アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
 これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。
-debug=trueではtranslation key等の詳細を追加します。
+アイテム名には、1.26.52.3の検証済み `ItemStackBase::getHoverName` から取得した表示名を使い、Item IDごとにキャッシュします。取得できない場合のみItem IDを名前欄に表示します。色遷移の詳細ログは `debug=true` の場合に限ります。MurderDetectのActor rosterはワールド参加ごとに一度だけ記録します。
 
 ワーカースレッドへActorポインタやSDKハンドルは渡しません。MinecraftがActor/EnTTを更新・破棄するタイミングと競合するため、Native read自体を別スレッドへ移すことはしていません。1.26.52.3のNative item layoutも現在は候補値のため、実機での装備ID読み取り確認が必要です。
 これによりActor数がスナップショット更新間隔を超えても先頭に戻って後半のActorを取りこぼすことがなく、
@@ -85,8 +84,7 @@ TabListを開いた瞬間の一括読み取りも発生しません。間隔を�
 各Actorの手持ちが再確認されるまでの時間はActor数に応じて長くなります。
 一度検知したSheriff／Murdererの表示は、手から武器が離れても最後の検知から5分間維持し、
 その間に再検知すればさらに5分延長します。プレイヤーが一時的に抜けても同じ名前の判定は期限まで保持します。
-未知のアイテムIDは `TabList.log` に一度だけ候補として記録されます。
-`debug` を `true` にするとActor名・表示名・個数・アイテム切替の詳細ログも出ます。
+手持ちアイテムが切り替わった時だけ、表示名とItem ID、個数、役割を `TabList.log` に記録します。色遷移ログなどの詳細は `debug=true` で有効になります。
 
 `gamemode_check` はActorの `ActorGameTypeComponent` を読み、Spectator (GameType 3) を灰色で表示します。
 死亡・不可視フラグの読み取りは対象バージョンでまだ確定できていないため、この設定では判定しません。
