@@ -202,6 +202,7 @@ std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
 std::uint64_t murderActorSnapshotTick = 0;
 std::size_t murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
+std::atomic<bool> murderActorRosterDirty{true};
 std::atomic<bool> loggedMurderActorReadFault{false};
 
 void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
@@ -216,7 +217,7 @@ void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
 }
 std::size_t cachedFaceCursor = 0;
 const std::vector<PlayerRow>* cachedFaceSource = nullptr;
-std::atomic<std::shared_ptr<const std::vector<PlayerRow>>> cachedTabRows{
+std::shared_ptr<const std::vector<PlayerRow>> cachedTabRows{
     std::make_shared<const std::vector<PlayerRow>>()};
 std::atomic<bool> loggedTabRowsReady{false};
 std::atomic<bool> loggedFirstNameTag{false};
@@ -258,7 +259,7 @@ std::unique_ptr<bedrock::GameHooks> gameHooks;
 std::atomic<bool> loggedActorListFailure{false};
 std::atomic<bool> loggedActorListSuccess{false};
 std::atomic<bool> loggedActorReceiverAdjustment{false};
-std::atomic<std::shared_ptr<const tablist::Config>> liveConfig{
+std::shared_ptr<const tablist::Config> liveConfig{
     std::make_shared<const tablist::Config>()};
 std::array<BDS_HookToken, 5> hookTokens{};
 struct NextFrame { BDS_HookNext next{}; void* frame{}; };
@@ -451,7 +452,8 @@ void recordLevel(void* level) noexcept {
     levelHeartbeatMs.store(steadyMilliseconds(), std::memory_order_release);
     if (previous != level) {
         if (gameApi) gameApi->clearObservedActors();
-        cachedTabRows.store({}, std::memory_order_release);
+        std::atomic_store_explicit(&cachedTabRows,
+            std::shared_ptr<const std::vector<PlayerRow>>{}, std::memory_order_release);
         loggedTabRowsReady.store(false, std::memory_order_release);
         {
             std::lock_guard lock(actorNameTagMutex);
@@ -1235,7 +1237,7 @@ bool fillOneFaceSeh(void* level, PlayerRow* row) noexcept {
 void refreshOneCachedFace(const std::shared_ptr<const tablist::Config>& config) noexcept {
     if (!config || !config->showFaces) return;
     try {
-        auto current = cachedTabRows.load(std::memory_order_acquire);
+        auto current = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
         if (!current || current->empty()) return;
         if (cachedFaceSource != current.get()) {
             cachedFaceSource = current.get();
@@ -1247,7 +1249,7 @@ void refreshOneCachedFace(const std::shared_ptr<const tablist::Config>& config) 
             auto updated = std::make_shared<std::vector<PlayerRow>>(*current);
             if (!fillOneFaceSeh(levelInstance.load(std::memory_order_acquire),
                                 &(*updated)[index])) return;
-            cachedTabRows.store(
+            std::atomic_store_explicit(&cachedTabRows,
                 std::shared_ptr<const std::vector<PlayerRow>>(std::move(updated)),
                 std::memory_order_release);
             return; // Exactly one native skin/face read per game tick.
@@ -1273,7 +1275,7 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
                          config->murderDetect, murderRoles, actorTags)) {
             return; // Keep the previous immutable snapshot on a transient read failure.
         }
-        const auto previous = cachedTabRows.load(std::memory_order_acquire);
+        const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
         if (config->showFaces && previous) {
             for (auto& row : rows) {
                 const auto old = std::find_if(previous->begin(), previous->end(),
@@ -1285,7 +1287,7 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
             }
         }
         auto snapshot = std::make_shared<const std::vector<PlayerRow>>(std::move(rows));
-        cachedTabRows.store(std::move(snapshot), std::memory_order_release);
+        std::atomic_store_explicit(&cachedTabRows, std::move(snapshot), std::memory_order_release);
         if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
             diagnostic("TabList row cache ready; renderer uses cached rows only");
     } catch (...) {
@@ -1394,12 +1396,14 @@ void updateMurderDetection(bool debug) noexcept {
         {
             std::lock_guard lock(murderDetectMutex);
             const auto now = std::chrono::steady_clock::now();
-            pruneExpiredMurderRolesLocked(now);
             const auto old = lastHeldItemByPlayer.find(snapshot.name);
-            changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
             if (old != lastHeldItemByPlayer.end()) previous = old->second;
-            if (itemKey.empty()) lastHeldItemByPlayer.erase(snapshot.name);
-            else {
+            // A missing/invalid native stack read is not proof that the hand
+            // became empty. Keep the last confirmed item so a transient read
+            // failure cannot erase the transition baseline and cause missed
+            // or duplicate reports on the next successful sample.
+            if (!itemKey.empty()) {
+                changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
                 lastHeldItemByPlayer.insert_or_assign(snapshot.name, itemKey);
                 firstSeen = loggedHeldItemIdentifiers.insert(itemKey).second;
             }
@@ -1410,6 +1414,19 @@ void updateMurderDetection(bool debug) noexcept {
             }
         }
         if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
+        if (changed && item) {
+            const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
+                : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
+            if (previous.empty()) {
+                diagnostic("MurderDetect held item: player=", snapshot.name,
+                           " item=", itemKey, " count=", item->count,
+                           " role=", roleName);
+            } else {
+                diagnostic("MurderDetect held item: player=", snapshot.name,
+                           " item=", itemKey, " count=", item->count,
+                           " role=", roleName, " previous=", previous);
+            }
+        }
         if (debug && changed && item) {
             diagnostic("MurderDetect actor item: player=", snapshot.name,
                        " item=", itemKey,
@@ -1432,12 +1449,18 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
+            murderActorRosterDirty.store(true, std::memory_order_release);
             murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
         }
-        // Refresh the roster every second, independently of the item polling
-        // cadence. Previously the roster refreshed after 25 *poll calls* and
-        // reset the cursor; with 30+ Actors, later entries were never reached.
-        if (++murderActorSnapshotTick < 20) return;
+        // Coalesce name-tag discovery bursts and refresh at most once per
+        // second when dirty; retain a five-second safety refresh when the
+        // hook is quiet. This avoids sorting/copying the roster every second
+        // while still promptly enrolling newly observed Actors.
+        ++murderActorSnapshotTick;
+        const bool dirty = murderActorRosterDirty.load(std::memory_order_acquire);
+        if (murderActorSnapshotTick < 20 ||
+            (!dirty && murderActorSnapshotTick < 100)) return;
+        murderActorRosterDirty.store(false, std::memory_order_release);
         murderActorSnapshotTick = 0;
 
         auto refreshed = gameApi->actors(level);
@@ -1480,7 +1503,7 @@ void __fastcall onLevelSubTick(void* level) {
         refreshTicks = 0;
         if (gameApi) (void)gameApi->refreshCachedActorNameTags(1);
     }
-    const auto config = liveConfig.load(std::memory_order_acquire);
+    const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
     refreshOneCachedFace(config);
     static unsigned murderScanCadence = 0;
     if (config->murderDetect) {
@@ -1534,11 +1557,11 @@ void drawTabList(void*) {
     auto& io = ImGui::GetIO();
     io.MouseDrawCursor = false;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-    const auto config = liveConfig.load(std::memory_order_acquire);
+    const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
     if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire)) return;
     if (!gameplayActive.load(std::memory_order_acquire)) return;
-    const auto playersSnapshot = cachedTabRows.load(std::memory_order_acquire);
+    const auto playersSnapshot = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
     if (!playersSnapshot || playersSnapshot->empty()) return;
     const auto& players = *playersSnapshot;
     if (!loggedListSuccess.exchange(true, std::memory_order_acq_rel))
@@ -1701,8 +1724,8 @@ bool loadConfig(const std::filesystem::path& path, bedrock::Logger& logger) {
         logger.error("Ignoring invalid config.json: ", error);
         return false;
     }
-    liveConfig.store(std::make_shared<const tablist::Config>(parsed),
-                     std::memory_order_release);
+    std::atomic_store_explicit(&liveConfig,
+        std::make_shared<const tablist::Config>(parsed), std::memory_order_release);
     return true;
 }
 
@@ -1913,6 +1936,7 @@ DWORD WINAPI startClient(void*) {
     if (actorNameTagHookReady) {
         gameApi->Event.Enum.ActorNameTag.then([](const bedrock::ActorNameTagEvent& event) {
             if (!event.actor || event.nameTag.empty() || event.nameTag.size() > 512) return;
+            murderActorRosterDirty.store(true, std::memory_order_release);
             try {
                 captureQueriedActorNameTag(event.actor, std::string(event.nameTag));
             } catch (...) {
@@ -1953,7 +1977,8 @@ DWORD WINAPI startClient(void*) {
     status.store(Status::Running, std::memory_order_release);
     auto lastWrite = std::filesystem::last_write_time(path);
     while (!stopRequested.load(std::memory_order_acquire)) {
-        const auto delay = liveConfig.load(std::memory_order_acquire)->reloadIntervalMs;
+        const auto delay = std::atomic_load_explicit(&liveConfig,
+            std::memory_order_acquire)->reloadIntervalMs;
         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
         if (!levelIsFresh()) tryAcquireLevelFromClient();
         std::error_code ec;

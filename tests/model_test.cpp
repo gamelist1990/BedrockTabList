@@ -7,6 +7,10 @@
 #include <vector>
 
 int main() {
+    std::string defaultsError;
+    const auto defaults = tablist::parseConfig("{}", defaultsError);
+    assert(defaultsError.empty() && defaults.murderScanIntervalTicks == 20);
+
     assert(tablist::stripMinecraftFormatting("Steve") == "Steve");
     assert(tablist::stripMinecraftFormatting("\xC2\xA7" "aAlex") == "Alex");
     assert(tablist::actorNameColorForPlayerName(
