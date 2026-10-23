@@ -627,6 +627,11 @@ std::int64_t steadyMilliseconds() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+bool levelIsFresh() noexcept {
+    const auto heartbeat = levelHeartbeatMs.load(std::memory_order_acquire);
+    return heartbeat > 0 && steadyMilliseconds() - heartbeat <= 1000;
+}
+
 void recordLevel(void* level) noexcept {
     if (!level) return;
     void* previous = levelInstance.exchange(level, std::memory_order_acq_rel);
