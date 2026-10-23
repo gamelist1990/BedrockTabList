@@ -14,7 +14,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
 - SDKの `Actor::getMainHand()` で取得した装備スナップショットからMurderDetectの役割を表示（弓=Sheriff/水色、`hivemurder:` ID=Murderer/赤）
 - `gamemode_check` が有効ならSpectatorを灰色にし `[Spectator]` を表示
-- MurderDetectはTab表示前からtickごとに最大2人ずつ読み、役割キャッシュを準備（Minecraftオブジェクトのネイティブ読み取りはゲームスレッド上で実行）
+- MurderDetectはTab表示前からPlayerListに一致したActorだけを順送りし、手持ちのネイティブ読み取りを最大1人/tickに制限（読み取りはゲームスレッド上で実行）
 - Sheriff／Murdererは最後の検知から5分間保持し、期間内に再検知した場合は期限を延長
 - Actorの装備コンポーネント／手持ち枠の読み取りで例外が出た対象はスキップし、後続Actorの走査を継続
 - TabListの行・色・役割はゲーム更新中に1秒間隔でキャッシュを作り直し、顔画像はtickごとに1人ずつ追加。Tab表示時はキャッシュだけを描画
@@ -72,8 +72,8 @@ MurderDetectとGamemodeCheckのActor一覧は、SDKアダプターから `Level:
 表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
 `murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定1、最小1、最大40 tick）です。
 以前の既定値 `20` が残る設定ファイルも `1` として読み込み、その他の明示値は保持します。
-Actor一覧はLevelのRuntimeActorListから1秒ごとに取得します。手持ちのNative readは
-1 tickにつき最大2人ずつ行い、読み取り・識別・表示名のコピーはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player / name / id / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
+Actor一覧はLevelのRuntimeActorListから1秒ごとに取得します。PlayerList名とコピー済みNameTagを照合し、プレイヤーActorだけをサンプル対象にします。手持ちのNative readは
+1 tickにつき最大1人に制限し、読み取りはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player / name / id / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
 アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
 これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。
 アイテム名には、1.26.52.3の検証済み `ItemStackBase::getHoverName` から取得した表示名を使い、Item IDごとにキャッシュします。取得できない場合のみItem IDを名前欄に表示します。色遷移の詳細ログは `debug=true` の場合に限ります。MurderDetectのActor rosterはワールド参加ごとに一度だけ記録します。

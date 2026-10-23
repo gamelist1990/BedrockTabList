@@ -245,7 +245,11 @@ bool murderWorkerStopping{};
 std::atomic<std::uint64_t> droppedMurderSamples{0};
 // Raw handles are captured from GameApi's validated roster on the game thread.
 // Re-validating each wrapper for every scan repeats several VirtualQuery calls.
-std::vector<void*> murderScanActors;
+struct MurderActorEntry {
+    void* actor{};
+    std::string playerName;
+};
+std::vector<MurderActorEntry> murderScanActors;
 std::vector<std::string> murderPlayerNames;
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
@@ -862,6 +866,8 @@ std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
         return std::nullopt;
     if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
         item.identifier.insert(0, "minecraft:");
+    // The display name is cached by item identifier, so the native resolver
+    // runs only for the first observation of each item type.
     populateItemDisplayName(stack, item);
     if (!item.valid()) return std::nullopt;
     return item;
@@ -1388,22 +1394,12 @@ bool containsNameIgnoreCase(std::string_view text, std::string_view name) noexce
 }
 
 void readActorMurderSnapshot(void* actor,
-                             const std::vector<std::string>& playerNames,
+                             std::string_view playerName,
                              ActorMurderSnapshot& snapshot,
                              bool readItem, bool readGameMode) {
-    std::string nameTag;
-    if (!copyActorNameTag(actor, &nameTag)) return;
-    const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
-    for (const auto& playerName : playerNames) {
-        if (!containsNameIgnoreCase(plainTag, playerName)) continue;
-        // Names are sorted longest-first to match GameApi's player identity
-        // semantics when a tag contains both a display name and username.
-        snapshot.name = playerName;
-        snapshot.isPlayer = true;
-        break;
-    }
-    if (!snapshot.isPlayer) return;
-    if (snapshot.name.empty() || snapshot.name.size() > 128) return;
+    if (!actor || playerName.empty() || playerName.size() > 128) return;
+    snapshot.name.assign(playerName);
+    snapshot.isPlayer = true;
     if (readItem)
         snapshot.item = gameApi->actor(actor).getMainHand();
     if (readGameMode) {
@@ -1416,12 +1412,12 @@ void readActorMurderSnapshot(void* actor,
 // Keep native Actor/inventory access behind a per-actor SEH boundary. One stale
 // cached Actor or invalid inventory layout must not take down Minecraft.
 bool readActorMurderSnapshotSeh(void* actor,
-                                const std::vector<std::string>* playerNames,
+                                const std::string* playerName,
                                 ActorMurderSnapshot* snapshot,
                                 bool readItem, bool readGameMode) noexcept {
-    if (!actor || !playerNames || !snapshot) return false;
+    if (!actor || !playerName || !snapshot) return false;
     __try {
-        readActorMurderSnapshot(actor, *playerNames, *snapshot, readItem, readGameMode);
+        readActorMurderSnapshot(actor, *playerName, *snapshot, readItem, readGameMode);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1437,16 +1433,20 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
         if (murderScanActors.empty() || murderPlayerNames.empty()) return;
-        constexpr std::size_t actorsPerTick = 2;
+        // One bounded equipment read per tick. The roster below is filtered to
+        // actual PlayerList actors, so reducing the batch does not waste most
+        // samples on mobs and other entities.
+        constexpr std::size_t actorsPerTick = 1;
         const auto sampleCount = std::min(actorsPerTick, murderScanActors.size());
         for (std::size_t sample = 0; sample < sampleCount; ++sample) {
             if (murderScanCursor >= murderScanActors.size()) murderScanCursor = 0;
-            auto* actor = murderScanActors[murderScanCursor];
+            const auto& tracked = murderScanActors[murderScanCursor];
+            auto* actor = tracked.actor;
             const auto actorHandle = reinterpret_cast<std::uintptr_t>(actor);
             murderScanCursor = (murderScanCursor + 1) % murderScanActors.size();
             if (actorHandle) murderLastProcessedActor = actorHandle;
             ActorMurderSnapshot snapshot;
-            if (!readActorMurderSnapshotSeh(actor, &murderPlayerNames, &snapshot,
+            if (!readActorMurderSnapshotSeh(actor, &tracked.playerName, &snapshot,
                                             readItems, readGameMode)) {
                 if (!loggedMurderActorReadFault.exchange(true, std::memory_order_acq_rel))
                     diagnostic("MurderDetect skipped an Actor whose native read raised an exception");
@@ -1505,12 +1505,6 @@ void refreshTrackedMurderActors(void* level) noexcept {
             });
         actorHandles.erase(std::unique(actorHandles.begin(), actorHandles.end()),
                            actorHandles.end());
-        std::vector<std::uintptr_t> handles;
-        handles.reserve(actorHandles.size());
-        for (const auto* actor : actorHandles)
-            handles.push_back(reinterpret_cast<std::uintptr_t>(actor));
-        murderScanActors = std::move(actorHandles);
-        murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
 
         murderPlayerNames.clear();
         for (const auto& name : gameApi->world(level).getPlayerNames()) {
@@ -1524,10 +1518,35 @@ void refreshTrackedMurderActors(void* level) noexcept {
             });
         murderPlayerNames.erase(std::unique(murderPlayerNames.begin(), murderPlayerNames.end()),
                                 murderPlayerNames.end());
+
+        // Keep only runtime Actors whose copied name tag identifies a current
+        // PlayerList entry. This moves the string matching and non-player
+        // filtering to the once-per-second roster refresh instead of doing it
+        // for every sampled entity on every tick.
+        std::vector<MurderActorEntry> playerActors;
+        playerActors.reserve(murderPlayerNames.size());
+        for (auto* actor : actorHandles) {
+            std::string nameTag;
+            if (!copyActorNameTag(actor, &nameTag)) continue;
+            const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
+            const auto player = std::find_if(murderPlayerNames.begin(),
+                murderPlayerNames.end(), [&](const std::string& playerName) {
+                    return containsNameIgnoreCase(plainTag, playerName);
+                });
+            if (player != murderPlayerNames.end())
+                playerActors.push_back({actor, *player});
+        }
+        std::vector<std::uintptr_t> handles;
+        handles.reserve(playerActors.size());
+        for (const auto& actor : playerActors)
+            handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
+        murderScanActors = std::move(playerActors);
+        murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
         if (!loggedMurderRosterReady) {
-            murderTrackedActorCount = murderScanActors.size();
+            murderTrackedActorCount = actorHandles.size();
             loggedMurderRosterReady = true;
             diagnostic("MurderDetect roster ready: actors=", murderTrackedActorCount,
+                       " playerActors=", murderScanActors.size(),
                        " players=", murderPlayerNames.size());
         }
     } catch (...) {
