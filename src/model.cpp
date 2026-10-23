@@ -28,6 +28,16 @@ MurderRole murderRoleForHeldItem(std::string_view identifier,
     return MurderRole::None;
 }
 
+std::size_t nextActorScanIndex(std::span<const std::uintptr_t> sortedHandles,
+                               std::uintptr_t lastProcessedHandle) noexcept {
+    if (sortedHandles.empty()) return 0;
+    const auto next = std::upper_bound(sortedHandles.begin(), sortedHandles.end(),
+                                       lastProcessedHandle);
+    return next == sortedHandles.end()
+        ? 0
+        : static_cast<std::size_t>(next - sortedHandles.begin());
+}
+
 namespace {
 
 struct FormattedText {

@@ -68,8 +68,11 @@ Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDK�
 
 `murder_detect` は手持ちの弓/矢を `[Sheriff]`（水色）、鉄剣を `[Murderer]`（赤）で
 表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
-`murder_scan_interval_ticks` は次のActorを読む間隔（既定10、最小1、最大40 tick）です。
-間隔を増やすほど負荷は下がりますが、全Actorのアイテム状態が揃うまでの時間は長くなります。
+`murder_scan_interval_ticks` は追跡中の次のActorから手持ちを読む間隔（既定10、最小1、最大40 tick）です。
+Actor一覧はゲームスレッド上で約20tickごとに更新し、読み取り位置をActor handleで維持します。
+これによりActor数がスナップショット更新間隔を超えても先頭に戻って後半のActorを取りこぼすことがなく、
+TabListを開いた瞬間の一括読み取りも発生しません。間隔を増やすほど負荷は下がりますが、
+各Actorの手持ちが再確認されるまでの時間はActor数に応じて長くなります。
 一度検知したSheriff／Murdererの表示は、手から武器が離れても最後の検知から5分間維持し、
 その間に再検知すればさらに5分延長します。プレイヤーが一時的に抜けても同じ名前の判定は期限まで保持します。
 未知のアイテムIDは `TabList.log` に一度だけ候補として記録されます。

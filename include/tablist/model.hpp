@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <optional>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,6 +18,12 @@ struct Layout {
 enum class MurderRole { None, Sheriff, Murderer };
 [[nodiscard]] MurderRole murderRoleForHeldItem(std::string_view identifier,
                                                 std::string_view displayName);
+// Actor handles are sorted before polling. Preserve round-robin progress when
+// the live Actor snapshot is refreshed so large worlds cannot starve entries
+// near the end of the list.
+[[nodiscard]] std::size_t nextActorScanIndex(
+    std::span<const std::uintptr_t> sortedHandles,
+    std::uintptr_t lastProcessedHandle) noexcept;
 
 std::string stripMinecraftFormatting(std::string_view text);
 // Returns the first active legacy Minecraft name color (0-15), or 16 when

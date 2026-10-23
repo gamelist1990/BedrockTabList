@@ -198,9 +198,10 @@ std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
 std::unordered_set<std::string> loggedHeldItemIdentifiers;
 std::vector<bedrock::Actor> murderScanActors;
 std::size_t murderScanCursor = 0;
+std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
-std::uint64_t murderScanTick = 0;
 std::uint64_t murderActorSnapshotTick = 0;
+std::size_t murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
 std::atomic<bool> loggedMurderActorReadFault{false};
 
 void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
@@ -1354,30 +1355,20 @@ bool readActorMurderSnapshotSeh(const bedrock::Actor* actor,
 }
 
 void updateMurderDetection(bool debug) noexcept {
-    // Native Minecraft objects are thread-affine. Warm the cache gradually
-    // during gameplay so opening the player list never starts a scan burst.
+    // The live Actor list is refreshed separately on the game tick. Poll one
+    // tracked Actor at a time so item reads stay thread-affine and opening the
+    // TabList never triggers a scan burst.
     if (!gameApi) return;
     try {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
-        if (murderScanLevel != level) {
-            murderScanActors.clear();
-            murderScanCursor = 0;
-            murderScanLevel = level;
-            murderScanTick = 0;
-            murderActorSnapshotTick = 0;
-        }
-        ++murderScanTick;
-        if (murderActorSnapshotTick == 0 ||
-            murderScanTick - murderActorSnapshotTick >= 25) {
-            murderScanActors = gameApi->actors(level);
-            murderScanCursor = 0;
-            murderActorSnapshotTick = murderScanTick;
-        }
         if (murderScanActors.empty()) return;
         if (murderScanCursor >= murderScanActors.size()) murderScanCursor = 0;
 
-        const auto& actor = murderScanActors[murderScanCursor++];
+        const auto& actor = murderScanActors[murderScanCursor];
+        const auto actorHandle = reinterpret_cast<std::uintptr_t>(actor.handle());
+        murderScanCursor = (murderScanCursor + 1) % murderScanActors.size();
+        if (actorHandle) murderLastProcessedActor = actorHandle;
         ActorMurderSnapshot snapshot;
         if (!readActorMurderSnapshotSeh(&actor, &snapshot)) {
             if (!loggedMurderActorReadFault.exchange(true, std::memory_order_acq_rel))
@@ -1432,6 +1423,53 @@ void updateMurderDetection(bool debug) noexcept {
     }
 }
 
+void refreshTrackedMurderActors(void* level, bool debug) noexcept {
+    if (!gameApi || !level) return;
+    try {
+        if (murderScanLevel != level) {
+            murderScanLevel = level;
+            murderScanActors.clear();
+            murderScanCursor = 0;
+            murderLastProcessedActor = 0;
+            murderActorSnapshotTick = 19; // First live roster is ready immediately.
+            murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
+        }
+        // Refresh the roster every second, independently of the item polling
+        // cadence. Previously the roster refreshed after 25 *poll calls* and
+        // reset the cursor; with 30+ Actors, later entries were never reached.
+        if (++murderActorSnapshotTick < 20) return;
+        murderActorSnapshotTick = 0;
+
+        auto refreshed = gameApi->actors(level);
+        refreshed.erase(std::remove_if(refreshed.begin(), refreshed.end(),
+            [](const bedrock::Actor& actor) { return actor.handle() == nullptr; }),
+            refreshed.end());
+        std::sort(refreshed.begin(), refreshed.end(),
+            [](const bedrock::Actor& left, const bedrock::Actor& right) {
+                return reinterpret_cast<std::uintptr_t>(left.handle()) <
+                       reinterpret_cast<std::uintptr_t>(right.handle());
+            });
+        refreshed.erase(std::unique(refreshed.begin(), refreshed.end(),
+            [](const bedrock::Actor& left, const bedrock::Actor& right) {
+                return left.handle() == right.handle();
+            }), refreshed.end());
+
+        std::vector<std::uintptr_t> handles;
+        handles.reserve(refreshed.size());
+        for (const auto& actor : refreshed)
+            handles.push_back(reinterpret_cast<std::uintptr_t>(actor.handle()));
+        murderScanActors = std::move(refreshed);
+        murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
+        if (debug && murderTrackedActorCount != murderScanActors.size()) {
+            murderTrackedActorCount = murderScanActors.size();
+            diagnostic("MurderDetect Actor tracker refreshed: tracked=",
+                       murderTrackedActorCount, " sampling=round-robin");
+        }
+    } catch (...) {
+        // Keep the last good roster if native enumeration transiently fails.
+    }
+}
+
 void __fastcall onLevelSubTick(void* level) {
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
@@ -1446,6 +1484,7 @@ void __fastcall onLevelSubTick(void* level) {
     refreshOneCachedFace(config);
     static unsigned murderScanCadence = 0;
     if (config->murderDetect) {
+        refreshTrackedMurderActors(level, config->debug);
         if (++murderScanCadence >= config->murderScanIntervalTicks) {
             murderScanCadence = 0;
             updateMurderDetection(config->debug);

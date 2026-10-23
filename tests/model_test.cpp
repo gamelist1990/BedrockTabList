@@ -1,6 +1,7 @@
 #include "tablist/config.hpp"
 #include "tablist/model.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 #include <vector>
@@ -65,6 +66,25 @@ int main() {
            tablist::MurderRole::None);
     assert(tablist::murderRoleForHeldItem("minecraft:crossbow", "Crossbow") ==
            tablist::MurderRole::None);
+
+    // Refreshing the Actor snapshot must resume after the last Actor already
+    // sampled, rather than resetting to index zero and starving later players.
+    std::vector<std::uintptr_t> actorHandles;
+    for (std::uintptr_t handle = 1; handle <= 40; ++handle)
+        actorHandles.push_back(handle);
+    std::uintptr_t lastActor = 0;
+    std::vector<std::uintptr_t> visitedActors;
+    for (int refresh = 0; refresh < 3; ++refresh) {
+        for (int sample = 0; sample < 25; ++sample) {
+            const auto index = tablist::nextActorScanIndex(actorHandles, lastActor);
+            lastActor = actorHandles[index];
+            visitedActors.push_back(lastActor);
+        }
+    }
+    for (const auto handle : actorHandles)
+        assert(std::find(visitedActors.begin(), visitedActors.end(), handle) !=
+               visitedActors.end());
+    assert(tablist::nextActorScanIndex(actorHandles, 40) == 0);
 
     std::cout << "tablist_test: PASS\n";
 }
