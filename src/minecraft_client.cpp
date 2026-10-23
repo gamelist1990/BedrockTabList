@@ -435,6 +435,8 @@ void processMurderSample(const MurderSample& sample) noexcept {
             ? tablist::murderRoleForHeldItem(sample.identifier, sample.displayName)
             : tablist::MurderRole::None;
 
+        const auto sampleConfig = std::atomic_load_explicit(&liveConfig,
+                                                            std::memory_order_acquire);
         bool changed = false;
         std::string previous;
         std::string currentDisplay;
@@ -450,7 +452,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
                 changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
                 lastHeldItemByPlayer.insert_or_assign(sample.name, itemKey);
             }
-            if (sample.hasItem) {
+            if (sample.hasItem && sampleConfig && sampleConfig->showHeldItems) {
                 std::string display = normalizeItemDisplayName(
                     sample.displayName, sample.identifier);
                 if (!display.empty()) {
@@ -972,7 +974,8 @@ std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
         item.identifier.insert(0, "minecraft:");
     // The display name is cached by item identifier, so the native resolver
     // runs only for the first observation of each item type.
-    populateItemDisplayName(stack, item);
+    const auto itemConfig = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
+    if (itemConfig && itemConfig->showHeldItems) populateItemDisplayName(stack, item);
     if (!item.valid()) return std::nullopt;
     return item;
 }
@@ -1452,10 +1455,14 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
         std::lock_guard writeLock(cachedTabRowsWriteMutex);
         if (config->murderDetect) {
             std::lock_guard stateLock(murderDetectMutex);
-            heldItems = heldItemNamesByPlayer;
-            for (auto& row : rows) {
-                const auto item = heldItems.find(row.name);
-                if (item != heldItems.end()) row.heldItemName = item->second;
+            if (config->showHeldItems) {
+                heldItems = heldItemNamesByPlayer;
+                for (auto& row : rows) {
+                    const auto item = heldItems.find(row.name);
+                    if (item != heldItems.end()) row.heldItemName = item->second;
+                }
+            } else {
+                heldItemNamesByPlayer.clear();
             }
         }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
@@ -1757,7 +1764,13 @@ void __fastcall onLevelSubTick(void* level) {
         if (gameApi) (void)gameApi->refreshCachedActorNameTags(1);
     }
     const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
-    refreshOneCachedFace(config);
+    // Face extraction copies the row snapshot and reads native skin data.
+    // Limit this optional work to once every four game ticks.
+    static unsigned faceRefreshCadence = 0;
+    if (++faceRefreshCadence >= 4) {
+        faceRefreshCadence = 0;
+        refreshOneCachedFace(config);
+    }
     static unsigned murderScanCadence = 0;
     if (config->murderDetect || config->gamemodeCheck) {
         refreshTrackedMurderActors(level);
