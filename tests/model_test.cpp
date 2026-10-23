@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
-#include <string_view>
 #include <vector>
 
 int main() {
@@ -82,15 +81,15 @@ int main() {
            tablist::MurderRole::Murderer);
     assert(tablist::murderRoleForHeldItem("minecraft:crossbow", "Crossbow") ==
            tablist::MurderRole::None);
-    constexpr std::u8string_view formattedJapaneseItem = u8"§o§f§r§aワンショット光線銃§r";
-    constexpr std::u8string_view plainJapaneseItem = u8"ワンショット光線銃";
-    const std::string_view formattedJapaneseItemBytes{
-        reinterpret_cast<const char*>(formattedJapaneseItem.data()),
-        formattedJapaneseItem.size()};
-    const std::string_view plainJapaneseItemBytes{
-        reinterpret_cast<const char*>(plainJapaneseItem.data()), plainJapaneseItem.size()};
-    assert(tablist::stripMinecraftFormatting(formattedJapaneseItemBytes) ==
-           plainJapaneseItemBytes);
+    constexpr std::string_view formattedJapaneseItem =
+        "\302\247o\302\247f\302\247r\302\247a"
+        "\343\203\257\343\203\263\343\202\267\343\203\247"
+        "\343\203\203\343\203\210\345\205\211\347\267\232\351\212\203"
+        "\302\247r";
+    constexpr std::string_view plainJapaneseItem =
+        "\343\203\257\343\203\263\343\202\267\343\203\247"
+        "\343\203\203\343\203\210\345\205\211\347\267\232\351\212\203";
+    assert(tablist::stripMinecraftFormatting(formattedJapaneseItem) == plainJapaneseItem);
 
     // Refreshing the Actor snapshot must resume after the last Actor already
     // sampled, rather than resetting to index zero and starving later players.
