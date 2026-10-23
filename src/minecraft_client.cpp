@@ -253,6 +253,11 @@ struct MurderActorEntry {
 };
 std::vector<MurderActorEntry> murderScanActors;
 std::vector<std::string> murderPlayerNames;
+std::vector<void*> murderRosterBuildActors;
+std::vector<std::string> murderRosterBuildPlayerNames;
+std::vector<MurderActorEntry> murderRosterBuildMatches;
+std::size_t murderRosterBuildCursor{};
+bool murderRosterBuildPending{};
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
@@ -1537,6 +1542,11 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderScanLevel = level;
             murderScanActors.clear();
             murderPlayerNames.clear();
+            murderRosterBuildActors.clear();
+            murderRosterBuildPlayerNames.clear();
+            murderRosterBuildMatches.clear();
+            murderRosterBuildCursor = 0;
+            murderRosterBuildPending = false;
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
@@ -1547,83 +1557,100 @@ void refreshTrackedMurderActors(void* level) noexcept {
         }
         // Keep the native Level actor-list walk off the hot path. Name-tag
         // observations can arrive in large bursts while players render, so
-        // they must not trigger a full roster rebuild. Refresh at most once per
-        // second; the first world snapshot is still taken immediately.
+        // they must not trigger a full roster rebuild. Refresh the native actor
+        // list at most once per second; resolve its NameTags in bounded batches
+        // over subsequent ticks instead of reading every Actor in one burst.
         ++murderActorSnapshotTick;
-        if (murderActorSnapshotTick < 20) return;
-        murderActorSnapshotTick = 0;
+        if (!murderRosterBuildPending && murderActorSnapshotTick >= 20) {
+            murderActorSnapshotTick = 0;
 
-        // The MurderDetect roster comes only from the exact-build, ABI-verified
-        // Level::getRuntimeActorList adapter. Do not merge name-tag observations
-        // or any secondary actor source into this native scan list.
-        auto actorHandles = tabListGameAccess.actorHandles(level);
-        std::sort(actorHandles.begin(), actorHandles.end(),
-            [](const void* left, const void* right) {
-                return reinterpret_cast<std::uintptr_t>(left) <
-                       reinterpret_cast<std::uintptr_t>(right);
-            });
-        actorHandles.erase(std::unique(actorHandles.begin(), actorHandles.end()),
-                           actorHandles.end());
+            // The roster source remains the exact-build Level runtime list.
+            // No NameTag cache or alternate Actor enumeration is merged here.
+            murderRosterBuildActors = tabListGameAccess.actorHandles(level);
+            std::sort(murderRosterBuildActors.begin(), murderRosterBuildActors.end(),
+                [](const void* left, const void* right) {
+                    return reinterpret_cast<std::uintptr_t>(left) <
+                           reinterpret_cast<std::uintptr_t>(right);
+                });
+            murderRosterBuildActors.erase(
+                std::unique(murderRosterBuildActors.begin(), murderRosterBuildActors.end()),
+                murderRosterBuildActors.end());
 
-        std::vector<std::string> playerNames;
-        for (const auto& name : gameApi->world(level).getPlayerNames()) {
-            auto plainName = tablist::stripMinecraftFormatting(name);
-            if (!plainName.empty() && plainName.size() <= 128)
-                playerNames.push_back(std::move(plainName));
+            murderRosterBuildPlayerNames.clear();
+            for (const auto& name : gameApi->world(level).getPlayerNames()) {
+                auto plainName = tablist::stripMinecraftFormatting(name);
+                if (!plainName.empty() && plainName.size() <= 128)
+                    murderRosterBuildPlayerNames.push_back(std::move(plainName));
+            }
+            std::sort(murderRosterBuildPlayerNames.begin(),
+                murderRosterBuildPlayerNames.end(),
+                [](const std::string& left, const std::string& right) {
+                    return left.size() > right.size();
+                });
+            murderRosterBuildPlayerNames.erase(
+                std::unique(murderRosterBuildPlayerNames.begin(),
+                            murderRosterBuildPlayerNames.end()),
+                murderRosterBuildPlayerNames.end());
+            murderRosterBuildMatches.clear();
+            murderRosterBuildMatches.reserve(murderRosterBuildPlayerNames.size());
+            murderRosterBuildCursor = 0;
+            murderRosterBuildPending = true;
         }
-        std::sort(playerNames.begin(), playerNames.end(),
-            [](const std::string& left, const std::string& right) {
-                return left.size() > right.size();
-            });
-        playerNames.erase(std::unique(playerNames.begin(), playerNames.end()),
-                          playerNames.end());
 
-        // Keep only runtime Actors whose copied name tag identifies a current
-        // PlayerList entry. This moves the string matching and non-player
-        // filtering to the once-per-second roster refresh instead of doing it
-        // for every sampled entity on every tick.
-        std::vector<MurderActorEntry> playerActors;
-        playerActors.reserve(playerNames.size());
-        for (auto* actor : actorHandles) {
+        // Bound native NameTag calls and matching work to a small batch each
+        // tick. This avoids a once-per-second burst proportional to all Actors.
+        constexpr std::size_t actorsPerRosterTick = 8;
+        const auto end = std::min(murderRosterBuildActors.size(),
+            murderRosterBuildCursor + actorsPerRosterTick);
+        for (; murderRosterBuildCursor < end; ++murderRosterBuildCursor) {
+            auto* actor = murderRosterBuildActors[murderRosterBuildCursor];
             std::string nameTag;
             if (!copyActorNameTag(actor, &nameTag)) continue;
             const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
-            const auto player = std::find_if(playerNames.begin(),
-                playerNames.end(), [&](const std::string& playerName) {
+            const auto player = std::find_if(murderRosterBuildPlayerNames.begin(),
+                murderRosterBuildPlayerNames.end(), [&](const std::string& playerName) {
                     return containsNameIgnoreCase(plainTag, playerName);
                 });
-            if (player != playerNames.end())
-                playerActors.push_back({actor, *player});
+            if (player != murderRosterBuildPlayerNames.end())
+                murderRosterBuildMatches.push_back({actor, *player});
         }
-        if (!playerNames.empty() && !playerActors.empty()) {
-            std::vector<std::uintptr_t> handles;
-            handles.reserve(playerActors.size());
-            for (const auto& actor : playerActors)
-                handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
-            murderPlayerNames = std::move(playerNames);
-            murderScanActors = std::move(playerActors);
-            murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
-            const auto actorCount = actorHandles.size();
-            const auto playerActorCount = murderScanActors.size();
-            if (actorCount != lastLoggedMurderActorCount ||
-                playerActorCount != lastLoggedMurderPlayerActorCount ||
-                murderPlayerNames.size() != lastLoggedMurderPlayerCount) {
-                lastLoggedMurderActorCount = actorCount;
-                lastLoggedMurderPlayerActorCount = playerActorCount;
-                lastLoggedMurderPlayerCount = murderPlayerNames.size();
-                diagnostic("MurderDetect roster updated: actors=", actorCount,
-                           " playerActors=", playerActorCount,
-                           " players=", murderPlayerNames.size());
-            }
-            lastMurderRosterStatusLogMs = steadyMilliseconds();
-        } else {
-            const auto now = steadyMilliseconds();
-            if (lastMurderRosterStatusLogMs == 0 ||
-                now - lastMurderRosterStatusLogMs >= 5000) {
-                diagnostic("MurderDetect waiting for live roster: actors=",
-                           actorHandles.size(), " playerNames=", playerNames.size(),
-                           " matchedActors=", playerActors.size());
-                lastMurderRosterStatusLogMs = now;
+
+        if (murderRosterBuildPending &&
+            murderRosterBuildCursor >= murderRosterBuildActors.size()) {
+            murderRosterBuildPending = false;
+            if (!murderRosterBuildPlayerNames.empty() &&
+                !murderRosterBuildMatches.empty()) {
+                std::vector<std::uintptr_t> handles;
+                handles.reserve(murderRosterBuildMatches.size());
+                for (const auto& actor : murderRosterBuildMatches)
+                    handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
+                murderPlayerNames = std::move(murderRosterBuildPlayerNames);
+                murderScanActors = std::move(murderRosterBuildMatches);
+                murderScanCursor = tablist::nextActorScanIndex(
+                    handles, murderLastProcessedActor);
+                const auto actorCount = murderRosterBuildActors.size();
+                const auto playerActorCount = murderScanActors.size();
+                if (actorCount != lastLoggedMurderActorCount ||
+                    playerActorCount != lastLoggedMurderPlayerActorCount ||
+                    murderPlayerNames.size() != lastLoggedMurderPlayerCount) {
+                    lastLoggedMurderActorCount = actorCount;
+                    lastLoggedMurderPlayerActorCount = playerActorCount;
+                    lastLoggedMurderPlayerCount = murderPlayerNames.size();
+                    diagnostic("MurderDetect roster updated: actors=", actorCount,
+                               " playerActors=", playerActorCount,
+                               " players=", murderPlayerNames.size());
+                }
+                lastMurderRosterStatusLogMs = steadyMilliseconds();
+            } else {
+                const auto now = steadyMilliseconds();
+                if (lastMurderRosterStatusLogMs == 0 ||
+                    now - lastMurderRosterStatusLogMs >= 5000) {
+                    diagnostic("MurderDetect waiting for live roster: actors=",
+                               murderRosterBuildActors.size(), " playerNames=",
+                               murderRosterBuildPlayerNames.size(), " matchedActors=",
+                               murderRosterBuildMatches.size());
+                    lastMurderRosterStatusLogMs = now;
+                }
             }
         }
     } catch (...) {

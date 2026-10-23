@@ -73,7 +73,7 @@ MurderDetectとGamemodeCheckのActor一覧は、SDKアダプターから `Level:
 表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
 `murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定1、最小1、最大40 tick）です。
 以前の既定値 `20` が残る設定ファイルも `1` として読み込み、その他の明示値は保持します。
-Actor一覧はLevelのRuntimeActorListから1秒ごとに取得します。PlayerList名とコピー済みNameTagを照合し、プレイヤーActorだけをサンプル対象にします。手持ちのNative readは
+Actor一覧はLevelのRuntimeActorListから1秒ごとに取得します。PlayerList名とNameTagの照合は1 tickにつき最大8 Actorずつ行い、全Actor分のNative getterが一度に集中しないようにします。プレイヤーActorだけを手持ちサンプル対象にします。手持ちのNative readは
 1 tickにつき最大1人に制限し、読み取りはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player / name / id / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
 アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
 これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。
