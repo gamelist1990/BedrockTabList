@@ -1,6 +1,7 @@
 #include "tablist/model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 
 namespace tablist {
@@ -26,6 +27,11 @@ MurderRole murderRoleForHeldItem(std::string_view identifier,
         return MurderRole::Murderer;
     if (idIs("bow") || equalsIgnoreCase(displayName, "bow"))
         return MurderRole::Sheriff;
+    constexpr std::array<std::string_view, 7> meleeWeapons{
+        "wooden_sword", "stone_sword", "iron_sword", "golden_sword",
+        "diamond_sword", "netherite_sword", "mace"};
+    if (std::any_of(meleeWeapons.begin(), meleeWeapons.end(), idIs))
+        return MurderRole::Murderer;
     return MurderRole::None;
 }
 

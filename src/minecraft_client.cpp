@@ -214,6 +214,7 @@ struct RuntimeActorListTickScope {
     ~RuntimeActorListTickScope() { allowRuntimeActorListCall = previous; }
 };
 struct ActorNameTagEntry {
+    void* actor{};
     std::string nameTag;
     unsigned colorOrder = 28;
     std::uint64_t sequence = 0;
@@ -253,11 +254,6 @@ struct MurderActorEntry {
 };
 std::vector<MurderActorEntry> murderScanActors;
 std::vector<std::string> murderPlayerNames;
-std::vector<void*> murderRosterBuildActors;
-std::vector<std::string> murderRosterBuildPlayerNames;
-std::vector<MurderActorEntry> murderRosterBuildMatches;
-std::size_t murderRosterBuildCursor{};
-bool murderRosterBuildPending{};
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
@@ -389,6 +385,35 @@ void publishHeldItemName(const std::string& playerName,
     }
 }
 
+std::string normalizeItemDisplayName(std::string_view raw,
+                                     std::string_view fallback) {
+    auto name = tablist::stripMinecraftFormatting(raw);
+    const auto actionHint = name.find('[');
+    if (actionHint != std::string::npos) name.resize(actionHint);
+    while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+        name.pop_back();
+    const auto first = std::find_if_not(name.begin(), name.end(),
+        [](unsigned char c) { return std::isspace(c) != 0; });
+    name.erase(name.begin(), first);
+    if (name.empty()) name.assign(fallback);
+
+    // Keep complete UTF-8 code points in the narrow TabList row.
+    std::size_t offset = 0;
+    std::size_t codepoints = 0;
+    while (offset < name.size() && codepoints < 40) {
+        const auto lead = static_cast<unsigned char>(name[offset]);
+        const std::size_t width = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2
+            : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 1;
+        offset += std::min(width, name.size() - offset);
+        ++codepoints;
+    }
+    if (offset < name.size()) {
+        name.resize(offset);
+        name += "...";
+    }
+    return name;
+}
+
 void processMurderSample(const MurderSample& sample) noexcept {
     try {
         std::string itemKey = sample.identifier.empty()
@@ -414,12 +439,8 @@ void processMurderSample(const MurderSample& sample) noexcept {
                 lastHeldItemByPlayer.insert_or_assign(sample.name, itemKey);
             }
             if (sample.hasItem) {
-                std::string display = sample.displayName.empty()
-                    ? sample.identifier : sample.displayName;
-                if (display.size() > 40) {
-                    display.resize(37);
-                    display += "...";
-                }
+                std::string display = normalizeItemDisplayName(
+                    sample.displayName, sample.identifier);
                 if (!display.empty()) {
                     currentDisplay = std::move(display);
                     heldItemNamesByPlayer.insert_or_assign(sample.name, currentDisplay);
@@ -440,7 +461,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
             const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
                 : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
             diagnostic("Item held: player=", sample.name,
-                       " name=", sample.displayName.empty() ? itemKey : sample.displayName,
+                       " name=", currentDisplay.empty() ? itemKey : currentDisplay,
                        " id=", itemKey, " count=", sample.count,
                        " role=", roleName,
                        previous.empty() ? "" : " previous=", previous);
@@ -1025,7 +1046,7 @@ void captureQueriedActorNameTag(void* actor, const std::string& nameTag) noexcep
             // do not remain attached to an Actor after its formatting changes.
             const auto color = hasVisibleName ? tablist::minecraftNameColorOrder(nameTag) : 28u;
             actorNameTags.insert_or_assign(actor,
-                ActorNameTagEntry{nameTag, color, sequence});
+                ActorNameTagEntry{actor, nameTag, color, sequence});
             logFirstName = hasVisibleName &&
                 !loggedFirstNameTag.exchange(true, std::memory_order_acq_rel);
         }
@@ -1143,7 +1164,7 @@ std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
             if (existing != byActor.end() && existing->second.sequence > item.sequence) continue;
             const auto color = tablist::minecraftNameColorOrder(item.nameTag);
             byActor.insert_or_assign(item.actor,
-                ActorNameTagEntry{item.nameTag, color, item.sequence});
+                ActorNameTagEntry{item.actor, item.nameTag, color, item.sequence});
         }
     };
     append(bedrock::NameTagSource::View);
@@ -1151,6 +1172,26 @@ std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
     result.reserve(byActor.size());
     for (auto& [_, entry] : byActor) result.push_back(std::move(entry));
     return result;
+}
+
+std::string matchPlayerNameFromTag(
+    std::string_view nameTag, const std::vector<std::string>& playerNames) {
+    const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
+    for (const auto& playerName : playerNames) {
+        if (playerName.size() > plainTag.size()) continue;
+        for (std::size_t offset = 0; offset + playerName.size() <= plainTag.size(); ++offset) {
+            bool matches = true;
+            for (std::size_t i = 0; i < playerName.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(plainTag[offset + i])) !=
+                    std::tolower(static_cast<unsigned char>(playerName[i]))) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return playerName;
+        }
+    }
+    return {};
 }
 
 bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
@@ -1443,14 +1484,31 @@ void readActorMurderSnapshot(void* actor,
                              std::string_view playerName,
                              ActorMurderSnapshot& snapshot,
                              bool readItem, bool readGameMode) {
-    if (!actor || playerName.empty() || playerName.size() > 128) return;
-    snapshot.name.assign(playerName);
-    snapshot.isPlayer = true;
-    if (readItem)
+    if (!actor) return;
+    bool itemRead = false;
+    if (!playerName.empty() && playerName.size() <= 128) {
+        snapshot.name.assign(playerName);
+        snapshot.isPlayer = true;
+    } else if (readItem) {
+        // Inspect one runtime Actor at a time. Check its equipment before doing
+        // name/identity work so Actors with no held stack stay on the cheap path.
+        snapshot.item = gameApi->actor(actor).getMainHand();
+        itemRead = true;
+        if (snapshot.item || readGameMode) {
+            const auto identity = gameApi->actor(actor).getIdentity();
+            snapshot.isPlayer = identity.isPlayer;
+            if (snapshot.isPlayer) snapshot.name = identity.name;
+        }
+    } else {
+        const auto identity = gameApi->actor(actor).getIdentity();
+        snapshot.isPlayer = identity.isPlayer;
+        if (snapshot.isPlayer) snapshot.name = identity.name;
+    }
+    if (readItem && !itemRead && snapshot.isPlayer)
         snapshot.item = gameApi->actor(actor).getMainHand();
     if (readGameMode) {
         std::int32_t gameType = -1;
-        snapshot.hasGameType = readActorGameType(actor, gameType);
+        snapshot.hasGameType = snapshot.isPlayer && readActorGameType(actor, gameType);
         snapshot.spectator = snapshot.hasGameType && gameType == 3;
     }
 }
@@ -1479,9 +1537,9 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
         if (murderScanActors.empty() || murderPlayerNames.empty()) return;
-        // One bounded equipment read per tick. The roster below is filtered to
-        // actual PlayerList actors, so reducing the batch does not waste most
-        // samples on mobs and other entities.
+        // One bounded equipment read per tick across the exact Level runtime
+        // list. Unresolved names are checked too; identity is requested only
+        // when that Actor currently has an item (or gamemode checking needs it).
         constexpr std::size_t actorsPerTick = 1;
         const auto sampleCount = std::min(actorsPerTick, murderScanActors.size());
         for (std::size_t sample = 0; sample < sampleCount; ++sample) {
@@ -1498,12 +1556,17 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
                     diagnostic("MurderDetect skipped an Actor whose native read raised an exception");
                 continue;
             }
-            if (!snapshot.isPlayer || snapshot.name.empty() || snapshot.name.size() > 128)
-                continue;
-
             const auto& item = snapshot.item;
+            if ((!snapshot.isPlayer || snapshot.name.empty() || snapshot.name.size() > 128) &&
+                !item) continue;
             MurderSample copied;
-            copied.name = std::move(snapshot.name);
+            if (!snapshot.name.empty()) {
+                copied.name = std::move(snapshot.name);
+            } else {
+                std::ostringstream actorLabel;
+                actorLabel << "unmatched@0x" << std::hex << actorHandle;
+                copied.name = actorLabel.str();
+            }
             copied.hasItem = item.has_value();
             copied.hasGameType = snapshot.hasGameType;
             copied.spectator = snapshot.spectator;
@@ -1526,11 +1589,6 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderScanLevel = level;
             murderScanActors.clear();
             murderPlayerNames.clear();
-            murderRosterBuildActors.clear();
-            murderRosterBuildPlayerNames.clear();
-            murderRosterBuildMatches.clear();
-            murderRosterBuildCursor = 0;
-            murderRosterBuildPending = false;
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             {
@@ -1547,99 +1605,94 @@ void refreshTrackedMurderActors(void* level) noexcept {
             lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
             lastMurderRosterStatusLogMs = 0;
         }
-        // Keep the native Level actor-list walk off the hot path. Name-tag
-        // observations can arrive in large bursts while players render, so
-        // they must not trigger a full roster rebuild. Refresh the native actor
-        // list at most once per second; resolve its NameTags in bounded batches
-        // over subsequent ticks instead of reading every Actor in one burst.
+        // Refresh the native Level actor list at most once per second. Match
+        // its handles against copied SDK NameTag snapshots; avoid calling the
+        // native NameTag getter or SDK identity path for every Actor each tick.
         ++murderActorSnapshotTick;
-        if (!murderRosterBuildPending && murderActorSnapshotTick >= 20) {
-            murderActorSnapshotTick = 0;
+        if (murderActorSnapshotTick < 20) return;
+        murderActorSnapshotTick = 0;
 
-            // The roster source remains the exact-build Level runtime list.
-            // No NameTag cache or alternate Actor enumeration is merged here.
-            murderRosterBuildActors = tabListGameAccess.actorHandles(level);
-            std::sort(murderRosterBuildActors.begin(), murderRosterBuildActors.end(),
-                [](const void* left, const void* right) {
-                    return reinterpret_cast<std::uintptr_t>(left) <
-                           reinterpret_cast<std::uintptr_t>(right);
-                });
-            murderRosterBuildActors.erase(
-                std::unique(murderRosterBuildActors.begin(), murderRosterBuildActors.end()),
-                murderRosterBuildActors.end());
+        // Actor enumeration remains exclusively Level::getRuntimeActorList.
+        auto actorHandles = tabListGameAccess.actorHandles(level);
+        std::sort(actorHandles.begin(), actorHandles.end(),
+            [](const void* left, const void* right) {
+                return reinterpret_cast<std::uintptr_t>(left) <
+                       reinterpret_cast<std::uintptr_t>(right);
+            });
+        actorHandles.erase(std::unique(actorHandles.begin(), actorHandles.end()),
+                           actorHandles.end());
 
-            murderRosterBuildPlayerNames.clear();
-            for (const auto& name : gameApi->world(level).getPlayerNames()) {
-                auto plainName = tablist::stripMinecraftFormatting(name);
-                if (!plainName.empty() && plainName.size() <= 128)
-                    murderRosterBuildPlayerNames.push_back(std::move(plainName));
-            }
-            std::sort(murderRosterBuildPlayerNames.begin(),
-                murderRosterBuildPlayerNames.end(),
-                [](const std::string& left, const std::string& right) {
-                    return left.size() > right.size();
-                });
-            murderRosterBuildPlayerNames.erase(
-                std::unique(murderRosterBuildPlayerNames.begin(),
-                            murderRosterBuildPlayerNames.end()),
-                murderRosterBuildPlayerNames.end());
-            murderRosterBuildMatches.clear();
-            murderRosterBuildMatches.reserve(murderRosterBuildPlayerNames.size());
-            murderRosterBuildCursor = 0;
-            murderRosterBuildPending = true;
+        std::vector<std::string> playerNames;
+        for (const auto& name : gameApi->world(level).getPlayerNames()) {
+            auto plainName = tablist::stripMinecraftFormatting(name);
+            if (!plainName.empty() && plainName.size() <= 128)
+                playerNames.push_back(std::move(plainName));
+        }
+        std::sort(playerNames.begin(), playerNames.end(),
+            [](const std::string& left, const std::string& right) {
+                return left.size() > right.size();
+            });
+        playerNames.erase(std::unique(playerNames.begin(), playerNames.end()),
+                          playerNames.end());
+
+        // These immutable SDK snapshots contain copied names and Actor handles
+        // observed by the existing NameTag hook. Intersect them with the exact
+        // runtime list instead of issuing native name reads for every entity.
+        std::unordered_map<void*, std::string> playerNamesByActor;
+        const auto actorTags = snapshotSdkActorNameTags();
+        playerNamesByActor.reserve(actorTags.size());
+        for (const auto& tag : actorTags) {
+            if (!tag.actor || tag.nameTag.empty()) continue;
+            auto playerName = matchPlayerNameFromTag(tag.nameTag, playerNames);
+            if (!playerName.empty())
+                playerNamesByActor.insert_or_assign(tag.actor, std::move(playerName));
         }
 
-        // Bound native NameTag calls and matching work to a small batch each
-        // tick. This avoids a once-per-second burst proportional to all Actors.
-        constexpr std::size_t actorsPerRosterTick = 8;
-        const auto end = std::min(murderRosterBuildActors.size(),
-            murderRosterBuildCursor + actorsPerRosterTick);
-        for (; murderRosterBuildCursor < end; ++murderRosterBuildCursor) {
-            auto* actor = murderRosterBuildActors[murderRosterBuildCursor];
-            // SDK identity reads the live tag and falls back to its observed
-            // NameTag cache. Directly calling the native getter here missed
-            // Actors whose tag had already been captured by the SDK hook.
-            const auto identity = gameApi->actor(actor).getIdentity();
-            if (identity.isPlayer && !identity.name.empty() && identity.name.size() <= 128)
-                murderRosterBuildMatches.push_back({actor, identity.name});
-        }
-
-        if (murderRosterBuildPending &&
-            murderRosterBuildCursor >= murderRosterBuildActors.size()) {
-            murderRosterBuildPending = false;
-            if (!murderRosterBuildPlayerNames.empty() &&
-                !murderRosterBuildMatches.empty()) {
-                std::vector<std::uintptr_t> handles;
-                handles.reserve(murderRosterBuildMatches.size());
-                for (const auto& actor : murderRosterBuildMatches)
-                    handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
-                murderPlayerNames = std::move(murderRosterBuildPlayerNames);
-                murderScanActors = std::move(murderRosterBuildMatches);
-                murderScanCursor = tablist::nextActorScanIndex(
-                    handles, murderLastProcessedActor);
-                const auto actorCount = murderRosterBuildActors.size();
-                const auto playerActorCount = murderScanActors.size();
-                if (actorCount != lastLoggedMurderActorCount ||
-                    playerActorCount != lastLoggedMurderPlayerActorCount ||
-                    murderPlayerNames.size() != lastLoggedMurderPlayerCount) {
-                    lastLoggedMurderActorCount = actorCount;
-                    lastLoggedMurderPlayerActorCount = playerActorCount;
-                    lastLoggedMurderPlayerCount = murderPlayerNames.size();
-                    diagnostic("MurderDetect roster updated: actors=", actorCount,
-                               " playerActors=", playerActorCount,
-                               " players=", murderPlayerNames.size());
-                }
-                lastMurderRosterStatusLogMs = steadyMilliseconds();
+        std::vector<MurderActorEntry> playerActors;
+        playerActors.reserve(actorHandles.size());
+        std::size_t namedActorCount = 0;
+        for (auto* actor : actorHandles) {
+            const auto player = playerNamesByActor.find(actor);
+            if (player != playerNamesByActor.end()) {
+                playerActors.push_back({actor, player->second});
+                ++namedActorCount;
             } else {
-                const auto now = steadyMilliseconds();
-                if (lastMurderRosterStatusLogMs == 0 ||
-                    now - lastMurderRosterStatusLogMs >= 5000) {
-                    diagnostic("MurderDetect waiting for live roster: actors=",
-                               murderRosterBuildActors.size(), " playerNames=",
-                               murderRosterBuildPlayerNames.size(), " matchedActors=",
-                               murderRosterBuildMatches.size());
-                    lastMurderRosterStatusLogMs = now;
-                }
+                playerActors.push_back({actor, {}});
+            }
+        }
+        if (!playerNames.empty() && !playerActors.empty()) {
+            std::vector<std::uintptr_t> handles;
+            handles.reserve(playerActors.size());
+            for (const auto& actor : playerActors)
+                handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
+            murderPlayerNames = std::move(playerNames);
+            murderScanActors = std::move(playerActors);
+            murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
+            const auto actorCount = actorHandles.size();
+            const auto playerActorCount = namedActorCount;
+            if (actorCount != lastLoggedMurderActorCount ||
+                playerActorCount != lastLoggedMurderPlayerActorCount ||
+                murderPlayerNames.size() != lastLoggedMurderPlayerCount) {
+                lastLoggedMurderActorCount = actorCount;
+                lastLoggedMurderPlayerActorCount = playerActorCount;
+                lastLoggedMurderPlayerCount = murderPlayerNames.size();
+                diagnostic("MurderDetect roster updated: actors=", actorCount,
+                           " namedActors=", playerActorCount,
+                           " trackedActors=", murderScanActors.size(),
+                           " players=", murderPlayerNames.size(),
+                           " observedTags=", actorTags.size());
+            }
+            lastMurderRosterStatusLogMs = steadyMilliseconds();
+        } else {
+            const auto now = steadyMilliseconds();
+            if (lastMurderRosterStatusLogMs == 0 ||
+                now - lastMurderRosterStatusLogMs >= 5000) {
+                diagnostic("MurderDetect waiting for live roster: actors=",
+                           actorHandles.size(), " playerNames=", playerNames.size(),
+                           " observedTags=", actorTags.size(),
+                           " namedActors=", namedActorCount,
+                           " trackedActors=", playerActors.size());
+                lastMurderRosterStatusLogMs = now;
             }
         }
     } catch (...) {
