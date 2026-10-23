@@ -14,6 +14,7 @@
 #include <bedrock/game_api.hpp>
 #include <bedrock/game_hooks.hpp>
 #include <bedrock/native_items.hpp>
+#include <bedrock/native_actors.hpp>
 #include <imgui.h>
 #include <entt/entt.hpp>
 #include "tablist/config.hpp"
@@ -252,13 +253,16 @@ std::atomic<std::uint64_t> murderWorldEpoch{0};
 // Re-validating each wrapper for every scan repeats several VirtualQuery calls.
 struct MurderActorEntry {
     void* actor{};
+    std::uint64_t runtimeId{};
+    std::uintptr_t scanKey{};
     std::string playerName;
 };
 std::vector<MurderActorEntry> murderScanActors;
 std::vector<std::string> murderPlayerNames;
+std::unordered_map<std::uint64_t, std::string> murderKnownPlayerNamesByRuntimeId;
 std::unordered_map<void*, std::string> murderKnownPlayerNamesByActor;
 std::size_t murderScanCursor = 0;
-std::uintptr_t murderLastProcessedActor = 0;
+std::uintptr_t murderLastProcessedScanKey = 0;
 void* murderScanLevel = nullptr;
 std::uint64_t murderActorSnapshotTick = 0;
 std::size_t lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
@@ -286,7 +290,9 @@ std::atomic<std::uint64_t> actorNameTagSequence{0};
 std::atomic<std::int64_t> lastActorNamePollMs{0};
 std::atomic<std::size_t> actorNamePollCursor{0};
 bool copyActorNameTag(void* actor, std::string* output);
+std::optional<std::uint64_t> readActorRuntimeId(void* actor) noexcept;
 std::optional<bedrock::NativeItemLayout> nativeItemLayout;
+std::optional<bedrock::NativeActorLayout> nativeActorLayout;
 class TabListGameAccess final : public bedrock::GameAccess {
 public:
     void setRuntimeActorList(std::size_t slot, void* target) noexcept {
@@ -300,6 +306,7 @@ public:
     void* localPlayer() const noexcept override;
     void* worldOf(void* actor) const noexcept override;
     std::vector<void*> actorHandles(void* world) const override;
+    std::optional<std::uint64_t> actorRuntimeId(void* actor) const override;
     std::optional<std::string> nameTag(void* actor) const override {
         std::string result;
         return copyActorNameTag(actor, &result) ? std::optional<std::string>{std::move(result)}
@@ -888,6 +895,42 @@ bool readActorEquipment(void* actor, const bedrock::NativeItemLayout& layout,
         *output = nullptr;
         return false;
     }
+}
+
+bool readActorRuntimeIdValue(void* actor, std::uint64_t* output) noexcept {
+    if (output) *output = 0;
+    if (!actor || !output || !nativeActorLayout) return false;
+    const auto& layout = *nativeActorLayout;
+    void* registry = nullptr;
+    std::uint32_t rawId = 0;
+    const auto context = layout.actorEntityContextOffset;
+    if (!safeRead(actor, context + layout.contextRegistryOffset, registry) ||
+        !safeRead(actor, context + layout.contextEntityIdOffset, rawId) || !registry ||
+        !readable(registry, sizeof(void*))) return false;
+    __try {
+        auto* typed = static_cast<entt::basic_registry<tablist_native::EntityId>*>(registry);
+        auto* storage = typed->storage(layout.runtimeIdComponentHash);
+        const auto entity = tablist_native::EntityId{rawId};
+        if (!storage || !storage->contains(entity)) return false;
+        auto* component = storage->value(entity);
+        std::uint64_t runtimeId = 0;
+        if (!component || !safeRead(component, layout.runtimeIdValueOffset, runtimeId) ||
+            runtimeId == 0) return false;
+        *output = runtimeId;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::optional<std::uint64_t> readActorRuntimeId(void* actor) noexcept {
+    std::uint64_t runtimeId = 0;
+    return readActorRuntimeIdValue(actor, &runtimeId)
+        ? std::optional<std::uint64_t>{runtimeId} : std::nullopt;
+}
+
+std::optional<std::uint64_t> TabListGameAccess::actorRuntimeId(void* actor) const {
+    return readActorRuntimeId(actor);
 }
 
 bool readActorGameType(void* actor, std::int32_t& gameType) noexcept {
@@ -1582,18 +1625,17 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
         if (murderScanActors.empty() || murderPlayerNames.empty()) return;
-        // One bounded equipment read per tick across the exact Level runtime
-        // list. Unresolved names are checked too; identity is requested only
-        // when that Actor currently has an item (or gamemode checking needs it).
+        // One bounded equipment read per configured interval. The roster is
+        // prefiltered to Actors matched to current PlayerList names.
         constexpr std::size_t actorsPerTick = 1;
         const auto sampleCount = std::min(actorsPerTick, murderScanActors.size());
         for (std::size_t sample = 0; sample < sampleCount; ++sample) {
             if (murderScanCursor >= murderScanActors.size()) murderScanCursor = 0;
             const auto& tracked = murderScanActors[murderScanCursor];
             auto* actor = tracked.actor;
-            const auto actorHandle = reinterpret_cast<std::uintptr_t>(actor);
             murderScanCursor = (murderScanCursor + 1) % murderScanActors.size();
-            if (actorHandle) murderLastProcessedActor = actorHandle;
+            const auto runtimeId = tracked.runtimeId;
+            murderLastProcessedScanKey = tracked.scanKey;
             ActorMurderSnapshot snapshot;
             if (!readActorMurderSnapshotSeh(actor, &tracked.playerName, &snapshot,
                                             readItems, readGameMode)) {
@@ -1610,7 +1652,7 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
                 copied.name = std::move(snapshot.name);
             } else {
                 std::ostringstream actorLabel;
-                actorLabel << "unmatched@0x" << std::hex << actorHandle;
+                actorLabel << "runtimeId=" << std::dec << runtimeId;
                 copied.name = actorLabel.str();
             }
             copied.hasItem = item.has_value();
@@ -1635,9 +1677,10 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderScanLevel = level;
             murderScanActors.clear();
             murderPlayerNames.clear();
+            murderKnownPlayerNamesByRuntimeId.clear();
             murderKnownPlayerNamesByActor.clear();
             murderScanCursor = 0;
-            murderLastProcessedActor = 0;
+            murderLastProcessedScanKey = 0;
             {
                 std::lock_guard stateLock(murderDetectMutex);
                 murderRolesByPlayer.clear();
@@ -1695,33 +1738,57 @@ void refreshTrackedMurderActors(void* level) noexcept {
 
         std::vector<MurderActorEntry> trackedActors;
         trackedActors.reserve(actorHandles.size());
-        std::unordered_map<void*, std::string> nextKnownPlayerNames;
+        std::unordered_map<std::uint64_t, std::string> nextKnownPlayerNames;
+        std::unordered_map<void*, std::string> nextKnownPlayerNamesByActor;
         nextKnownPlayerNames.reserve(std::min(actorHandles.size(), playerNames.size()));
+        nextKnownPlayerNamesByActor.reserve(std::min(actorHandles.size(), playerNames.size()));
+        std::unordered_set<std::uint64_t> seenRuntimeIds;
+        seenRuntimeIds.reserve(actorHandles.size());
         std::size_t namedActorCount = 0;
+        std::size_t runtimeIdActorCount = 0;
         for (auto* actor : actorHandles) {
+            auto runtimeId = gameApi->actor(actor).getRuntimeId();
+            if (runtimeId && !seenRuntimeIds.insert(*runtimeId).second)
+                runtimeId.reset();
+            if (runtimeId) ++runtimeIdActorCount;
             auto player = playerNamesByActor.find(actor);
             if (player == playerNamesByActor.end()) {
-                const auto known = murderKnownPlayerNamesByActor.find(actor);
-                if (known != murderKnownPlayerNamesByActor.end())
-                    player = playerNamesByActor.emplace(actor, known->second).first;
+                if (runtimeId) {
+                    const auto known = murderKnownPlayerNamesByRuntimeId.find(*runtimeId);
+                    if (known != murderKnownPlayerNamesByRuntimeId.end())
+                        player = playerNamesByActor.emplace(actor, known->second).first;
+                } else {
+                    const auto known = murderKnownPlayerNamesByActor.find(actor);
+                    if (known != murderKnownPlayerNamesByActor.end())
+                        player = playerNamesByActor.emplace(actor, known->second).first;
+                }
             }
             if (player != playerNamesByActor.end()) {
-                trackedActors.push_back({actor, player->second});
-                nextKnownPlayerNames.insert_or_assign(actor, player->second);
+                const auto scanKey = runtimeId
+                    ? static_cast<std::uintptr_t>(*runtimeId)
+                    : reinterpret_cast<std::uintptr_t>(actor);
+                trackedActors.push_back({actor, runtimeId.value_or(0), scanKey, player->second});
+                if (runtimeId)
+                    nextKnownPlayerNames.insert_or_assign(*runtimeId, player->second);
+                else
+                    nextKnownPlayerNamesByActor.insert_or_assign(actor, player->second);
                 ++namedActorCount;
-            } else {
-                trackedActors.push_back({actor, {}});
             }
         }
-        murderKnownPlayerNamesByActor = std::move(nextKnownPlayerNames);
+        std::sort(trackedActors.begin(), trackedActors.end(),
+            [](const MurderActorEntry& left, const MurderActorEntry& right) {
+                return left.scanKey < right.scanKey;
+            });
+        murderKnownPlayerNamesByRuntimeId = std::move(nextKnownPlayerNames);
+        murderKnownPlayerNamesByActor = std::move(nextKnownPlayerNamesByActor);
         if (!playerNames.empty() && !trackedActors.empty()) {
             std::vector<std::uintptr_t> handles;
             handles.reserve(trackedActors.size());
             for (const auto& actor : trackedActors)
-                handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
+                handles.push_back(actor.scanKey);
             murderPlayerNames = std::move(playerNames);
             murderScanActors = std::move(trackedActors);
-            murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
+            murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedScanKey);
             const auto now = steadyMilliseconds();
             const bool playerCountChanged =
                 murderPlayerNames.size() != lastLoggedMurderPlayerCount;
@@ -1730,17 +1797,22 @@ void refreshTrackedMurderActors(void* level) noexcept {
                 lastLoggedMurderPlayerCount = murderPlayerNames.size();
                 lastMurderRosterStatusLogMs = now;
                 diagnostic("MurderDetect roster updated: actors=", actorHandles.size(),
+                           " runtimeIds=", runtimeIdActorCount,
                            " namedActors=", namedActorCount,
                            " trackedActors=", murderScanActors.size(),
                            " players=", murderPlayerNames.size(),
                            " observedTags=", actorTags.size());
             }
         } else {
+            murderPlayerNames = std::move(playerNames);
+            murderScanActors.clear();
+            murderScanCursor = 0;
             const auto now = steadyMilliseconds();
             if (lastMurderRosterStatusLogMs == 0 ||
                 now - lastMurderRosterStatusLogMs >= 5000) {
                 diagnostic("MurderDetect waiting for live roster: actors=",
-                           actorHandles.size(), " playerNames=", playerNames.size(),
+                           actorHandles.size(), " runtimeIds=", runtimeIdActorCount,
+                           " playerNames=", playerNames.size(),
                            " observedTags=", actorTags.size(),
                            " namedActors=", namedActorCount,
                            " trackedActors=", trackedActors.size());
@@ -2149,6 +2221,10 @@ DWORD WINAPI startClient(void*) {
     std::string cachedItemLayoutError;
     bool itemLayoutAvailable = bedrock::parseNativeItemLayout(
         profile, cachedItemLayout, cachedItemLayoutError);
+    bedrock::NativeActorLayout cachedActorLayout;
+    std::string cachedActorLayoutError;
+    bool actorLayoutAvailable = bedrock::parseNativeActorLayout(
+        profile, cachedActorLayout, cachedActorLayoutError);
     resolveActorNameTag();
     bool runtimeActorListReady = resolveRuntimeActorList(resolver);
     bool itemHoverNameReady = resolveItemHoverName(resolver);
@@ -2175,6 +2251,8 @@ DWORD WINAPI startClient(void*) {
                 itemHoverNameReady = resolveItemHoverName(resolver);
                 itemLayoutAvailable = bedrock::parseNativeItemLayout(
                     profile, cachedItemLayout, cachedItemLayoutError);
+                actorLayoutAvailable = bedrock::parseNativeActorLayout(
+                    profile, cachedActorLayout, cachedActorLayoutError);
                 diagnostic("latest exact-build profile loaded [",
                            bedrock::profileSourceName(version.source), "]");
             } else {
@@ -2187,7 +2265,8 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag || !runtimeActorListReady || !itemHoverNameReady) {
+    if (!actorNameTag || !runtimeActorListReady || !itemHoverNameReady ||
+        !actorLayoutAvailable) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -2203,6 +2282,11 @@ DWORD WINAPI startClient(void*) {
                 runtimeActorListReady = resolveRuntimeActorList(embeddedResolver);
             if (!itemHoverNameReady)
                 itemHoverNameReady = resolveItemHoverName(embeddedResolver);
+            if (!actorLayoutAvailable) {
+                actorLayoutAvailable = bedrock::parseNativeActorLayout(
+                    bedrock::generated::kSymbolDatabase, cachedActorLayout,
+                    cachedActorLayoutError);
+            }
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
         }
@@ -2237,6 +2321,14 @@ DWORD WINAPI startClient(void*) {
             nativeItemLayout.reset();
             diagnostic("SDK item API unavailable: no versioned native item layout");
         }
+    }
+
+    if (actorLayoutAvailable) {
+        nativeActorLayout = std::move(cachedActorLayout);
+        diagnostic("Actor RuntimeID component reader ready [versioned candidate layout; 64-bit value]");
+    } else {
+        nativeActorLayout.reset();
+        diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
 
     if (startMurderWorker())

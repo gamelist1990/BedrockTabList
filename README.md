@@ -75,13 +75,13 @@ MurderDetectとGamemodeCheckのActor一覧は、SDKアダプターから `Level:
 Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
 `murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定3、最小1、最大40 tick）です。既定値3は従来の毎tick読取に比べてNative装備読取を約3分の1に抑えます。間隔を短くすると一瞬だけ持つアイテムを拾いやすくなりますが、負荷も上がります。
 以前の既定値 `20` が残る設定ファイルは `3` として読み込み、その他の明示値は保持します。
-Actor一覧はLevelのRuntimeActorListから2秒ごとに取得します。Hookでコピー済みのSDK NameTagスナップショットはActorポインタとPlayerList名の照合にだけ使い、Actorの取得元には混ぜません。一度PlayerList名と結び付いたActorは、Nametagが後から非表示になっても、Level一覧にいる間は名前の対応を保持します。名前が未解決のActorも読み取り間隔ごとに最大1件ずつ手持ちを確認し、役割判定はプレイヤー名や表示名でなくItem IDで行います。手持ちのNative readは
-1回の走査につき最大1 Actorに制限し、読み取りはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player`（名前未解決時は`actor`）/ `name` / `id` / `role` / `previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。`show_held_items=false` の場合は表示名のNative解決を省き、ログの`name`欄はItem IDになります。
+Actor一覧はLevelのRuntimeActorListから2秒ごとに取得します。各Actorの `RuntimeIDComponent` をSDKの `Actor::getRuntimeId()` で読み、以後の名前キャッシュとラウンドロビン順序のキーに使います。これはEnTTのentity IDやActorUniqueIDとは別のBedrock RuntimeIDです。Hookでコピー済みのSDK NameTagスナップショットは最初のActorとPlayerList名の照合に使います。一度一致した後はActorポインタが変わってもRuntimeIDで名前対応を保持します。RuntimeIDを読めないActorや重複IDはポインタを予備キーとして使います。手持ちの読み取り対象はPlayerList名と照合できたActorに絞り、その他のエンティティの装備を読みません。NameTagが一度も観測されずPlayerList名と結び付いていないActorは対象外です。役割判定は表示名でなくItem IDで行います。手持ちのNative readは
+1回の走査につき最大1 Actorに制限し、読み取りはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player` / `name` / `id` / `role` / `previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。`show_held_items=false` の場合は表示名のNative解決を省き、ログの`name`欄はItem IDになります。
 アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
 これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。
 アイテム名には、1.26.52.3の検証済み `ItemStackBase::getHoverName` から取得した表示名を使い、Item IDごとにキャッシュします。取得できない場合のみItem IDを名前欄に表示します。Minecraftの装飾コードと `[Use]` などの操作ヒントを除いた名前だけを表示・記録します。アイテム名はNative read後にワーカーから行キャッシュへ反映するため、次の全行更新を待たずに表示されます。色遷移の詳細ログは `debug=true` の場合に限ります。MurderDetectのrosterログはプレイヤー人数変更時と10秒ごとに制限し、Actor数の小刻みな変動では毎秒出力しません。
 
-ワーカースレッドへActorポインタやSDKハンドルは渡しません。MinecraftがActor/EnTTを更新・破棄するタイミングと競合するため、Native read自体を別スレッドへ移すことはしていません。顔画像の取得も4tickに1回までに制限します。1.26.52.3のNative item layoutも現在は候補値のため、実機での装備ID読み取り確認が必要です。
+ワーカースレッドへActorポインタやSDKハンドルは渡しません。MinecraftがActor/EnTTを更新・破棄するタイミングと競合するため、Native read自体を別スレッドへ移すことはしていません。顔画像の取得も4tickに1回までに制限します。RuntimeID component hashは1.26.52.3の実行ファイルで確認済みですが、値を64-bit/offset 0として読む配置は候補で、実機での一致確認が必要です。RuntimeIDとPlayerList entry IDの直接照合は行わず、NameTagで得たプレイヤー名をRuntimeIDに関連付けます。1.26.52.3のNative item layoutも候補値のため、実機での装備ID読み取り確認が必要です。
 これによりActor数がスナップショット更新間隔を超えても先頭に戻って後半のActorを取りこぼすことがなく、
 TabListを開いた瞬間の一括読み取りも発生しません。間隔を増やすほど負荷は下がりますが、
 各Actorの手持ちが再確認されるまでの時間はActor数に応じて長くなります。
