@@ -41,7 +41,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
   "show_faces": true,
   "sort_by_name_color": false,
   "murder_detect": true,
-  "murder_scan_interval_ticks": 20,
+  "murder_scan_interval_ticks": 1,
   "debug": false,
   "background_color": "#0A0D14CC",
   "text_color": "#F2F5FBFF",
@@ -68,9 +68,10 @@ Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDK�
 
 `murder_detect` は手持ちの弓/矢を `[Sheriff]`（水色）、鉄剣を `[Murderer]`（赤）で
 表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
-`murder_scan_interval_ticks` は追跡中の次のActorから手持ちを読む間隔（既定20、最小1、最大40 tick）です。
+`murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定1、最小1、最大40 tick）です。
+以前の既定値 `20` が残る設定ファイルも `1` として読み込み、その他の明示値は保持します。
 Actor一覧は新しいActorのNameTag観測をまとめて反映し、静かな場合のみ5秒ごとに安全更新します。手持ちのNative readは
-1回につきActor 1人だけで、既定では毎秒1人を調べます。確認できたアイテムが前回から変わった時は、debug設定に関係なく
+1 tickにつき最大2人ずつ行い、20 TPS・20人なら約0.5秒で一巡します。確認できたアイテムが前回から変わった時は、debug設定に関係なく
 `TabList.log` に `player / item / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
 アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
 これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。

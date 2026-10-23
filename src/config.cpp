@@ -61,8 +61,12 @@ Config parseConfig(std::string_view jsonText, std::string& error) noexcept {
         config.sortByNameColor = root.value("sort_by_name_color", config.sortByNameColor);
         config.murderDetect = root.value("murder_detect", config.murderDetect);
         config.debug = root.value("debug", config.debug);
-        config.murderScanIntervalTicks = std::clamp(
-            numberOr<unsigned>(root, "murder_scan_interval_ticks", config.murderScanIntervalTicks), 1u, 40u);
+        const auto scanInterval = numberOr<unsigned>(
+            root, "murder_scan_interval_ticks", config.murderScanIntervalTicks);
+        // 20 was the previous built-in default. Treat it as the new default
+        // for existing generated config files while preserving custom values.
+        config.murderScanIntervalTicks = scanInterval == 20
+            ? 1u : std::clamp(scanInterval, 1u, 40u);
         config.background = parseColor(root, "background_color", config.background);
         config.text = parseColor(root, "text_color", config.text);
         config.accent = parseColor(root, "accent_color", config.accent);

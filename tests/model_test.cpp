@@ -9,7 +9,15 @@
 int main() {
     std::string defaultsError;
     const auto defaults = tablist::parseConfig("{}", defaultsError);
-    assert(defaultsError.empty() && defaults.murderScanIntervalTicks == 20);
+    assert(defaultsError.empty() && defaults.murderScanIntervalTicks == 1);
+    std::string oldConfigError;
+    const auto oldConfig = tablist::parseConfig(
+        R"({"murder_scan_interval_ticks":20})", oldConfigError);
+    assert(oldConfigError.empty() && oldConfig.murderScanIntervalTicks == 1);
+    std::string customConfigError;
+    const auto customConfig = tablist::parseConfig(
+        R"({"murder_scan_interval_ticks":5})", customConfigError);
+    assert(customConfigError.empty() && customConfig.murderScanIntervalTicks == 5);
 
     assert(tablist::stripMinecraftFormatting("Steve") == "Steve");
     assert(tablist::stripMinecraftFormatting("\xC2\xA7" "aAlex") == "Alex");
