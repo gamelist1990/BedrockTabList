@@ -1557,14 +1557,11 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
             murderActorRosterDirty.store(true, std::memory_order_release);
             murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
         }
-        // Coalesce name-tag discovery bursts and refresh at most once per
-        // second when dirty; retain a five-second safety refresh when the
-        // hook is quiet. This avoids sorting/copying the roster every second
-        // while still promptly enrolling newly observed Actors.
+        // Coalesce name-tag discovery bursts to one roster refresh per tick.
+        // When the getter hook is quiet, retain a five-second safety refresh.
         ++murderActorSnapshotTick;
         const bool dirty = murderActorRosterDirty.load(std::memory_order_acquire);
-        if (murderActorSnapshotTick < 20 ||
-            (!dirty && murderActorSnapshotTick < 100)) return;
+        if (!dirty && murderActorSnapshotTick < 100) return;
         murderActorRosterDirty.store(false, std::memory_order_release);
         murderActorSnapshotTick = 0;
 
