@@ -81,8 +81,15 @@ int main() {
            tablist::MurderRole::Murderer);
     assert(tablist::murderRoleForHeldItem("minecraft:crossbow", "Crossbow") ==
            tablist::MurderRole::None);
-    assert(tablist::stripMinecraftFormatting(
-        "§o§f§r§aワンショット光線銃§r") == "ワンショット光線銃");
+    constexpr auto formattedJapaneseItem = u8"§o§f§r§aワンショット光線銃§r";
+    constexpr auto plainJapaneseItem = u8"ワンショット光線銃";
+    const std::string_view formattedJapaneseItemBytes{
+        reinterpret_cast<const char*>(formattedJapaneseItem),
+        sizeof(formattedJapaneseItem) - 1};
+    const std::string_view plainJapaneseItemBytes{
+        reinterpret_cast<const char*>(plainJapaneseItem), sizeof(plainJapaneseItem) - 1};
+    assert(tablist::stripMinecraftFormatting(formattedJapaneseItemBytes) ==
+           plainJapaneseItemBytes);
 
     // Refreshing the Actor snapshot must resume after the last Actor already
     // sampled, rather than resetting to index zero and starving later players.

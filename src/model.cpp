@@ -52,6 +52,22 @@ struct FormattedText {
     std::vector<unsigned> colorAtByte;
 };
 
+bool isUtf8ContinuationByte(std::string_view text, std::size_t index) noexcept {
+    if (index == 0 || index >= text.size()) return false;
+    const auto current = static_cast<unsigned char>(text[index]);
+    if ((current & 0xC0) != 0x80) return false;
+
+    auto leadIndex = index - 1;
+    while (leadIndex > 0 &&
+           (static_cast<unsigned char>(text[leadIndex]) & 0xC0) == 0x80)
+        --leadIndex;
+    const auto lead = static_cast<unsigned char>(text[leadIndex]);
+    const std::size_t width = lead >= 0xC2 && lead <= 0xDF ? 2
+        : lead >= 0xE0 && lead <= 0xEF ? 3
+        : lead >= 0xF0 && lead <= 0xF4 ? 4 : 1;
+    return width > 1 && index < leadIndex + width;
+}
+
 FormattedText parseFormatting(std::string_view text) {
     FormattedText result;
     result.plain.reserve(text.size());
@@ -69,7 +85,8 @@ FormattedText parseFormatting(std::string_view text) {
             static_cast<unsigned char>(text[i + 1]) == 0xA7) {
             codeIndex = i + 2;
             sequenceLength = 3;
-        } else if (current == 0xA7 && i + 1 < text.size()) {
+        } else if (current == 0xA7 && i + 1 < text.size() &&
+                   !isUtf8ContinuationByte(text, i)) {
             codeIndex = i + 1;
             sequenceLength = 2;
         }
