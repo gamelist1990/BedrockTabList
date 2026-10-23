@@ -242,7 +242,10 @@ std::deque<MurderSample> murderQueue;
 std::thread murderWorker;
 bool murderWorkerStopping{};
 std::atomic<std::uint64_t> droppedMurderSamples{0};
-std::vector<bedrock::Actor> murderScanActors;
+// Raw handles are captured from GameApi's validated roster on the game thread.
+// Re-validating each wrapper for every scan repeats several VirtualQuery calls.
+std::vector<void*> murderScanActors;
+std::vector<std::string> murderPlayerNames;
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
@@ -558,11 +561,20 @@ void* callInventoryGetItem(void* inventory, std::size_t slot,
                            const bedrock::NativeItemLayout& layout) noexcept {
     if (!inventory || slot >= layout.localInventorySlots) return nullptr;
     void** vtable = nullptr;
-    if (!safeRead(inventory, 0, vtable) || !vtable ||
-        !readable(vtable, sizeof(void*) * (layout.inventoryGetItemVtableSlot + 1))) return nullptr;
+    if (!safeRead(inventory, 0, vtable) || !vtable) return nullptr;
+    static std::atomic<void**> cachedVtable{nullptr};
+    static std::atomic<void*> cachedTarget{nullptr};
     void* target = nullptr;
-    if (!safeRead(vtable, sizeof(void*) * layout.inventoryGetItemVtableSlot, target) ||
-        !executable(target)) return nullptr;
+    if (cachedVtable.load(std::memory_order_acquire) == vtable) {
+        target = cachedTarget.load(std::memory_order_acquire);
+    } else {
+        if (!readable(vtable, sizeof(void*) * (layout.inventoryGetItemVtableSlot + 1)) ||
+            !safeRead(vtable, sizeof(void*) * layout.inventoryGetItemVtableSlot, target) ||
+            !executable(target)) return nullptr;
+        cachedTarget.store(target, std::memory_order_release);
+        cachedVtable.store(vtable, std::memory_order_release);
+    }
+    if (!target) return nullptr;
     using GetItemFn = void*(__fastcall*)(void*, int);
     __try {
         return reinterpret_cast<GetItemFn>(target)(inventory, static_cast<int>(slot));
@@ -789,7 +801,10 @@ void* TabListGameAccess::localPlayer() const noexcept {
 
 std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
     void* actor, bedrock::EquipmentSlot slot) const {
-    if (!nativeItemLayout || !isActorValid(actor)) return std::nullopt;
+    // Actor's public wrapper validates before dispatch. The murder sampler
+    // calls this adapter directly for handles from the validated roster, and
+    // every memory/native boundary below is guarded independently.
+    if (!nativeItemLayout || !actor) return std::nullopt;
     const auto& layout = *nativeItemLayout;
     tablist_native::ActorEquipmentComponent* component = nullptr;
     if (!readActorEquipment(actor, layout, &component) || !component) return std::nullopt;
@@ -820,11 +835,8 @@ std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
         !safeRead(itemReference, 0, nativeItem) || !nativeItem) return std::nullopt;
     item.count = count;
     const auto* id = static_cast<const std::byte*>(nativeItem) + layout.itemNamespacedIdOffset;
-    const auto* translation = static_cast<const std::byte*>(nativeItem) +
-                              layout.itemTranslationKeyOffset;
     if (!copyNativeString(id, item.identifier, layout, layout.maxStringBytes))
         return std::nullopt;
-    (void)copyNativeString(translation, item.translationKey, layout, layout.maxStringBytes);
     if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
         item.identifier.insert(0, "minecraft:");
     if (!item.valid()) return std::nullopt;
@@ -1333,30 +1345,58 @@ struct ActorMurderSnapshot {
     bool spectator = false;
 };
 
-void readActorMurderSnapshot(const bedrock::Actor& actor,
+bool containsNameIgnoreCase(std::string_view text, std::string_view name) noexcept {
+    if (name.empty() || name.size() > text.size()) return false;
+    for (std::size_t start = 0; start + name.size() <= text.size(); ++start) {
+        bool equal = true;
+        for (std::size_t i = 0; i < name.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(text[start + i])) !=
+                std::tolower(static_cast<unsigned char>(name[i]))) {
+                equal = false;
+                break;
+            }
+        }
+        if (equal) return true;
+    }
+    return false;
+}
+
+void readActorMurderSnapshot(void* actor,
+                             const std::vector<std::string>& playerNames,
                              ActorMurderSnapshot& snapshot,
                              bool readItem, bool readGameMode) {
-    const auto identity = actor.getIdentity();
-    snapshot.isPlayer = identity.isPlayer;
+    std::string nameTag;
+    if (!copyActorNameTag(actor, &nameTag)) return;
+    const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
+    for (const auto& playerName : playerNames) {
+        if (!containsNameIgnoreCase(plainTag, playerName)) continue;
+        // Names are sorted longest-first to match GameApi's player identity
+        // semantics when a tag contains both a display name and username.
+        snapshot.name = playerName;
+        snapshot.isPlayer = true;
+        break;
+    }
     if (!snapshot.isPlayer) return;
-    snapshot.name = identity.name;
     if (snapshot.name.empty() || snapshot.name.size() > 128) return;
-    if (readItem) snapshot.item = actor.getMainHand();
+    if (readItem)
+        snapshot.item = tabListGameAccess.equipmentItem(
+            actor, bedrock::EquipmentSlot::MainHand);
     if (readGameMode) {
         std::int32_t gameType = -1;
-        snapshot.hasGameType = readActorGameType(actor.handle(), gameType);
+        snapshot.hasGameType = readActorGameType(actor, gameType);
         snapshot.spectator = snapshot.hasGameType && gameType == 3;
     }
 }
 
 // Keep native Actor/inventory access behind a per-actor SEH boundary. One stale
 // cached Actor or invalid inventory layout must not take down Minecraft.
-bool readActorMurderSnapshotSeh(const bedrock::Actor* actor,
+bool readActorMurderSnapshotSeh(void* actor,
+                                const std::vector<std::string>* playerNames,
                                 ActorMurderSnapshot* snapshot,
                                 bool readItem, bool readGameMode) noexcept {
-    if (!actor || !snapshot) return false;
+    if (!actor || !playerNames || !snapshot) return false;
     __try {
-        readActorMurderSnapshot(*actor, *snapshot, readItem, readGameMode);
+        readActorMurderSnapshot(actor, *playerNames, *snapshot, readItem, readGameMode);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1371,17 +1411,18 @@ void updateMurderDetection(bool debug, bool readItems, bool readGameMode) noexce
     try {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
-        if (murderScanActors.empty()) return;
+        if (murderScanActors.empty() || murderPlayerNames.empty()) return;
         constexpr std::size_t actorsPerTick = 2;
         const auto sampleCount = std::min(actorsPerTick, murderScanActors.size());
         for (std::size_t sample = 0; sample < sampleCount; ++sample) {
             if (murderScanCursor >= murderScanActors.size()) murderScanCursor = 0;
-            const auto& actor = murderScanActors[murderScanCursor];
-            const auto actorHandle = reinterpret_cast<std::uintptr_t>(actor.handle());
+            auto* actor = murderScanActors[murderScanCursor];
+            const auto actorHandle = reinterpret_cast<std::uintptr_t>(actor);
             murderScanCursor = (murderScanCursor + 1) % murderScanActors.size();
             if (actorHandle) murderLastProcessedActor = actorHandle;
             ActorMurderSnapshot snapshot;
-            if (!readActorMurderSnapshotSeh(&actor, &snapshot, readItems, readGameMode)) {
+            if (!readActorMurderSnapshotSeh(actor, &murderPlayerNames, &snapshot,
+                                            readItems, readGameMode)) {
                 if (!loggedMurderActorReadFault.exchange(true, std::memory_order_acq_rel))
                     diagnostic("MurderDetect skipped an Actor whose native read raised an exception");
                 continue;
@@ -1415,6 +1456,7 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
         if (murderScanLevel != level) {
             murderScanLevel = level;
             murderScanActors.clear();
+            murderPlayerNames.clear();
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
@@ -1429,25 +1471,37 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
         murderActorSnapshotTick = 0;
 
         auto refreshed = gameApi->actors(level);
-        refreshed.erase(std::remove_if(refreshed.begin(), refreshed.end(),
-            [](const bedrock::Actor& actor) { return actor.handle() == nullptr; }),
-            refreshed.end());
-        std::sort(refreshed.begin(), refreshed.end(),
-            [](const bedrock::Actor& left, const bedrock::Actor& right) {
-                return reinterpret_cast<std::uintptr_t>(left.handle()) <
-                       reinterpret_cast<std::uintptr_t>(right.handle());
+        std::vector<void*> actorHandles;
+        actorHandles.reserve(refreshed.size());
+        for (const auto& actor : refreshed) {
+            if (auto* handle = actor.handle()) actorHandles.push_back(handle);
+        }
+        std::sort(actorHandles.begin(), actorHandles.end(),
+            [](const void* left, const void* right) {
+                return reinterpret_cast<std::uintptr_t>(left) <
+                       reinterpret_cast<std::uintptr_t>(right);
             });
-        refreshed.erase(std::unique(refreshed.begin(), refreshed.end(),
-            [](const bedrock::Actor& left, const bedrock::Actor& right) {
-                return left.handle() == right.handle();
-            }), refreshed.end());
-
+        actorHandles.erase(std::unique(actorHandles.begin(), actorHandles.end()),
+                           actorHandles.end());
         std::vector<std::uintptr_t> handles;
-        handles.reserve(refreshed.size());
-        for (const auto& actor : refreshed)
-            handles.push_back(reinterpret_cast<std::uintptr_t>(actor.handle()));
-        murderScanActors = std::move(refreshed);
+        handles.reserve(actorHandles.size());
+        for (const auto* actor : actorHandles)
+            handles.push_back(reinterpret_cast<std::uintptr_t>(actor));
+        murderScanActors = std::move(actorHandles);
         murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
+
+        murderPlayerNames.clear();
+        for (const auto& name : gameApi->world(level).getPlayerNames()) {
+            auto plainName = tablist::stripMinecraftFormatting(name);
+            if (!plainName.empty() && plainName.size() <= 128)
+                murderPlayerNames.push_back(std::move(plainName));
+        }
+        std::sort(murderPlayerNames.begin(), murderPlayerNames.end(),
+            [](const std::string& left, const std::string& right) {
+                return left.size() > right.size();
+            });
+        murderPlayerNames.erase(std::unique(murderPlayerNames.begin(), murderPlayerNames.end()),
+                                murderPlayerNames.end());
         if (debug && murderTrackedActorCount != murderScanActors.size()) {
             murderTrackedActorCount = murderScanActors.size();
             diagnostic("MurderDetect Actor tracker refreshed: tracked=",
