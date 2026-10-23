@@ -17,6 +17,7 @@ struct Config {
     bool showFaces = true;
     bool sortByNameColor = false;
     bool murderDetect = true;
+    bool gamemodeCheck = true;
     bool debug = false;
     unsigned murderScanIntervalTicks = 1;
     Color background{0.039f, 0.051f, 0.078f, 0.80f};

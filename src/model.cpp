@@ -20,10 +20,11 @@ MurderRole murderRoleForHeldItem(std::string_view identifier,
             (identifier.size() > id.size() && identifier[identifier.size() - id.size() - 1] == ':' &&
              equalsIgnoreCase(identifier.substr(identifier.size() - id.size()), id));
     };
-    if (idIs("iron_sword") || equalsIgnoreCase(displayName, "iron sword"))
+    constexpr std::string_view murderNamespace = "hivemurder:";
+    if (identifier.size() >= murderNamespace.size() &&
+        equalsIgnoreCase(identifier.substr(0, murderNamespace.size()), murderNamespace))
         return MurderRole::Murderer;
-    if (idIs("bow") || idIs("arrow") || equalsIgnoreCase(displayName, "bow") ||
-        equalsIgnoreCase(displayName, "arrow"))
+    if (idIs("bow") || equalsIgnoreCase(displayName, "bow"))
         return MurderRole::Sheriff;
     return MurderRole::None;
 }

@@ -71,8 +71,9 @@ int main() {
     assert(tablist::murderRoleForHeldItem("minecraft:bow", "Bow") ==
            tablist::MurderRole::Sheriff);
     assert(tablist::murderRoleForHeldItem("minecraft:arrow", "Arrow") ==
-           tablist::MurderRole::Sheriff);
-    assert(tablist::murderRoleForHeldItem("minecraft:iron_sword", "Iron Sword") ==
+           tablist::MurderRole::None);
+    assert(tablist::murderRoleForHeldItem(
+        "hivemurder:murder_weapon_baseball_bat", "hivemurder:murder_weapon_baseball_bat") ==
            tablist::MurderRole::Murderer);
     assert(tablist::murderRoleForHeldItem("minecraft:golden_sword", "Golden Sword") ==
            tablist::MurderRole::None);

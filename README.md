@@ -12,7 +12,8 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - 画面上部中央に、半透明の背景・人数・プレイヤー名を表示
 - Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
-- SDKの `Actor::getMainHand()` で取得した装備スナップショットからMurderDetectの役割を表示（弓・矢=Sheriff/水色、鉄剣=Murderer/赤）
+- SDKの `Actor::getMainHand()` で取得した装備スナップショットからMurderDetectの役割を表示（弓=Sheriff/水色、`hivemurder:` ID=Murderer/赤）
+- `gamemode_check` が有効ならSpectatorを灰色にし `[Spectator]` を表示
 - MurderDetectはTab表示前から間隔を空けてActorを1件ずつ読み、役割キャッシュを準備（Minecraftオブジェクトのネイティブ読み取りは安全のためゲームスレッド上で実行）
 - Sheriff／Murdererは最後の検知から5分間保持し、期間内に再検知した場合は期限を延長
 - Actorの装備コンポーネント／手持ち枠の読み取りで例外が出た対象はスキップし、後続Actorの走査を継続
@@ -41,6 +42,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
   "show_faces": true,
   "sort_by_name_color": false,
   "murder_detect": true,
+  "gamemode_check": true,
   "murder_scan_interval_ticks": 1,
   "debug": false,
   "background_color": "#0A0D14CC",
@@ -61,12 +63,12 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
 
 色は `#RRGGBB` または透明度を含む `#RRGGBBAA` 形式です。
 `sort_by_name_color` を `true` にすると、装飾コードを除いたPlayerList名を、Actor::getNameTag Hookで観測したActor名に部分一致させ、名前部分に適用されている色順に並べます。同色内は名前順です。
-Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDKの `GameHooks` / `GameApi` / `Actor` API経由です。TabList固有のActor HookやRuntimeActorList呼び出しは使いません。SDKが観測したActorのNameTag変更をTabList描画時に反映し、PlayerList名との照合はSDKの `Actor::getName()` が返す正規名で行います。色遷移時のみ `PlayerList name color updated` を記録し、コード・色名・完全一致の有無を表示します。Hive上で実際に紫に描画される `§i` はTabListでも紫として表示します。
-`Level::getRuntimeActorList` は実機でSEH例外を起こしたため、現在の経路では呼び出していません。Hookが観測できないActorも含むView系のActor一覧取得は、現状まだ別経路として検証が必要です。
+Actorの検出・NameTag取得・PlayerList名との照合はBedrockDynamicSDKの `GameHooks` / `GameApi` / `Actor` API経由です。Actor一覧の取得もSDK経由で実際に使用しています。TabListのLevel tick処理から `gameApi->actors(level)` を呼び、SDKアダプターの `actorHandles()` が、SDKの1.26.52.3プロファイルで解決した `Level::getRuntimeActorList` を使ってActor一覧を返します。MurderDetectまたはGamemodeCheckが有効な間、一覧を更新して走査します。呼び出し先vtable entryとABIがプロファイルに一致しない場合は呼び出しません。PlayerList名との照合はSDKの `Actor::getName()` が返す正規名で行い、色遷移時のみ `PlayerList name color updated` を記録します。Hive上で実際に紫に描画される `§i` はTabListでも紫として表示します。
+Actor一覧経路は対象バイナリを静的解析して接続しましたが、更新後のMinecraft実機で件数・ワールド再参加を確認する必要があります。native Actorの読み取りはゲームスレッドで行い、コピーした値の判定だけをワーカーへ送ります。
 `corner_radius` を `0` にすると角丸を無効にできます。スキンがまだ取得できていない
 プレイヤーは、アクセント色の小さな丸で表示します。
 
-`murder_detect` は手持ちの弓/矢を `[Sheriff]`（水色）、鉄剣を `[Murderer]`（赤）で
+`murder_detect` は手持ちの弓を `[Sheriff]`（水色）、アイテムIDが `hivemurder:` で始まるアイテムを `[Murderer]`（赤）で
 表示します。Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
 `murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定1、最小1、最大40 tick）です。
 以前の既定値 `20` が残る設定ファイルも `1` として読み込み、その他の明示値は保持します。
@@ -85,6 +87,9 @@ TabListを開いた瞬間の一括読み取りも発生しません。間隔を�
 その間に再検知すればさらに5分延長します。プレイヤーが一時的に抜けても同じ名前の判定は期限まで保持します。
 未知のアイテムIDは `TabList.log` に一度だけ候補として記録されます。
 `debug` を `true` にするとActor名・表示名・個数・アイテム切替の詳細ログも出ます。
+
+`gamemode_check` はActorの `ActorGameTypeComponent` を読み、Spectator (GameType 3) を灰色で表示します。
+死亡・不可視フラグの読み取りは対象バージョンでまだ確定できていないため、この設定では判定しません。
 
 同じフォルダの `TabList.log` には、起動結果、Level取得、Tab遷移、プレイヤー一覧の
 取得結果だけをコンパクトに記録します。メインメニューでinjectした場合も、Level tickと

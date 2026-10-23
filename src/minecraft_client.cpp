@@ -65,6 +65,10 @@ struct ActorEquipmentComponent {
     void* handContainer{};
     void* armorContainer{};
 };
+struct ActorGameTypeComponent {
+    static constexpr std::uint32_t type_hash = 0x88D3EDDF;
+    std::int32_t gameType{};
+};
 }
 
 // These traits mirror the pinned Latite reference's Bedrock ECS component
@@ -93,6 +97,24 @@ template<> struct type_hash<tablist_native::ActorEquipmentComponent> {
     }
     [[nodiscard]] consteval operator id_type() const noexcept { return value(); }
 };
+template<> struct component_traits<tablist_native::ActorGameTypeComponent,
+                                   tablist_native::EntityId> {
+    using element_type = tablist_native::ActorGameTypeComponent;
+    using entity_type = tablist_native::EntityId;
+    static constexpr bool in_place_delete = true;
+    static constexpr std::size_t page_size = 128 * !std::is_empty_v<element_type>;
+};
+template<> struct storage_type<tablist_native::ActorGameTypeComponent,
+                               tablist_native::EntityId> {
+    using type = basic_storage<tablist_native::ActorGameTypeComponent,
+                               tablist_native::EntityId>;
+};
+template<> struct type_hash<tablist_native::ActorGameTypeComponent> {
+    [[nodiscard]] static consteval id_type value() noexcept {
+        return tablist_native::ActorGameTypeComponent::type_hash;
+    }
+    [[nodiscard]] consteval operator id_type() const noexcept { return value(); }
+};
 }
 
 namespace {
@@ -103,9 +125,9 @@ using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
 using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
-struct RuntimeActorRecord { std::array<std::byte, 0x40> bytes{}; };
-static_assert(sizeof(RuntimeActorRecord) == 0x40);
-using RuntimeActorListFn = void*(__fastcall*)(void*, std::vector<RuntimeActorRecord>*);
+// Exact 1.26.52.3 disassembly writes a std::vector<Actor*> hidden return area
+// through RDX, then appends one Actor* per runtime entity.
+using LevelRuntimeActorListFn = void(__fastcall*)(void*, std::vector<void*>*);
 
 // These layouts come from the matching Latite SDK revision and are used only
 // after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
@@ -154,6 +176,7 @@ struct PlayerRow {
     unsigned nameColorOrder = 28;
     bool hasNameColor = false;
     tablist::MurderRole murderRole = tablist::MurderRole::None;
+    bool spectator = false;
     std::array<std::uint32_t, 64> face{};
     bool hasFace = false;
 };
@@ -177,11 +200,14 @@ std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 std::atomic<void*> originalActorGetNameTag{nullptr};
 std::atomic<void*> resolvedActorGetNameTag{nullptr};
 BDS_HookToken actorNameTagHookToken{};
-std::atomic<void*> runtimeActorListFunction{nullptr};
-std::atomic<void*> resolvedRuntimeActorListFunction{nullptr};
-std::atomic<int> runtimeActorPointerOffset{-1};
-std::atomic<int> runtimeActorReceiverAdjustment{std::numeric_limits<int>::min()};
-std::atomic<void*> runtimeActorReceiverLevel{nullptr};
+std::atomic<std::size_t> runtimeActorListSlot{std::numeric_limits<std::size_t>::max()};
+std::atomic<void*> runtimeActorListTarget{nullptr};
+thread_local bool allowRuntimeActorListCall = false;
+struct RuntimeActorListTickScope {
+    bool previous{allowRuntimeActorListCall};
+    RuntimeActorListTickScope() noexcept { allowRuntimeActorListCall = true; }
+    ~RuntimeActorListTickScope() { allowRuntimeActorListCall = previous; }
+};
 struct ActorNameTagEntry {
     std::string nameTag;
     unsigned colorOrder = 28;
@@ -195,6 +221,7 @@ std::unordered_map<std::string, unsigned> observedPlayerColorOrders;
 std::unordered_map<void*, ActorNameTagEntry> actorNameTags;
 std::mutex murderDetectMutex;
 std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
+std::unordered_set<std::string> spectatorPlayers;
 std::unordered_map<std::string, std::chrono::steady_clock::time_point> murderRoleExpiryByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
 std::unordered_set<std::string> loggedHeldItemIdentifiers;
@@ -205,6 +232,8 @@ struct MurderSample {
     std::string translationKey;
     unsigned count{};
     bool hasItem{};
+    bool hasGameType{};
+    bool spectator{};
     bool debug{};
 };
 std::mutex murderQueueMutex;
@@ -245,9 +274,14 @@ bool copyActorNameTag(void* actor, std::string* output);
 std::optional<bedrock::NativeItemLayout> nativeItemLayout;
 class TabListGameAccess final : public bedrock::GameAccess {
 public:
+    void setRuntimeActorList(std::size_t slot, void* target) noexcept {
+        runtimeActorListTarget.store(target, std::memory_order_release);
+        runtimeActorListSlot.store(slot, std::memory_order_release);
+    }
     bool isActorValid(void* actor) const noexcept override;
     void* localPlayer() const noexcept override;
     void* worldOf(void* actor) const noexcept override;
+    std::vector<void*> actorHandles(void* world) const override;
     std::optional<std::string> nameTag(void* actor) const override {
         std::string result;
         return copyActorNameTag(actor, &result) ? std::optional<std::string>{std::move(result)}
@@ -273,9 +307,7 @@ private:
 TabListGameAccess tabListGameAccess;
 std::unique_ptr<bedrock::GameApi> gameApi;
 std::unique_ptr<bedrock::GameHooks> gameHooks;
-std::atomic<bool> loggedActorListFailure{false};
 std::atomic<bool> loggedActorListSuccess{false};
-std::atomic<bool> loggedActorReceiverAdjustment{false};
 std::shared_ptr<const tablist::Config> liveConfig{
     std::make_shared<const tablist::Config>()};
 std::array<BDS_HookToken, 5> hookTokens{};
@@ -344,6 +376,10 @@ void processMurderSample(const MurderSample& sample) noexcept {
                 murderRolesByPlayer.insert_or_assign(sample.name, role);
                 murderRoleExpiryByPlayer.insert_or_assign(
                     sample.name, now + std::chrono::minutes(5));
+            }
+            if (sample.hasGameType) {
+                if (sample.spectator) spectatorPlayers.insert(sample.name);
+                else spectatorPlayers.erase(sample.name);
             }
         }
         if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
@@ -617,117 +653,6 @@ bool executable(const void* pointer) noexcept {
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
-struct RuntimeActorReceiverProbe {
-    void* receiver{};
-    std::ptrdiff_t adjustment{};
-    std::uintptr_t begin{};
-    std::uintptr_t end{};
-    std::uintptr_t capacity{};
-    std::size_t count{};
-    unsigned score{};
-};
-
-std::optional<RuntimeActorReceiverProbe> probeRuntimeActorReceiver(
-    void* level, std::ptrdiff_t adjustment) noexcept {
-    const auto levelAddress = reinterpret_cast<std::uintptr_t>(level);
-    const auto receiverAddress = adjustment < 0
-        ? levelAddress - static_cast<std::uintptr_t>(-adjustment)
-        : levelAddress + static_cast<std::uintptr_t>(adjustment);
-    if ((adjustment < 0 && receiverAddress > levelAddress) ||
-        (adjustment >= 0 && receiverAddress < levelAddress)) return std::nullopt;
-    auto* receiver = reinterpret_cast<void*>(receiverAddress);
-    const auto managerAddress = receiverAddress + 0x2E8;
-    if (managerAddress < receiverAddress) return std::nullopt;
-
-    RuntimeActorReceiverProbe probe{};
-    probe.receiver = receiver;
-    probe.adjustment = adjustment;
-    if (!safeRead(reinterpret_cast<void*>(managerAddress), 0x1A0, probe.begin) ||
-        !safeRead(reinterpret_cast<void*>(managerAddress), 0x1A8, probe.end) ||
-        !safeRead(reinterpret_cast<void*>(managerAddress), 0x1B0, probe.capacity))
-        return std::nullopt;
-    if (!probe.begin || probe.end < probe.begin || probe.capacity < probe.end ||
-        (probe.begin & (alignof(void*) - 1)) != 0) return std::nullopt;
-    const auto bytes = probe.end - probe.begin;
-    const auto capacityBytes = probe.capacity - probe.begin;
-    if (bytes == 0 || bytes % sizeof(RuntimeActorRecord) != 0 ||
-        capacityBytes % sizeof(RuntimeActorRecord) != 0 ||
-        bytes > 4096 * sizeof(RuntimeActorRecord) ||
-        capacityBytes > 4096 * sizeof(RuntimeActorRecord) ||
-        !readable(reinterpret_cast<const void*>(probe.begin), bytes)) return std::nullopt;
-    probe.count = bytes / sizeof(RuntimeActorRecord);
-
-    // Ghidra shows the helper entering a Windows critical section at
-    // receiver + 0x370. Reject offsets whose adjacent bytes do not resemble
-    // an initialized CRITICAL_SECTION before allowing the native call.
-    const auto lockAddress = managerAddress + 0x88;
-    std::uintptr_t debugInfo = 0, owner = 0, semaphore = 0, spinCount = 0;
-    std::int32_t lockCount = 0, recursionCount = 0;
-    if (lockAddress < managerAddress ||
-        !safeRead(reinterpret_cast<void*>(lockAddress), 0, debugInfo) ||
-        !safeRead(reinterpret_cast<void*>(lockAddress), 8, lockCount) ||
-        !safeRead(reinterpret_cast<void*>(lockAddress), 12, recursionCount) ||
-        !safeRead(reinterpret_cast<void*>(lockAddress), 16, owner) ||
-        !safeRead(reinterpret_cast<void*>(lockAddress), 24, semaphore) ||
-        !safeRead(reinterpret_cast<void*>(lockAddress), 32, spinCount)) return std::nullopt;
-    if (lockCount < -1 || lockCount > 4096 || recursionCount < 0 ||
-        recursionCount > 1024 || owner > UINT32_MAX || spinCount > 0x7FFFFFFFu)
-        return std::nullopt;
-    probe.score = 1;
-    if (debugInfo && readable(reinterpret_cast<const void*>(debugInfo), sizeof(void*)))
-        probe.score += 2;
-    if (semaphore == 0 || readable(reinterpret_cast<const void*>(semaphore), sizeof(void*)))
-        ++probe.score;
-    return probe;
-}
-
-std::optional<RuntimeActorReceiverProbe> findRuntimeActorReceiver(void* level) noexcept {
-    std::optional<RuntimeActorReceiverProbe> best;
-    bool ambiguous = false;
-    for (std::ptrdiff_t adjustment = -0x200; adjustment <= 0x200; adjustment += 8) {
-        auto candidate = probeRuntimeActorReceiver(level, adjustment);
-        if (!candidate) continue;
-        if (!best || candidate->score > best->score) {
-            best = std::move(candidate);
-            ambiguous = false;
-        } else if (candidate->score == best->score) {
-            ambiguous = true;
-        }
-    }
-    return ambiguous ? std::nullopt : best;
-}
-
-bool tryAcquireLevelPointerFromClient(void** output) noexcept;
-
-int captureRuntimeActorException(EXCEPTION_POINTERS* exception,
-                                 unsigned long* exceptionCode,
-                                 std::uintptr_t* exceptionAddress) noexcept {
-    if (exceptionCode && exception && exception->ExceptionRecord)
-        *exceptionCode = exception->ExceptionRecord->ExceptionCode;
-    if (exceptionAddress && exception && exception->ExceptionRecord)
-        *exceptionAddress = reinterpret_cast<std::uintptr_t>(
-            exception->ExceptionRecord->ExceptionAddress);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-// Keep native dispatch inside a tiny SEH boundary with no owning C++ objects
-// on its stack. The candidate signature is only usable on an exact build.
-bool invokeRuntimeActorList(void* level, void* function,
-                            std::vector<RuntimeActorRecord>* actors,
-                            unsigned long* exceptionCode,
-                            std::uintptr_t* exceptionAddress) noexcept {
-    if (exceptionCode) *exceptionCode = 0;
-    if (exceptionAddress) *exceptionAddress = 0;
-    if (!level || !actors || !readable(level, sizeof(void*)) || !executable(function)) return false;
-    __try {
-        reinterpret_cast<RuntimeActorListFn>(function)(level, actors);
-        return true;
-    } __except (captureRuntimeActorException(GetExceptionInformation(),
-                                              exceptionCode, exceptionAddress)) {
-        return false;
-    }
-}
-
 bool looksLikeActor(void* actor) noexcept {
     if (!actor || !readable(actor, sizeof(void*))) return false;
     void** vtable = nullptr;
@@ -742,8 +667,54 @@ bool looksLikeActor(void* actor) noexcept {
     return executableSlots >= 2;
 }
 
+bool invokeLevelRuntimeActorList(void* level, void* target,
+                                std::vector<void*>* actors) noexcept {
+    if (!allowRuntimeActorListCall || !level || !target || !actors ||
+        !readable(level, sizeof(void*)) || !executable(target)) return false;
+    __try {
+        reinterpret_cast<LevelRuntimeActorListFn>(target)(level, actors);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool TabListGameAccess::isActorValid(void* actor) const noexcept {
     return looksLikeActor(actor);
+}
+
+std::vector<void*> TabListGameAccess::actorHandles(void* world) const {
+    std::vector<void*> result;
+    if (!allowRuntimeActorListCall || !world ||
+        world != levelInstance.load(std::memory_order_acquire)) return result;
+    const auto slot = runtimeActorListSlot.load(std::memory_order_acquire);
+    auto* expectedTarget = runtimeActorListTarget.load(std::memory_order_acquire);
+    if (slot == std::numeric_limits<std::size_t>::max() || slot > 0x400 ||
+        !expectedTarget) return result;
+
+    void** vtable = nullptr;
+    void* target = nullptr;
+    // Slot 0x145 is zero-based; reject derived/foreign vtables unless the
+    // target is exactly the one resolved from this executable's profile.
+    if (!safeRead(world, 0, vtable) || !vtable ||
+        !safeRead(vtable, slot * sizeof(void*), target) ||
+        target != expectedTarget || !executable(target)) return result;
+
+    std::vector<void*> nativeActors;
+    if (!invokeLevelRuntimeActorList(world, target, &nativeActors) ||
+        nativeActors.size() > 4096) return result;
+    result.reserve(nativeActors.size());
+    std::unordered_set<void*> seen;
+    seen.reserve(nativeActors.size());
+    for (auto* actor : nativeActors) {
+        if (actor && isActorValid(actor) && seen.insert(actor).second)
+            result.push_back(actor);
+    }
+    if (!loggedActorListSuccess.exchange(true, std::memory_order_acq_rel))
+        diagnostic("Level::getRuntimeActorList active: slot=0x", std::hex, slot,
+                   " target=0x", reinterpret_cast<std::uintptr_t>(target), std::dec,
+                   " native=", nativeActors.size(), " valid=", result.size());
+    return result;
 }
 
 bool readActorEquipment(void* actor, const bedrock::NativeItemLayout& layout,
@@ -766,6 +737,31 @@ bool readActorEquipment(void* actor, const bedrock::NativeItemLayout& layout,
         return *output != nullptr;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         *output = nullptr;
+        return false;
+    }
+}
+
+bool readActorGameType(void* actor, std::int32_t& gameType) noexcept {
+    if (!actor || !nativeItemLayout) return false;
+    const auto& layout = *nativeItemLayout;
+    void* registry = nullptr;
+    std::uint32_t rawId = 0;
+    if (!safeRead(actor, layout.actorEntityContextOffset + layout.contextEnttRegistryOffset,
+                  registry) ||
+        !safeRead(actor, layout.actorEntityContextOffset + layout.contextEntityIdOffset,
+                  rawId) || !registry || !readable(registry, sizeof(void*))) return false;
+    __try {
+        auto* typed = static_cast<entt::basic_registry<tablist_native::EntityId>*>(registry);
+        auto* storage = typed->storage(tablist_native::ActorGameTypeComponent::type_hash);
+        if (!storage) return false;
+        const auto entity = tablist_native::EntityId{rawId};
+        if (!storage->contains(entity)) return false;
+        const auto* component = static_cast<const tablist_native::ActorGameTypeComponent*>(
+            storage->value(entity));
+        if (!component) return false;
+        gameType = component->gameType;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
@@ -908,37 +904,6 @@ std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
     return names;
 }
 
-void* actorPointerFromRecord(const RuntimeActorRecord& record, std::size_t offset) noexcept {
-    if (offset + sizeof(void*) > record.bytes.size()) return nullptr;
-    void* actor = nullptr;
-    std::memcpy(&actor, record.bytes.data() + offset, sizeof(actor));
-    return actor;
-}
-
-int discoverActorPointerOffset(const std::vector<RuntimeActorRecord>& records) {
-    const auto sampleCount = std::min<std::size_t>(records.size(), 64);
-    std::size_t bestCount = 0;
-    int bestOffset = -1;
-    for (std::size_t offset = 0; offset + sizeof(void*) <= sizeof(RuntimeActorRecord);
-         offset += sizeof(void*)) {
-        std::size_t matchingNames = 0;
-        for (std::size_t i = 0; i < sampleCount; ++i) {
-            auto* actor = actorPointerFromRecord(records[i], offset);
-            if (!looksLikeActor(actor)) continue;
-            std::string nameTag;
-            if (copyActorNameTag(actor, &nameTag) && !nameTag.empty() && nameTag.size() <= 512 &&
-                !tablist::stripMinecraftFormatting(nameTag).empty()) {
-                ++matchingNames;
-            }
-        }
-        if (matchingNames > bestCount) {
-            bestCount = matchingNames;
-            bestOffset = static_cast<int>(offset);
-        }
-    }
-    return bestCount >= 2 ? bestOffset : -1;
-}
-
 bool getActorNameTagView(void* actor, const char** data, std::size_t* size) noexcept {
     auto* rawFunction = originalActorGetNameTag.load(std::memory_order_acquire);
     if (!actor || !data || !size || !rawFunction || !readable(actor, sizeof(void*)) ||
@@ -1044,129 +1009,6 @@ void refreshObservedActorNameTags() noexcept {
     }
 }
 
-void updateRuntimeActorNameTags(void* level) {
-    auto* function = runtimeActorListFunction.load(std::memory_order_acquire);
-    if (!function || !originalActorGetNameTag.load(std::memory_order_acquire)) return;
-    const auto cachedAdjustment = runtimeActorReceiverAdjustment.load(std::memory_order_acquire);
-    const bool cachedForThisLevel = runtimeActorReceiverLevel.load(std::memory_order_acquire) == level;
-    auto receiver = !cachedForThisLevel || cachedAdjustment == std::numeric_limits<int>::min()
-        ? findRuntimeActorReceiver(level)
-        : probeRuntimeActorReceiver(level, cachedAdjustment);
-    void* receiverLevel = level;
-    // _subTick's `this` may be a derived-level subobject, while the SDK method
-    // is declared on Level. Cross-check the Level pointer reached through the
-    // live ClientInstance/session chain before declaring the exact-build
-    // candidate unusable. The session path is already used for player-list
-    // recovery, but normally is skipped while the tick hook is fresh.
-    void* sessionLevel = nullptr;
-    if (!receiver && tryAcquireLevelPointerFromClient(&sessionLevel) &&
-        sessionLevel && sessionLevel != level) {
-        receiver = findRuntimeActorReceiver(sessionLevel);
-        receiverLevel = sessionLevel;
-        if (receiver && !loggedActorReceiverAdjustment.exchange(true, std::memory_order_acq_rel))
-            diagnostic("runtime Actor receiver validated via ClientInstance session Level; tick_level=0x",
-                       std::hex, reinterpret_cast<std::uintptr_t>(level), " session_level=0x",
-                       reinterpret_cast<std::uintptr_t>(sessionLevel), std::dec);
-    }
-    if (!receiver) {
-        runtimeActorReceiverAdjustment.store(std::numeric_limits<int>::min(),
-                                             std::memory_order_release);
-        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
-            diagnostic("runtime Actor receiver validation failed; no unique Level adjustment has a valid lock and 0x40-byte actor vector; color sort inactive");
-        return;
-    }
-    runtimeActorReceiverAdjustment.store(static_cast<int>(receiver->adjustment),
-                                         std::memory_order_release);
-    runtimeActorReceiverLevel.store(receiverLevel, std::memory_order_release);
-    if (receiver->adjustment != 0 &&
-        !loggedActorReceiverAdjustment.exchange(true, std::memory_order_acq_rel))
-        diagnostic("runtime Actor receiver adjustment=0x", std::hex,
-                   receiver->adjustment, std::dec, "; preflight records=", receiver->count);
-    std::vector<RuntimeActorRecord> actors;
-    unsigned long exceptionCode = 0;
-    std::uintptr_t exceptionAddress = 0;
-    if (!invokeRuntimeActorList(receiver->receiver, function, &actors,
-                                &exceptionCode, &exceptionAddress)) {
-        runtimeActorListFunction.store(nullptr, std::memory_order_release);
-        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel)) {
-            const auto levelAddress = reinterpret_cast<std::uintptr_t>(receiver->receiver);
-            const auto managerAddress = levelAddress + 0x2E8;
-            const auto lockAddress = managerAddress + 0x88;
-            std::array<std::uintptr_t, 3> actorVector{};
-            std::array<std::uintptr_t, 5> criticalSection{};
-            const bool vectorReadable = safeRead(reinterpret_cast<void*>(managerAddress), 0x1A0,
-                                                 actorVector[0]) &&
-                safeRead(reinterpret_cast<void*>(managerAddress), 0x1A8, actorVector[1]) &&
-                safeRead(reinterpret_cast<void*>(managerAddress), 0x1B0, actorVector[2]);
-            const bool lockReadable = safeRead(reinterpret_cast<void*>(lockAddress), 0,
-                                               criticalSection);
-            diagnostic("Level::getRuntimeActorList invocation raised SEH exception=0x",
-                       std::hex, exceptionCode, " at=0x", exceptionAddress,
-                       " level=0x", levelAddress, " manager=0x", managerAddress,
-                       " lock=0x", lockAddress,
-                       " lock_state=", lockReadable ? "readable" : "unreadable",
-                       " lock_words=0x", criticalSection[0], ",0x", criticalSection[1],
-                       ",0x", criticalSection[2], ",0x", criticalSection[3],
-                       ",0x", criticalSection[4],
-                       " actor_vector=", vectorReadable ? "readable" : "unreadable",
-                       " begin=0x", actorVector[0], " end=0x", actorVector[1],
-                       " capacity=0x", actorVector[2], std::dec,
-                       "; actor color sort inactive");
-        }
-        return;
-    }
-    if (actors.size() > 4096 ||
-        (actors.size() && !readable(actors.data(), actors.size() * sizeof(RuntimeActorRecord)))) {
-        runtimeActorListFunction.store(nullptr, std::memory_order_release);
-        if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel))
-            diagnostic("Level::getRuntimeActorList returned invalid record buffer; records=",
-                       actors.size(), " record_size=", sizeof(RuntimeActorRecord),
-                       "; actor color sort inactive");
-        return;
-    }
-
-    int actorOffset = runtimeActorPointerOffset.load(std::memory_order_acquire);
-    if (actorOffset < 0) {
-        actorOffset = discoverActorPointerOffset(actors);
-        if (actorOffset >= 0) {
-            runtimeActorPointerOffset.store(actorOffset, std::memory_order_release);
-            diagnostic("runtime Actor record layout identified; Actor* at +0x",
-                       std::hex, actorOffset, std::dec);
-        } else if (!loggedActorListFailure.exchange(true, std::memory_order_acq_rel)) {
-            diagnostic("Level::getRuntimeActorList returned ", actors.size(),
-                       " 0x40-byte records, but no Actor* field matched Actor::getNameTag");
-        }
-        if (actorOffset < 0) return;
-    }
-
-    std::unordered_map<void*, ActorNameTagEntry> updated;
-    updated.reserve(actors.size());
-    for (const auto& record : actors) {
-        void* actor = actorPointerFromRecord(record, static_cast<std::size_t>(actorOffset));
-        if (!looksLikeActor(actor)) continue;
-        std::string nameTag;
-        if (!copyActorNameTag(actor, &nameTag) || nameTag.empty() || nameTag.size() > 512)
-            continue;
-        if (tablist::stripMinecraftFormatting(nameTag).empty()) continue;
-        const auto color = tablist::minecraftNameColorOrder(nameTag);
-        const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
-        updated.insert_or_assign(actor, ActorNameTagEntry{std::move(nameTag), color, sequence});
-    }
-    const auto nameTagCount = updated.size();
-    {
-        std::lock_guard lock(actorNameTagMutex);
-        actorNameTags.swap(updated);
-    }
-    if (!loggedActorListSuccess.exchange(true, std::memory_order_acq_rel))
-        diagnostic("World Actor list active; ", actors.size(), " actor(s), ",
-                   nameTagCount, " NameTag(s) read");
-}
-
-bool levelIsFresh() noexcept {
-    const auto heartbeat = levelHeartbeatMs.load(std::memory_order_acquire);
-    return heartbeat > 0 && steadyMilliseconds() - heartbeat <= 1500;
-}
-
 bool tryAcquireLevelPointerFromClient(void** output) noexcept {
     if (!output) return false;
     *output = nullptr;
@@ -1221,9 +1063,10 @@ std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
 }
 
 bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
-                       bool sortByNameColor,
+                       bool sortByNameColor, bool gamemodeCheck,
                        bool murderDetect,
                        const std::unordered_map<std::string, tablist::MurderRole>& murderRoles,
+                       const std::unordered_set<std::string>& spectators,
                        const std::vector<ActorNameTagEntry>& actorTags) {
     void* level = levelInstance.load(std::memory_order_acquire);
     if (!level) {
@@ -1261,6 +1104,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
             const auto role = murderRoles.find(row.name);
             if (role != murderRoles.end()) row.murderRole = role->second;
         }
+        row.spectator = gamemodeCheck && spectatorPlayers.contains(row.name);
         if (sortByNameColor) {
             bool foundColor = false;
             bool bestWasExact = false;
@@ -1340,15 +1184,16 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
 }
 
 bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
-                 bool sortByNameColor,
+                 bool sortByNameColor, bool gamemodeCheck,
                  bool murderDetect,
                  const std::unordered_map<std::string, tablist::MurderRole>& murderRoles,
+                 const std::unordered_set<std::string>& spectators,
                  const std::vector<ActorNameTagEntry>& actorTags) noexcept {
     // Keep SEH outside the function that owns C++ objects. A player joining or
     // leaving during the read cannot crash Minecraft; that frame is skipped.
     __try {
-        return collectRowsUnsafe(rows, includeFaces, sortByNameColor, murderDetect,
-                                 murderRoles, actorTags);
+        return collectRowsUnsafe(rows, includeFaces, sortByNameColor, gamemodeCheck, murderDetect,
+                                 murderRoles, spectators, actorTags);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         rows.clear();
         return false;
@@ -1410,14 +1255,18 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
         std::vector<PlayerRow> rows;
         std::vector<ActorNameTagEntry> actorTags;
         std::unordered_map<std::string, tablist::MurderRole> murderRoles;
+        std::unordered_set<std::string> spectators;
         if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
-        if (config->murderDetect) {
+        if (config->murderDetect || config->gamemodeCheck) {
             std::lock_guard lock(murderDetectMutex);
-            pruneExpiredMurderRolesLocked(std::chrono::steady_clock::now());
-            murderRoles = murderRolesByPlayer;
+            if (config->murderDetect) {
+                pruneExpiredMurderRolesLocked(std::chrono::steady_clock::now());
+                murderRoles = murderRolesByPlayer;
+            }
+            if (config->gamemodeCheck) spectators = spectatorPlayers;
         }
-        if (!collectRows(rows, false, config->sortByNameColor,
-                         config->murderDetect, murderRoles, actorTags)) {
+        if (!collectRows(rows, false, config->sortByNameColor, config->gamemodeCheck,
+                         config->murderDetect, murderRoles, spectators, actorTags)) {
             return; // Keep the previous immutable snapshot on a transient read failure.
         }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
@@ -1476,32 +1325,41 @@ struct ActorMurderSnapshot {
     bool isPlayer = false;
     std::string name;
     std::optional<bedrock::HeldItemInfo> item;
+    bool hasGameType = false;
+    bool spectator = false;
 };
 
 void readActorMurderSnapshot(const bedrock::Actor& actor,
-                             ActorMurderSnapshot& snapshot) {
+                             ActorMurderSnapshot& snapshot,
+                             bool readItem, bool readGameMode) {
     const auto identity = actor.getIdentity();
     snapshot.isPlayer = identity.isPlayer;
     if (!snapshot.isPlayer) return;
     snapshot.name = identity.name;
     if (snapshot.name.empty() || snapshot.name.size() > 128) return;
-    snapshot.item = actor.getMainHand();
+    if (readItem) snapshot.item = actor.getMainHand();
+    if (readGameMode) {
+        std::int32_t gameType = -1;
+        snapshot.hasGameType = readActorGameType(actor.handle(), gameType);
+        snapshot.spectator = snapshot.hasGameType && gameType == 3;
+    }
 }
 
 // Keep native Actor/inventory access behind a per-actor SEH boundary. One stale
 // cached Actor or invalid inventory layout must not take down Minecraft.
 bool readActorMurderSnapshotSeh(const bedrock::Actor* actor,
-                                ActorMurderSnapshot* snapshot) noexcept {
+                                ActorMurderSnapshot* snapshot,
+                                bool readItem, bool readGameMode) noexcept {
     if (!actor || !snapshot) return false;
     __try {
-        readActorMurderSnapshot(*actor, *snapshot);
+        readActorMurderSnapshot(*actor, *snapshot, readItem, readGameMode);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-void updateMurderDetection(bool debug) noexcept {
+void updateMurderDetection(bool debug, bool readItems, bool readGameMode) noexcept {
     // Keep native Actor/inventory reads thread-affine, but sample a small
     // bounded batch each tick so a brief held-item change is less likely to
     // fall between two samples. Opening the TabList never triggers a scan burst.
@@ -1519,7 +1377,7 @@ void updateMurderDetection(bool debug) noexcept {
             murderScanCursor = (murderScanCursor + 1) % murderScanActors.size();
             if (actorHandle) murderLastProcessedActor = actorHandle;
             ActorMurderSnapshot snapshot;
-            if (!readActorMurderSnapshotSeh(&actor, &snapshot)) {
+            if (!readActorMurderSnapshotSeh(&actor, &snapshot, readItems, readGameMode)) {
                 if (!loggedMurderActorReadFault.exchange(true, std::memory_order_acq_rel))
                     diagnostic("MurderDetect skipped an Actor whose native read raised an exception");
                 continue;
@@ -1531,6 +1389,8 @@ void updateMurderDetection(bool debug) noexcept {
             MurderSample copied;
             copied.name = std::move(snapshot.name);
             copied.hasItem = item.has_value();
+            copied.hasGameType = snapshot.hasGameType;
+            copied.spectator = snapshot.spectator;
             copied.debug = debug;
             if (item) {
                 copied.identifier = item->identifier;
@@ -1596,6 +1456,7 @@ void refreshTrackedMurderActors(void* level, bool debug) noexcept {
 }
 
 void __fastcall onLevelSubTick(void* level) {
+    RuntimeActorListTickScope actorListTickScope;
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
     // Poll at most one cached Actor per second as a fallback for hidden labels;
@@ -1608,11 +1469,12 @@ void __fastcall onLevelSubTick(void* level) {
     const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
     refreshOneCachedFace(config);
     static unsigned murderScanCadence = 0;
-    if (config->murderDetect) {
+    if (config->murderDetect || config->gamemodeCheck) {
         refreshTrackedMurderActors(level, config->debug);
         if (++murderScanCadence >= config->murderScanIntervalTicks) {
             murderScanCadence = 0;
-            updateMurderDetection(config->debug);
+            updateMurderDetection(config->debug, config->murderDetect,
+                                  config->gamemodeCheck);
         }
     } else {
         murderScanCadence = 0;
@@ -1716,6 +1578,7 @@ void drawTabList(void*) {
         widths[column] = std::max(widths[column],
             ImGui::CalcTextSize(players[i].name.c_str()).x +
             ImGui::CalcTextSize(roleText).x +
+            (players[i].spectator ? ImGui::CalcTextSize(" [Spectator]").x : 0.0f) +
             horizontalPadding * 2.0f + faceArea);
     }
     float totalWidth = 0.0f;
@@ -1746,6 +1609,9 @@ void drawTabList(void*) {
     for (std::size_t i = 0; i < players.size(); ++i) {
         const auto column = i / config->maximumRows;
         const auto row = i % config->maximumRows;
+        const auto roleText = players[i].murderRole == tablist::MurderRole::Sheriff
+            ? " [Sheriff]" : players[i].murderRole == tablist::MurderRole::Murderer
+                ? " [Murderer]" : "";
         const float y = topLeft.y + config->headerHeight +
             config->rowHeight * static_cast<float>(row);
         if ((row & 1U) != 0)
@@ -1772,7 +1638,9 @@ void drawTabList(void*) {
             textX += 9.0f;
         }
         const auto textSize = ImGui::CalcTextSize(players[i].name.c_str());
-        const ImU32 nameColor = players[i].hasNameColor && players[i].nameColorOrder <
+        const ImU32 nameColor = players[i].spectator
+            ? IM_COL32(145, 150, 165, 210)
+            : players[i].hasNameColor && players[i].nameColorOrder <
             minecraftNameColors.size()
             ? minecraftNameColors[players[i].nameColorOrder]
             : packed(config->text);
@@ -1786,6 +1654,11 @@ void drawTabList(void*) {
             draw->AddText({textX + textSize.x,
                            y + (config->rowHeight - textSize.y) * 0.5f},
                           roleColor, roleLabel);
+        }
+        if (players[i].spectator) {
+            const float suffixX = textX + textSize.x + ImGui::CalcTextSize(roleText).x;
+            draw->AddText({suffixX, y + (config->rowHeight - textSize.y) * 0.5f},
+                          IM_COL32(165, 170, 185, 230), " [Spectator]");
         }
     }
 }
@@ -1846,7 +1719,8 @@ void removeNativeHooks() noexcept {
     originalLevelSubTick.store(nullptr);
     originalActorGetNameTag.store(nullptr, std::memory_order_release);
     resolvedActorGetNameTag.store(nullptr, std::memory_order_release);
-    runtimeActorListFunction.store(nullptr, std::memory_order_release);
+    runtimeActorListSlot.store(std::numeric_limits<std::size_t>::max(), std::memory_order_release);
+    runtimeActorListTarget.store(nullptr, std::memory_order_release);
     gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
     levelInstance.store(nullptr);
@@ -1923,11 +1797,22 @@ DWORD WINAPI startClient(void*) {
             (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
             actorNameTag.reset();
     };
+    const auto resolveRuntimeActorList = [](const bedrock::Resolver& source) {
+        if (!source.exactBuild()) return false;
+        const auto slot = source.resolveVirtualSlot("Level::getRuntimeActorList");
+        const auto method = source.resolve("Level::getRuntimeActorList");
+        if (!slot || !method || !method->exact_build || !method->verified ||
+            method->method != "exact-rva") return false;
+        tabListGameAccess.setRuntimeActorList(*slot,
+            reinterpret_cast<void*>(method->address));
+        return true;
+    };
     bedrock::NativeItemLayout cachedItemLayout;
     std::string cachedItemLayoutError;
     bool itemLayoutAvailable = bedrock::parseNativeItemLayout(
         profile, cachedItemLayout, cachedItemLayoutError);
     resolveActorNameTag();
+    bool runtimeActorListReady = resolveRuntimeActorList(resolver);
     const auto requirementsMet = [&] {
         return valid(keyboard) && valid(grab) && valid(release) && valid(fov) && valid(levelTick);
     };
@@ -1960,7 +1845,7 @@ DWORD WINAPI startClient(void*) {
 
     // A fresh runtime-profile cache can predate virtual-method metadata. The
     // bundled profile is still accepted only for this exact executable hash.
-    if (!actorNameTag) {
+    if (!actorNameTag || !runtimeActorListReady) {
         bedrock::Resolver embeddedResolver;
         std::string embeddedError;
         if (embeddedResolver.loadJson(bedrock::generated::kSymbolDatabase, embeddedError) &&
@@ -1972,10 +1857,15 @@ DWORD WINAPI startClient(void*) {
                     (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
                     actorNameTag.reset();
             }
+            if (!runtimeActorListReady)
+                runtimeActorListReady = resolveRuntimeActorList(embeddedResolver);
         } else {
             diagnostic("embedded exact-build profile unavailable: ", embeddedError);
         }
     }
+    diagnostic("world Actor source: Level::getRuntimeActorList=",
+               runtimeActorListReady ? "profile ready" : "unavailable",
+               runtimeActorListReady ? " [exact vtable slot and ABI]" : "");
 
     if (!requirementsMet()) {
         diagnostic("required symbols unavailable keyboard=", bool(keyboard),
@@ -2058,11 +1948,10 @@ DWORD WINAPI startClient(void*) {
         diagnostic("SDK ActorNameTag hook unavailable; color sorting has no live Actor source",
                    error.empty() ? "" : ": ", error);
     }
-    runtimeActorListFunction.store(nullptr, std::memory_order_release);
-    resolvedRuntimeActorListFunction.store(nullptr, std::memory_order_release);
     diagnostic("world Actor source: SDK ActorNameTag event=",
                actorNameTagHookReady ? "active" : "unavailable",
-               " runtimeActorList=disabled");
+               " Level::getRuntimeActorList profile=",
+               runtimeActorListReady ? "ready" : "unavailable");
 
     bedrock::gui::OverlayOptions options;
     options.toggleVirtualKey = 0;

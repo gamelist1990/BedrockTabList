@@ -60,6 +60,7 @@ Config parseConfig(std::string_view jsonText, std::string& error) noexcept {
         config.showFaces = root.value("show_faces", config.showFaces);
         config.sortByNameColor = root.value("sort_by_name_color", config.sortByNameColor);
         config.murderDetect = root.value("murder_detect", config.murderDetect);
+        config.gamemodeCheck = root.value("gamemode_check", config.gamemodeCheck);
         config.debug = root.value("debug", config.debug);
         const auto scanInterval = numberOr<unsigned>(
             root, "murder_scan_interval_ticks", config.murderScanIntervalTicks);
@@ -98,6 +99,7 @@ std::string configJson(const Config& config) {
     root["show_faces"] = config.showFaces;
     root["sort_by_name_color"] = config.sortByNameColor;
     root["murder_detect"] = config.murderDetect;
+    root["gamemode_check"] = config.gamemodeCheck;
     root["debug"] = config.debug;
     root["murder_scan_interval_ticks"] = config.murderScanIntervalTicks;
     root["background_color"] = colorString(config.background);
