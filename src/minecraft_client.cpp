@@ -235,6 +235,7 @@ struct MurderSample {
     std::string name;
     std::string identifier;
     std::string displayName;
+    std::uint64_t worldEpoch{};
     unsigned count{};
     bool hasItem{};
     bool hasGameType{};
@@ -246,6 +247,7 @@ std::deque<MurderSample> murderQueue;
 std::thread murderWorker;
 bool murderWorkerStopping{};
 std::atomic<std::uint64_t> droppedMurderSamples{0};
+std::atomic<std::uint64_t> murderWorldEpoch{0};
 // Raw handles are captured from GameApi's validated roster on the game thread.
 // Re-validating each wrapper for every scan repeats several VirtualQuery calls.
 struct MurderActorEntry {
@@ -310,6 +312,12 @@ public:
         void* player, std::size_t slot) const override;
     std::optional<std::size_t> selectedHotbarSlot(void* player) const override;
     std::vector<std::string> playerListNames(void* world) const override;
+    void clearPlayerNameCache() const noexcept {
+        std::lock_guard lock(playerNamesMutex_);
+        cachedWorld_ = nullptr;
+        playerNamesCacheMs_ = 0;
+        playerNamesCache_.clear();
+    }
     std::optional<bedrock::ServerAddress> serverAddress(void* player) const override {
         (void)player;
         return std::nullopt;
@@ -364,9 +372,11 @@ void diagnostic(Args&&... args) {
 }
 
 void publishHeldItemName(const std::string& playerName,
-                         const std::string& displayName) noexcept {
+                         const std::string& displayName,
+                         std::uint64_t worldEpoch) noexcept {
     try {
         std::lock_guard writeLock(cachedTabRowsWriteMutex);
+        if (worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
         const auto current = std::atomic_load_explicit(&cachedTabRows,
                                                        std::memory_order_acquire);
         if (!current || current->empty()) return;
@@ -415,6 +425,7 @@ std::string normalizeItemDisplayName(std::string_view raw,
 
 void processMurderSample(const MurderSample& sample) noexcept {
     try {
+        if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
         std::string itemKey = sample.identifier.empty()
             ? sample.displayName : sample.identifier;
         if (itemKey.size() > 256) return;
@@ -429,6 +440,8 @@ void processMurderSample(const MurderSample& sample) noexcept {
         std::string currentDisplay;
         {
             std::lock_guard lock(murderDetectMutex);
+            if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire))
+                return;
             const auto now = std::chrono::steady_clock::now();
             const auto old = lastHeldItemByPlayer.find(sample.name);
             if (old != lastHeldItemByPlayer.end()) previous = old->second;
@@ -455,7 +468,9 @@ void processMurderSample(const MurderSample& sample) noexcept {
                 else spectatorPlayers.erase(sample.name);
             }
         }
-        if (!currentDisplay.empty()) publishHeldItemName(sample.name, currentDisplay);
+        if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
+        if (!currentDisplay.empty())
+            publishHeldItemName(sample.name, currentDisplay, sample.worldEpoch);
         if (changed && sample.hasItem) {
             const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
                 : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
@@ -518,8 +533,10 @@ void stopMurderWorker() noexcept {
 void enqueueMurderSample(MurderSample sample) noexcept {
     bool processInline = false;
     try {
+        if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
         {
             std::lock_guard lock(murderQueueMutex);
+            if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
             if (!murderWorker.joinable() || murderWorkerStopping) {
                 processInline = true;
             } else {
@@ -709,14 +726,34 @@ void recordLevel(void* level) noexcept {
     void* previous = levelInstance.exchange(level, std::memory_order_acq_rel);
     levelHeartbeatMs.store(steadyMilliseconds(), std::memory_order_release);
     if (previous != level) {
+        murderWorldEpoch.fetch_add(1, std::memory_order_acq_rel);
+        tabListGameAccess.clearPlayerNameCache();
+        {
+            std::lock_guard queueLock(murderQueueMutex);
+            murderQueue.clear();
+        }
+        {
+            std::lock_guard detectLock(murderDetectMutex);
+            murderRolesByPlayer.clear();
+            spectatorPlayers.clear();
+            murderRoleExpiryByPlayer.clear();
+            lastHeldItemByPlayer.clear();
+            heldItemNamesByPlayer.clear();
+        }
         if (gameApi) gameApi->clearObservedActors();
-        std::atomic_store_explicit(&cachedTabRows,
-            std::shared_ptr<const std::vector<PlayerRow>>{}, std::memory_order_release);
+        {
+            std::lock_guard rowsLock(cachedTabRowsWriteMutex);
+            std::atomic_store_explicit(&cachedTabRows,
+                std::shared_ptr<const std::vector<PlayerRow>>{}, std::memory_order_release);
+        }
         loggedTabRowsReady.store(false, std::memory_order_release);
         {
             std::lock_guard lock(actorNameTagMutex);
             observedPlayerColorOrders.clear();
+            actorNameTags.clear();
         }
+        loggedMurderActorReadFault.store(false, std::memory_order_release);
+        droppedMurderSamples.store(0, std::memory_order_release);
         diagnostic("level ready");
     }
 }
@@ -1561,6 +1598,7 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
             if ((!snapshot.isPlayer || snapshot.name.empty() || snapshot.name.size() > 128) &&
                 !item) continue;
             MurderSample copied;
+            copied.worldEpoch = murderWorldEpoch.load(std::memory_order_acquire);
             if (!snapshot.name.empty()) {
                 copied.name = std::move(snapshot.name);
             } else {

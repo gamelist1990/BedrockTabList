@@ -85,7 +85,12 @@ TabListを開いた瞬間の一括読み取りも発生しません。間隔を�
 各Actorの手持ちが再確認されるまでの時間はActor数に応じて長くなります。
 一度検知したSheriff／Murdererの表示は、手から武器が離れても最後の検知から5分間維持し、
 その間に再検知すればさらに5分延長します。プレイヤーが一時的に抜けても同じ名前の判定は期限まで保持します。
+Levelが切り替わると、Actor/NameTag観測、プレイヤー一覧キャッシュ、手持ち表示、役割判定、Spectator状態と未処理のワーカーサンプルを破棄します。前のワールドの遅延サンプルは世代番号で無視します。
 手持ちアイテムが切り替わった時だけ、表示名とItem ID、個数、役割を `TabList.log` に記録します。色遷移ログなどの詳細は `debug=true` で有効になります。
+
+GUIはWindowsにインストールされたYu Gothic、Meiryo、MS Gothicの順で日本語グリフを追加します。該当フォントがOSにない場合は英語フォントへフォールバックします。
+
+PlayerListの各エントリにはActorUniqueIDがありますが、現在のSDK `getEntityId()` が返すECS entity IDとは別の値です。Minecraft 1.26.52.3でActor側のActorUniqueIDを安全に読む方法を確定するまでは、この2種類を比較して名前を推測しません。そのため、Nametagが一度も観測されなかったActorは引き続き`unmatched`になり、該当PlayerList行への役割表示は保留されます。
 
 `gamemode_check` はActorの `ActorGameTypeComponent` を読み、Spectator (GameType 3) を灰色で表示します。
 死亡・不可視フラグの読み取りは対象バージョンでまだ確定できていないため、この設定では判定しません。
