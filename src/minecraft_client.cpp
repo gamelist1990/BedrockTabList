@@ -1698,7 +1698,7 @@ void refreshTrackedMurderActors(void* level) noexcept {
                            actorHandles.size(), " playerNames=", playerNames.size(),
                            " observedTags=", actorTags.size(),
                            " namedActors=", namedActorCount,
-                           " trackedActors=", playerActors.size());
+                           " trackedActors=", trackedActors.size());
                 lastMurderRosterStatusLogMs = now;
             }
         }
