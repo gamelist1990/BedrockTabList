@@ -63,12 +63,18 @@ Config parseConfig(std::string_view jsonText, std::string& error) noexcept {
         config.showHeldItems = root.value("show_held_items", config.showHeldItems);
         config.gamemodeCheck = root.value("gamemode_check", config.gamemodeCheck);
         config.debug = root.value("debug", config.debug);
-        const auto scanInterval = numberOr<unsigned>(
-            root, "murder_scan_interval_ticks", config.murderScanIntervalTicks);
-        // 20 was the previous built-in default. Use the lower-latency but
-        // bounded new default for existing generated config files.
-        config.murderScanIntervalTicks = scanInterval == 20
-            ? 3u : std::clamp(scanInterval, 1u, 40u);
+        if (root.contains("murder_scan_interval_ms")) {
+            config.murderScanIntervalMs = std::clamp(
+                numberOr<unsigned>(root, "murder_scan_interval_ms",
+                                   config.murderScanIntervalMs), 250u, 2000u);
+        } else {
+            // Migrate the old tick setting to a stable real-time interval.
+            const auto legacyTicks = numberOr<unsigned>(
+                root, "murder_scan_interval_ticks", 8u);
+            config.murderScanIntervalMs = legacyTicks == 3 || legacyTicks == 20
+                ? 400u
+                : std::clamp(legacyTicks, 5u, 40u) * 50u;
+        }
         config.background = parseColor(root, "background_color", config.background);
         config.text = parseColor(root, "text_color", config.text);
         config.accent = parseColor(root, "accent_color", config.accent);
@@ -103,7 +109,7 @@ std::string configJson(const Config& config) {
     root["show_held_items"] = config.showHeldItems;
     root["gamemode_check"] = config.gamemodeCheck;
     root["debug"] = config.debug;
-    root["murder_scan_interval_ticks"] = config.murderScanIntervalTicks;
+    root["murder_scan_interval_ms"] = config.murderScanIntervalMs;
     root["background_color"] = colorString(config.background);
     root["text_color"] = colorString(config.text);
     root["accent_color"] = colorString(config.accent);

@@ -208,6 +208,7 @@ std::atomic<void*> runtimeActorListTarget{nullptr};
 std::atomic<void*> itemHoverNameTarget{nullptr};
 std::mutex itemDisplayNameMutex;
 std::unordered_map<std::string, std::string> itemDisplayNames;
+std::chrono::steady_clock::time_point lastItemDisplayNameResolve{};
 thread_local bool allowRuntimeActorListCall = false;
 struct RuntimeActorListTickScope {
     bool previous{allowRuntimeActorListCall};
@@ -239,6 +240,7 @@ struct MurderSample {
     std::uint64_t worldEpoch{};
     unsigned count{};
     bool hasItem{};
+    bool handEmpty{};
     bool hasGameType{};
     bool spectator{};
 };
@@ -284,6 +286,21 @@ const std::vector<PlayerRow>* cachedFaceSource = nullptr;
 std::mutex cachedTabRowsWriteMutex;
 std::shared_ptr<const std::vector<PlayerRow>> cachedTabRows{
     std::make_shared<const std::vector<PlayerRow>>()};
+struct TabRowsBuild {
+    bool failed{};
+    void* world{};
+    std::vector<std::string> names;
+    std::vector<PlayerRow> rows;
+    std::shared_ptr<const tablist::Config> config;
+    std::unordered_map<std::string, tablist::MurderRole> roles;
+    std::unordered_set<std::string> spectators;
+    std::vector<ActorNameTagEntry> actorTags;
+};
+std::mutex tabRowsWorkerMutex;
+std::thread tabRowsWorker;
+std::shared_ptr<TabRowsBuild> completedTabRowsBuild;
+bool tabRowsWorkerDone{};
+std::int64_t tabRowsLastStartedMs{};
 std::atomic<bool> loggedTabRowsReady{false};
 std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
@@ -447,6 +464,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
         bool changed = false;
         std::string previous;
         std::string currentDisplay;
+        bool clearedHeldItem = false;
         {
             std::lock_guard lock(murderDetectMutex);
             if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire))
@@ -454,8 +472,14 @@ void processMurderSample(const MurderSample& sample) noexcept {
             const auto now = std::chrono::steady_clock::now();
             const auto old = lastHeldItemByPlayer.find(sample.name);
             if (old != lastHeldItemByPlayer.end()) previous = old->second;
-            // Failed/empty stack reads do not erase the last confirmed item.
-            if (!itemKey.empty()) {
+            // A confirmed empty slot clears stale item state; failed reads
+            // leave the prior snapshot untouched.
+            if (sample.handEmpty) {
+                clearedHeldItem = old != lastHeldItemByPlayer.end() ||
+                                  heldItemNamesByPlayer.contains(sample.name);
+                lastHeldItemByPlayer.erase(sample.name);
+                heldItemNamesByPlayer.erase(sample.name);
+            } else if (!itemKey.empty()) {
                 changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
                 lastHeldItemByPlayer.insert_or_assign(sample.name, itemKey);
             }
@@ -478,7 +502,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
             }
         }
         if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
-        if (!currentDisplay.empty())
+        if (!currentDisplay.empty() || clearedHeldItem)
             publishHeldItemName(sample.name, currentDisplay, sample.worldEpoch);
         if (changed && sample.hasItem) {
             const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
@@ -644,11 +668,13 @@ bool copyNativeString(const void* object, std::string& output,
     }
 }
 
-void* callInventoryGetItem(void* inventory, std::size_t slot,
-                           const bedrock::NativeItemLayout& layout) noexcept {
-    if (!inventory || slot >= layout.localInventorySlots) return nullptr;
+bool tryCallInventoryGetItem(void* inventory, std::size_t slot,
+                             const bedrock::NativeItemLayout& layout,
+                             void** output) noexcept {
+    if (output) *output = nullptr;
+    if (!inventory || !output || slot >= layout.localInventorySlots) return false;
     void** vtable = nullptr;
-    if (!safeRead(inventory, 0, vtable) || !vtable) return nullptr;
+    if (!safeRead(inventory, 0, vtable) || !vtable) return false;
     static std::atomic<void**> cachedVtable{nullptr};
     static std::atomic<void*> cachedTarget{nullptr};
     void* target = nullptr;
@@ -657,17 +683,26 @@ void* callInventoryGetItem(void* inventory, std::size_t slot,
     } else {
         if (!readable(vtable, sizeof(void*) * (layout.inventoryGetItemVtableSlot + 1)) ||
             !safeRead(vtable, sizeof(void*) * layout.inventoryGetItemVtableSlot, target) ||
-            !executable(target)) return nullptr;
+            !executable(target)) return false;
         cachedTarget.store(target, std::memory_order_release);
         cachedVtable.store(vtable, std::memory_order_release);
     }
-    if (!target) return nullptr;
+    if (!target) return false;
     using GetItemFn = void*(__fastcall*)(void*, int);
     __try {
-        return reinterpret_cast<GetItemFn>(target)(inventory, static_cast<int>(slot));
+        *output = reinterpret_cast<GetItemFn>(target)(inventory, static_cast<int>(slot));
+        // A successfully invoked getter returning nullptr is a confirmed empty slot.
+        return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
+        *output = nullptr;
+        return false;
     }
+}
+
+void* callInventoryGetItem(void* inventory, std::size_t slot,
+                           const bedrock::NativeItemLayout& layout) noexcept {
+    void* stack = nullptr;
+    return tryCallInventoryGetItem(inventory, slot, layout, &stack) ? stack : nullptr;
 }
 
 bool validateClient(void* client) noexcept {
@@ -737,6 +772,11 @@ void recordLevel(void* level) noexcept {
     if (previous != level) {
         murderWorldEpoch.fetch_add(1, std::memory_order_acq_rel);
         tabListGameAccess.clearPlayerNameCache();
+        tabRowsLastStartedMs = 0;
+        {
+            std::lock_guard rowsLock(tabRowsWorkerMutex);
+            completedTabRowsBuild.reset();
+        }
         {
             std::lock_guard queueLock(murderQueueMutex);
             murderQueue.clear();
@@ -858,6 +898,11 @@ void populateItemDisplayName(void* stack, bedrock::ItemStack& item) {
             item.displayName = it->second;
             return;
         }
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto minimumResolveInterval = std::chrono::milliseconds(500);
+        if (lastItemDisplayNameResolve != std::chrono::steady_clock::time_point{} &&
+            now - lastItemDisplayNameResolve < minimumResolveInterval) return;
+        lastItemDisplayNameResolve = now;
     }
     std::string displayName;
     auto* target = itemHoverNameTarget.load(std::memory_order_acquire);
@@ -975,15 +1020,16 @@ void* TabListGameAccess::localPlayer() const noexcept {
     } __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
-std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
-    void* actor, bedrock::EquipmentSlot slot) const {
-    // Actor's public wrapper validates before dispatch. The murder sampler
-    // calls this adapter directly for handles from the validated roster, and
-    // every memory/native boundary below is guarded independently.
-    if (!nativeItemLayout || !actor) return std::nullopt;
+enum class EquipmentReadStatus { Failed, Empty, Item };
+
+EquipmentReadStatus readEquipmentItem(void* actor, bedrock::EquipmentSlot slot,
+                                     bedrock::ItemStack* output) {
+    if (output) *output = {};
+    if (!nativeItemLayout || !actor || !output) return EquipmentReadStatus::Failed;
     const auto& layout = *nativeItemLayout;
     tablist_native::ActorEquipmentComponent* component = nullptr;
-    if (!readActorEquipment(actor, layout, &component) || !component) return std::nullopt;
+    if (!readActorEquipment(actor, layout, &component) || !component)
+        return EquipmentReadStatus::Failed;
     std::size_t slotIndex = 0;
     std::size_t containerOffset = layout.handContainerOffset;
     switch (slot) {
@@ -999,28 +1045,42 @@ std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
         containerOffset = layout.armorContainerOffset; slotIndex = layout.armorSlots[3]; break;
     }
     void* container = nullptr;
-    if (!safeRead(component, containerOffset, container) || !container) return std::nullopt;
-    void* stack = callInventoryGetItem(container, slotIndex, layout);
-    if (!stack) return std::nullopt;
+    if (!safeRead(component, containerOffset, container) || !container)
+        return EquipmentReadStatus::Failed;
+    void* stack = nullptr;
+    if (!tryCallInventoryGetItem(container, slotIndex, layout, &stack))
+        return EquipmentReadStatus::Failed;
+    if (!stack) return EquipmentReadStatus::Empty;
     bedrock::ItemStack item;
     std::uint8_t count = 0;
     void** itemReference = nullptr;
     void* nativeItem = nullptr;
-    if (!safeRead(stack, layout.itemCountOffset, count) || count == 0 ||
-        !safeRead(stack, layout.itemReferenceOffset, itemReference) || !itemReference ||
-        !safeRead(itemReference, 0, nativeItem) || !nativeItem) return std::nullopt;
+    if (!safeRead(stack, layout.itemCountOffset, count))
+        return EquipmentReadStatus::Failed;
+    if (count == 0) return EquipmentReadStatus::Empty;
+    if (!safeRead(stack, layout.itemReferenceOffset, itemReference) || !itemReference ||
+        !safeRead(itemReference, 0, nativeItem) || !nativeItem)
+        return EquipmentReadStatus::Failed;
     item.count = count;
     const auto* id = static_cast<const std::byte*>(nativeItem) + layout.itemNamespacedIdOffset;
     if (!copyNativeString(id, item.identifier, layout, layout.maxStringBytes))
-        return std::nullopt;
+        return EquipmentReadStatus::Failed;
     if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
         item.identifier.insert(0, "minecraft:");
     // The display name is cached by item identifier, so the native resolver
     // runs only for the first observation of each item type.
     const auto itemConfig = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
     if (itemConfig && itemConfig->showHeldItems) populateItemDisplayName(stack, item);
-    if (!item.valid()) return std::nullopt;
-    return item;
+    if (!item.valid()) return EquipmentReadStatus::Failed;
+    *output = std::move(item);
+    return EquipmentReadStatus::Item;
+}
+
+std::optional<bedrock::ItemStack> TabListGameAccess::equipmentItem(
+    void* actor, bedrock::EquipmentSlot slot) const {
+    bedrock::ItemStack item;
+    return readEquipmentItem(actor, slot, &item) == EquipmentReadStatus::Item
+        ? std::optional<bedrock::ItemStack>{std::move(item)} : std::nullopt;
 }
 
 std::size_t TabListGameAccess::localInventorySize(void* player) const {
@@ -1278,40 +1338,18 @@ std::string matchPlayerNameFromTag(
     return {};
 }
 
-bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
+bool collectRowsUnsafe(std::vector<PlayerRow>& rows,
+                       const std::vector<std::string>& playerNames,
+                       std::size_t begin, std::size_t end,
                        bool sortByNameColor, bool gamemodeCheck,
                        bool murderDetect,
                        bool debug,
                        const std::unordered_map<std::string, tablist::MurderRole>& murderRoles,
                        const std::unordered_set<std::string>& spectators,
                        const std::vector<ActorNameTagEntry>& actorTags) {
-    void* level = levelInstance.load(std::memory_order_acquire);
-    if (!level) {
-        if (!tryAcquireLevelFromClient()) return false;
-        level = levelInstance.load(std::memory_order_acquire);
-        if (!level) return false;
-    }
-    if (!gameApi) return false;
-    const auto playerNames = gameApi->world(level).getPlayerNames();
-    if (playerNames.size() > 512) return false;
-
-    NativePlayerList* nativePlayers = nullptr;
-    std::unordered_map<std::string, const NativePlayerListEntry*> faceEntries;
-    if (includeFaces && safeRead(level, levelPlayerListOffset, nativePlayers) &&
-        nativePlayers && readable(nativePlayers, sizeof(NativePlayerList)) &&
-        nativePlayers->size() <= 512) {
-        faceEntries.reserve(nativePlayers->size());
-        for (const auto& item : *nativePlayers) {
-            const auto& nativeName = item.second.name;
-            if (nativeName.empty() || nativeName.size() > 128 ||
-                !readable(nativeName.data(), nativeName.size())) continue;
-            auto plain = tablist::stripMinecraftFormatting(nativeName);
-            if (!plain.empty()) faceEntries.try_emplace(std::move(plain), &item.second);
-        }
-    }
-    rows.clear();
-    rows.reserve(playerNames.size());
-    for (const auto& nativeName : playerNames) {
+    if (begin > end || end > playerNames.size()) return false;
+    for (std::size_t index = begin; index < end; ++index) {
+        const auto& nativeName = playerNames[index];
         const auto length = nativeName.size();
         if (length == 0 || length > 128 || !readable(nativeName.data(), length)) continue;
         PlayerRow row;
@@ -1321,7 +1359,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
             const auto role = murderRoles.find(row.name);
             if (role != murderRoles.end()) row.murderRole = role->second;
         }
-        row.spectator = gamemodeCheck && spectatorPlayers.contains(row.name);
+        row.spectator = gamemodeCheck && spectators.contains(row.name);
         if (sortByNameColor) {
             bool foundColor = false;
             bool bestWasExact = false;
@@ -1379,28 +1417,35 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows, bool includeFaces,
                            bestWasExact ? "exact" : "none", ")");
             }
         }
-        if (includeFaces) {
-            const auto face = faceEntries.find(row.name);
-            if (face != faceEntries.end()) extractFace(*face->second, row);
-        }
         rows.push_back(std::move(row));
     }
-    std::stable_sort(rows.begin(), rows.end(), [sortByNameColor](const auto& left, const auto& right) {
-        if (sortByNameColor && left.nameColorOrder != right.nameColorOrder)
-            return left.nameColorOrder < right.nameColorOrder;
-        return std::lexicographical_compare(
-            left.name.begin(), left.name.end(), right.name.begin(), right.name.end(),
-            [](unsigned char a, unsigned char b) {
-                return std::tolower(a) < std::tolower(b);
-            });
-    });
-    rows.erase(std::unique(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
-        return left.name == right.name;
-    }), rows.end());
     return true;
 }
 
-bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
+bool copyPlayerNamesUnsafe(std::vector<std::string>& names) {
+    void* level = levelInstance.load(std::memory_order_acquire);
+    if (!level) {
+        if (!tryAcquireLevelFromClient()) return false;
+        level = levelInstance.load(std::memory_order_acquire);
+    }
+    if (!level || !gameApi) return false;
+    names = gameApi->world(level).getPlayerNames();
+    return names.size() <= 512;
+}
+
+bool copyPlayerNames(std::vector<std::string>* names) noexcept {
+    if (!names) return false;
+    __try {
+        return copyPlayerNamesUnsafe(*names);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        names->clear();
+        return false;
+    }
+}
+
+bool collectRowsChunk(std::vector<PlayerRow>& rows,
+                 const std::vector<std::string>& playerNames,
+                 std::size_t begin, std::size_t end,
                  bool sortByNameColor, bool gamemodeCheck,
                  bool murderDetect, bool debug,
                  const std::unordered_map<std::string, tablist::MurderRole>& murderRoles,
@@ -1409,11 +1454,56 @@ bool collectRows(std::vector<PlayerRow>& rows, bool includeFaces,
     // Keep SEH outside the function that owns C++ objects. A player joining or
     // leaving during the read cannot crash Minecraft; that frame is skipped.
     __try {
-        return collectRowsUnsafe(rows, includeFaces, sortByNameColor, gamemodeCheck, murderDetect,
+        return collectRowsUnsafe(rows, playerNames, begin, end, sortByNameColor, gamemodeCheck, murderDetect,
                                  debug, murderRoles, spectators, actorTags);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         rows.clear();
         return false;
+    }
+}
+
+void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexcept {
+    try {
+        constexpr std::size_t batchSize = 8;
+        build->rows.reserve(build->names.size());
+        for (std::size_t begin = 0; begin < build->names.size(); begin += batchSize) {
+            const auto end = std::min(begin + batchSize, build->names.size());
+            if (!collectRowsChunk(build->rows, build->names, begin, end,
+                    build->config->sortByNameColor, build->config->gamemodeCheck,
+                    build->config->murderDetect, build->config->debug,
+                    build->roles, build->spectators, build->actorTags)) {
+                build->failed = true;
+                break;
+            }
+            // Let other client work run between small batches.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!build->failed) {
+            const auto config = build->config;
+            std::stable_sort(build->rows.begin(), build->rows.end(),
+                [config](const auto& left, const auto& right) {
+                    if (config->sortByNameColor &&
+                        left.nameColorOrder != right.nameColorOrder)
+                        return left.nameColorOrder < right.nameColorOrder;
+                    return std::lexicographical_compare(
+                        left.name.begin(), left.name.end(),
+                        right.name.begin(), right.name.end(),
+                        [](unsigned char a, unsigned char b) {
+                            return std::tolower(a) < std::tolower(b);
+                        });
+                });
+            build->rows.erase(std::unique(build->rows.begin(), build->rows.end(),
+                [](const auto& left, const auto& right) {
+                    return left.name == right.name;
+                }), build->rows.end());
+        }
+    } catch (...) {
+        build->failed = true;
+    }
+    {
+        std::lock_guard lock(tabRowsWorkerMutex);
+        completedTabRowsBuild = build;
+        tabRowsWorkerDone = true;
     }
 }
 
@@ -1476,55 +1566,82 @@ void refreshOneCachedFace(const std::shared_ptr<const tablist::Config>& config) 
 void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) noexcept {
     if (!config || !config->enabled) return;
     try {
-        std::vector<PlayerRow> rows;
-        std::vector<ActorNameTagEntry> actorTags;
-        std::unordered_map<std::string, tablist::MurderRole> murderRoles;
-        std::unordered_set<std::string> spectators;
-        std::unordered_map<std::string, std::string> heldItems;
-        if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
+        const auto world = levelInstance.load(std::memory_order_acquire);
+        std::shared_ptr<TabRowsBuild> completed;
+        bool workerDone = false;
+        {
+            std::lock_guard lock(tabRowsWorkerMutex);
+            workerDone = tabRowsWorkerDone;
+            if (workerDone) {
+                completed = std::move(completedTabRowsBuild);
+                tabRowsWorkerDone = false;
+            }
+        }
+        if (workerDone && tabRowsWorker.joinable()) tabRowsWorker.join();
+        if (completed && !completed->failed && completed->world == world &&
+            completed->config == config) {
+            auto& rows = completed->rows;
+            std::unordered_map<std::string, std::string> heldItems;
+            std::lock_guard writeLock(cachedTabRowsWriteMutex);
+            if (config->murderDetect) {
+                std::lock_guard stateLock(murderDetectMutex);
+                if (config->showHeldItems) {
+                    heldItems = heldItemNamesByPlayer;
+                    for (auto& row : rows) {
+                        const auto item = heldItems.find(row.name);
+                        if (item != heldItems.end()) row.heldItemName = item->second;
+                    }
+                } else {
+                    heldItemNamesByPlayer.clear();
+                }
+            }
+            const auto previous = std::atomic_load_explicit(
+                &cachedTabRows, std::memory_order_acquire);
+            if (config->showFaces && previous) {
+                for (auto& row : rows) {
+                    const auto old = std::find_if(previous->begin(), previous->end(),
+                        [&](const PlayerRow& candidate) { return candidate.name == row.name; });
+                    if (old != previous->end() && old->hasFace) {
+                        row.face = old->face;
+                        row.hasFace = true;
+                    }
+                }
+            }
+            auto snapshot = std::make_shared<const std::vector<PlayerRow>>(std::move(rows));
+            std::atomic_store_explicit(&cachedTabRows, std::move(snapshot),
+                                       std::memory_order_release);
+            if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
+                diagnostic("TabList row cache ready; renderer uses cached rows only");
+        }
+
+        // If a background build is still running, keep rendering the last
+        // immutable cache and do not enqueue another copy of the same work.
+        if (tabRowsWorker.joinable()) return;
+        const auto nowMs = steadyMilliseconds();
+        if (tabRowsLastStartedMs != 0 && nowMs - tabRowsLastStartedMs < 1000) return;
+
+        auto next = std::make_shared<TabRowsBuild>();
+        next->world = world;
+        next->config = config;
+        if (!copyPlayerNames(&next->names)) return;
+        if (config->sortByNameColor) next->actorTags = snapshotSdkActorNameTags();
         if (config->murderDetect || config->gamemodeCheck) {
             std::lock_guard lock(murderDetectMutex);
             if (config->murderDetect) {
                 pruneExpiredMurderRolesLocked(std::chrono::steady_clock::now());
-                murderRoles = murderRolesByPlayer;
+                next->roles = murderRolesByPlayer;
             }
-            if (config->gamemodeCheck) spectators = spectatorPlayers;
+            if (config->gamemodeCheck) next->spectators = spectatorPlayers;
         }
-        if (!collectRows(rows, false, config->sortByNameColor, config->gamemodeCheck,
-                         config->murderDetect, config->debug, murderRoles, spectators,
-                         actorTags)) {
-            return; // Keep the previous immutable snapshot on a transient read failure.
+        {
+            std::lock_guard lock(tabRowsWorkerMutex);
+            completedTabRowsBuild.reset();
+            tabRowsWorkerDone = false;
         }
-        std::lock_guard writeLock(cachedTabRowsWriteMutex);
-        if (config->murderDetect) {
-            std::lock_guard stateLock(murderDetectMutex);
-            if (config->showHeldItems) {
-                heldItems = heldItemNamesByPlayer;
-                for (auto& row : rows) {
-                    const auto item = heldItems.find(row.name);
-                    if (item != heldItems.end()) row.heldItemName = item->second;
-                }
-            } else {
-                heldItemNamesByPlayer.clear();
-            }
-        }
-        const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
-        if (config->showFaces && previous) {
-            for (auto& row : rows) {
-                const auto old = std::find_if(previous->begin(), previous->end(),
-                    [&](const PlayerRow& candidate) { return candidate.name == row.name; });
-                if (old != previous->end() && old->hasFace) {
-                    row.face = old->face;
-                    row.hasFace = true;
-                }
-            }
-        }
-        auto snapshot = std::make_shared<const std::vector<PlayerRow>>(std::move(rows));
-        std::atomic_store_explicit(&cachedTabRows, std::move(snapshot), std::memory_order_release);
-        if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
-            diagnostic("TabList row cache ready; renderer uses cached rows only");
+        tabRowsLastStartedMs = nowMs;
+        tabRowsWorker = std::thread(buildTabRowsInBackground, std::move(next));
     } catch (...) {
-        // Cache construction is best-effort and never runs from the render callback.
+        // Preserve the last complete snapshot if copying or worker startup fails.
     }
 }
 
@@ -1564,6 +1681,7 @@ struct ActorMurderSnapshot {
     bool isPlayer = false;
     std::string name;
     std::optional<bedrock::HeldItemInfo> item;
+    bool handEmpty = false;
     bool hasGameType = false;
     bool spectator = false;
 };
@@ -1580,7 +1698,11 @@ void readActorMurderSnapshot(void* actor,
     } else if (readItem) {
         // Inspect one runtime Actor at a time. Check its equipment before doing
         // name/identity work so Actors with no held stack stay on the cheap path.
-        snapshot.item = gameApi->actor(actor).getMainHand();
+        bedrock::ItemStack heldItem;
+        const auto handStatus = readEquipmentItem(
+            actor, bedrock::EquipmentSlot::MainHand, &heldItem);
+        if (handStatus == EquipmentReadStatus::Item) snapshot.item = std::move(heldItem);
+        snapshot.handEmpty = handStatus == EquipmentReadStatus::Empty;
         itemRead = true;
         if (snapshot.item || readGameMode) {
             const auto identity = gameApi->actor(actor).getIdentity();
@@ -1592,8 +1714,13 @@ void readActorMurderSnapshot(void* actor,
         snapshot.isPlayer = identity.isPlayer;
         if (snapshot.isPlayer) snapshot.name = identity.name;
     }
-    if (readItem && !itemRead && snapshot.isPlayer)
-        snapshot.item = gameApi->actor(actor).getMainHand();
+    if (readItem && !itemRead && snapshot.isPlayer) {
+        bedrock::ItemStack heldItem;
+        const auto handStatus = readEquipmentItem(
+            actor, bedrock::EquipmentSlot::MainHand, &heldItem);
+        if (handStatus == EquipmentReadStatus::Item) snapshot.item = std::move(heldItem);
+        snapshot.handEmpty = handStatus == EquipmentReadStatus::Empty;
+    }
     if (readGameMode) {
         std::int32_t gameType = -1;
         snapshot.hasGameType = snapshot.isPlayer && readActorGameType(actor, gameType);
@@ -1656,6 +1783,7 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
                 copied.name = actorLabel.str();
             }
             copied.hasItem = item.has_value();
+            copied.handEmpty = readItems && snapshot.handEmpty;
             copied.hasGameType = snapshot.hasGameType;
             copied.spectator = snapshot.spectator;
             if (item) {
@@ -1843,21 +1971,28 @@ void __fastcall onLevelSubTick(void* level) {
         faceRefreshCadence = 0;
         refreshOneCachedFace(config);
     }
-    static unsigned murderScanCadence = 0;
+    static auto nextMurderScan = std::chrono::steady_clock::time_point{};
+    static unsigned lastMurderScanIntervalMs = 0;
     if (config->murderDetect || config->gamemodeCheck) {
         refreshTrackedMurderActors(level);
-        if (++murderScanCadence >= config->murderScanIntervalTicks) {
-            murderScanCadence = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (lastMurderScanIntervalMs != config->murderScanIntervalMs) {
+            lastMurderScanIntervalMs = config->murderScanIntervalMs;
+            nextMurderScan = now;
+        }
+        if (now >= nextMurderScan) {
+            // Schedule from the current time rather than catching up after a
+            // slow frame, so native equipment reads can never burst together.
+            nextMurderScan = now +
+                std::chrono::milliseconds(config->murderScanIntervalMs);
             updateMurderDetection(config->murderDetect, config->gamemodeCheck);
         }
     } else {
-        murderScanCadence = 0;
+        nextMurderScan = {};
+        lastMurderScanIntervalMs = 0;
     }
-    static unsigned rowsCacheTicks = 0;
-    if (++rowsCacheTicks >= 20) {
-        rowsCacheTicks = 0;
-        refreshTabRowsCache(config);
-    }
+    // Build the PlayerList snapshot in small batches across game ticks.
+    refreshTabRowsCache(config);
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
@@ -1885,6 +2020,33 @@ void BDS_HOOK_CALL levelMiddleware(void*, void* raw, BDS_HookNext next, void* fr
     const auto old = levelFrame; levelFrame = {next, frame};
     onLevelSubTick(args->level);
     levelFrame = old;
+}
+
+void drawFacePixels(ImDrawList* draw, const std::array<std::uint32_t, 64>& face,
+                    float x, float y, float size) {
+    if (!draw) return;
+    std::size_t visiblePixels = 0;
+    for (const auto color : face)
+        if ((color & 0xFFU) != 0) ++visiblePixels;
+    if (visiblePixels == 0) return;
+
+    draw->PrimReserve(static_cast<int>(visiblePixels * 6),
+                      static_cast<int>(visiblePixels * 4));
+    const float pixelSize = size / 8.0f;
+    for (std::size_t py = 0; py < 8; ++py) {
+        for (std::size_t px = 0; px < 8; ++px) {
+            const auto value = face[py * 8 + px];
+            if ((value & 0xFFU) == 0) continue;
+            const auto color = IM_COL32((value >> 24) & 0xFF,
+                                        (value >> 16) & 0xFF,
+                                        (value >> 8) & 0xFF,
+                                        value & 0xFF);
+            const ImVec2 topLeft{x + static_cast<float>(px) * pixelSize,
+                                 y + static_cast<float>(py) * pixelSize};
+            draw->PrimRect(topLeft,
+                           {topLeft.x + pixelSize, topLeft.y + pixelSize}, color);
+        }
+    }
 }
 
 void drawTabList(void*) {
@@ -2009,23 +2171,7 @@ void drawTabList(void*) {
         if (config->showFaces && players[i].hasFace) {
             const float faceX = textX;
             const float faceY = y + (config->rowHeight - config->faceSize) * 0.5f;
-            const float pixelSize = config->faceSize / 8.0f;
-            for (std::size_t py = 0; py < 8; ++py) {
-                std::size_t runStart = 0;
-                while (runStart < 8) {
-                    const auto value = players[i].face[py * 8 + runStart];
-                    std::size_t runEnd = runStart + 1;
-                    while (runEnd < 8 && players[i].face[py * 8 + runEnd] == value)
-                        ++runEnd;
-                    const ImU32 color = IM_COL32((value >> 24) & 0xFF,
-                                                 (value >> 16) & 0xFF,
-                                                 (value >> 8) & 0xFF, value & 0xFF);
-                    draw->AddRectFilled(
-                        {faceX + runStart * pixelSize, faceY + py * pixelSize},
-                        {faceX + runEnd * pixelSize, faceY + (py + 1) * pixelSize}, color);
-                    runStart = runEnd;
-                }
-            }
+            drawFacePixels(draw, players[i].face, faceX, faceY, config->faceSize);
             textX += config->faceSize + 7.0f;
         } else {
             draw->AddCircleFilled({textX + 2.5f, y + config->rowHeight * 0.5f},
@@ -2422,6 +2568,7 @@ DWORD WINAPI startClient(void*) {
         }
     }
 
+    if (tabRowsWorker.joinable()) tabRowsWorker.join();
     bedrock::gui::Overlay::shutdown();
     removeNativeHooks();
     status.store(Status::Stopped, std::memory_order_release);

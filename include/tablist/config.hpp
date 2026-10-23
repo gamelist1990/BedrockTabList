@@ -20,7 +20,7 @@ struct Config {
     bool showHeldItems = true;
     bool gamemodeCheck = true;
     bool debug = false;
-    unsigned murderScanIntervalTicks = 3;
+    unsigned murderScanIntervalMs = 400;
     Color background{0.039f, 0.051f, 0.078f, 0.80f};
     Color text{0.949f, 0.961f, 0.984f, 1.0f};
     Color accent{0.392f, 0.863f, 0.608f, 1.0f};

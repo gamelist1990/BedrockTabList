@@ -18,7 +18,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - MurderDetectはLevelのRuntimeActorListを順送りし、手持ちのネイティブ読み取りを最大1 Actor/tickに制限（読み取りはゲームスレッド上で実行）。名前が未解決のActorもアイテム確認対象にし、アイテム保持時にだけSDK identityを解決
 - Sheriff／Murdererは最後の検知から5分間保持し、期間内に再検知した場合は期限を延長
 - Actorの装備コンポーネント／手持ち枠の読み取りで例外が出た対象はスキップし、後続Actorの走査を継続
-- TabListの行・色・役割はゲーム更新中に1秒間隔でキャッシュを作り直し、顔画像はtickごとに1人ずつ追加。Tab表示時はキャッシュだけを描画
+- TabListの行・色・役割はゲームスレッドでコピーした値だけをワーカーが最大8行ずつ処理し、完成後にまとめてキャッシュを交換。顔画像はtickごとに1人ずつ追加。Tab表示時はキャッシュだけを描画
 - 16人を超える場合は自動的に複数列へ分割
 - メニュー、チャット、インベントリでは自動的に非表示
 - Minecraftの `Keyboard::feed(InputKey, down)` を直接使用
@@ -45,7 +45,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
   "murder_detect": true,
   "show_held_items": true,
   "gamemode_check": true,
-  "murder_scan_interval_ticks": 3,
+  "murder_scan_interval_ms": 400,
   "debug": false,
   "background_color": "#0A0D14CC",
   "text_color": "#F2F5FBFF",
@@ -72,13 +72,12 @@ MurderDetectとGamemodeCheckのActor一覧は、SDKアダプターから `Level:
 
 `murder_detect` は手持ちの弓・矢・`hivemurder:magnifying_glass_item` を `[Sheriff]`（水色）、IDが `hivemurder:murder_weapon_*` または `hivemurder:zapper_ray_gun` のアイテム、バニラの剣・メイスを `[Murderer]`（赤）で
 表示します。`show_held_items` は手持ち名をTabListに表示する設定です。`false` にすると表示名の取得・キャッシュ・描画を止め、MurderDetectはItem IDだけを使って継続します。
-Actorごとの手持ち読み出しをtick間に分散し、TabListを開いた瞬間には追加走査しません。
-`murder_scan_interval_ticks` は追跡中のActor手持ちを読む間隔（既定3、最小1、最大40 tick）です。既定値3は従来の毎tick読取に比べてNative装備読取を約3分の1に抑えます。間隔を短くすると一瞬だけ持つアイテムを拾いやすくなりますが、負荷も上がります。
-以前の既定値 `20` が残る設定ファイルは `3` として読み込み、その他の明示値は保持します。
+Actorごとの手持ち読み出しを実時間間隔で分散し、TabListを開いた瞬間には追加走査しません。
+`murder_scan_interval_ms` は追跡中のActor手持ちを読む間隔（既定400ms、最小250ms、最大2000ms）です。1回に読むActorは最大1人です。読み取り時刻は前回処理が遅れても追いつき実行せず、次の間隔を現在時刻から数え直します。以前のtick設定 `3` と `20` は400msに、その他のtick設定は50ms単位に変換して範囲内へ収めます。短時間だけ表示されるアイテムを見落とす可能性は上がりますが、ゲームスレッド上の読み取り頻度を下げ、安定性を優先しています。
 Actor一覧はLevelのRuntimeActorListから2秒ごとに取得します。各Actorの `RuntimeIDComponent` をSDKの `Actor::getRuntimeId()` で読み、以後の名前キャッシュとラウンドロビン順序のキーに使います。これはEnTTのentity IDやActorUniqueIDとは別のBedrock RuntimeIDです。Hookでコピー済みのSDK NameTagスナップショットは最初のActorとPlayerList名の照合に使います。一度一致した後はActorポインタが変わってもRuntimeIDで名前対応を保持します。RuntimeIDを読めないActorや重複IDはポインタを予備キーとして使います。手持ちの読み取り対象はPlayerList名と照合できたActorに絞り、その他のエンティティの装備を読みません。NameTagが一度も観測されずPlayerList名と結び付いていないActorは対象外です。役割判定は表示名でなくItem IDで行います。手持ちのNative readは
-1回の走査につき最大1 Actorに制限し、読み取りはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player` / `name` / `id` / `role` / `previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。`show_held_items=false` の場合は表示名のNative解決を省き、ログの`name`欄はItem IDになります。
-アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
-これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。
+1回の走査につき最大1 Actorに制限し、読み取りはゲームスレッドで行います。新しいアイテムIDの表示名をNative解決する処理も最大500msに1回に制限し、同じIDの名前はキャッシュを使います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player` / `name` / `id` / `role` / `previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。`show_held_items=false` の場合は表示名のNative解決を省き、ログの`name`欄はItem IDになります。
+アイテムの読み取り失敗では最後に確認できた表示を保ちます。getterが正常に空を返すかスタック数0を確認できた場合は、素手として前の表示を消します。
+一時的なNative read失敗と本当の空スロットを分け、表示の残留と一時的なちらつきを防ぎます。
 アイテム名には、1.26.52.3の検証済み `ItemStackBase::getHoverName` から取得した表示名を使い、Item IDごとにキャッシュします。取得できない場合のみItem IDを名前欄に表示します。Minecraftの装飾コードと `[Use]` などの操作ヒントを除いた名前だけを表示・記録します。アイテム名はNative read後にワーカーから行キャッシュへ反映するため、次の全行更新を待たずに表示されます。色遷移の詳細ログは `debug=true` の場合に限ります。MurderDetectのrosterログはプレイヤー人数変更時と10秒ごとに制限し、Actor数の小刻みな変動では毎秒出力しません。
 
 ワーカースレッドへActorポインタやSDKハンドルは渡しません。MinecraftがActor/EnTTを更新・破棄するタイミングと競合するため、Native read自体を別スレッドへ移すことはしていません。顔画像の取得も4tickに1回までに制限します。RuntimeID component hashは1.26.52.3の実行ファイルで確認済みですが、値を64-bit/offset 0として読む配置は候補で、実機での一致確認が必要です。RuntimeIDとPlayerList entry IDの直接照合は行わず、NameTagで得たプレイヤー名をRuntimeIDに関連付けます。1.26.52.3のNative item layoutも候補値のため、実機での装備ID読み取り確認が必要です。
