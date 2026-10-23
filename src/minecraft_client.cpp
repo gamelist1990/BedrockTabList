@@ -174,6 +174,7 @@ struct NativeSkinImage {
 };
 struct PlayerRow {
     std::string name;
+    std::string heldItemName;
     unsigned nameColorOrder = 28;
     bool hasNameColor = false;
     tablist::MurderRole murderRole = tablist::MurderRole::None;
@@ -228,6 +229,7 @@ std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
 std::unordered_set<std::string> spectatorPlayers;
 std::unordered_map<std::string, std::chrono::steady_clock::time_point> murderRoleExpiryByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
+std::unordered_map<std::string, std::string> heldItemNamesByPlayer;
 struct MurderSample {
     std::string name;
     std::string identifier;
@@ -255,8 +257,10 @@ std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
 std::uint64_t murderActorSnapshotTick = 0;
-std::size_t murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
-bool loggedMurderRosterReady{};
+std::size_t lastLoggedMurderActorCount = std::numeric_limits<std::size_t>::max();
+std::size_t lastLoggedMurderPlayerActorCount = std::numeric_limits<std::size_t>::max();
+std::size_t lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
+std::int64_t lastMurderRosterStatusLogMs{};
 std::atomic<bool> loggedMurderActorReadFault{false};
 
 void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
@@ -271,6 +275,7 @@ void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
 }
 std::size_t cachedFaceCursor = 0;
 const std::vector<PlayerRow>* cachedFaceSource = nullptr;
+std::mutex cachedTabRowsWriteMutex;
 std::shared_ptr<const std::vector<PlayerRow>> cachedTabRows{
     std::make_shared<const std::vector<PlayerRow>>()};
 std::atomic<bool> loggedTabRowsReady{false};
@@ -358,6 +363,27 @@ void diagnostic(Args&&... args) {
     diagnosticLog.flush();
 }
 
+void publishHeldItemName(const std::string& playerName,
+                         const std::string& displayName) noexcept {
+    try {
+        std::lock_guard writeLock(cachedTabRowsWriteMutex);
+        const auto current = std::atomic_load_explicit(&cachedTabRows,
+                                                       std::memory_order_acquire);
+        if (!current || current->empty()) return;
+        const auto found = std::find_if(current->begin(), current->end(),
+            [&](const PlayerRow& row) { return row.name == playerName; });
+        if (found == current->end() || found->heldItemName == displayName) return;
+        auto updated = std::make_shared<std::vector<PlayerRow>>(*current);
+        (*updated)[static_cast<std::size_t>(std::distance(current->begin(), found))]
+            .heldItemName = displayName;
+        std::atomic_store_explicit(&cachedTabRows,
+            std::shared_ptr<const std::vector<PlayerRow>>(std::move(updated)),
+            std::memory_order_release);
+    } catch (...) {
+        // Rendering remains on the last immutable row snapshot on allocation failure.
+    }
+}
+
 void processMurderSample(const MurderSample& sample) noexcept {
     try {
         std::string itemKey = sample.identifier.empty()
@@ -371,6 +397,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
 
         bool changed = false;
         std::string previous;
+        std::string currentDisplay;
         {
             std::lock_guard lock(murderDetectMutex);
             const auto now = std::chrono::steady_clock::now();
@@ -380,6 +407,18 @@ void processMurderSample(const MurderSample& sample) noexcept {
             if (!itemKey.empty()) {
                 changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
                 lastHeldItemByPlayer.insert_or_assign(sample.name, itemKey);
+            }
+            if (sample.hasItem) {
+                std::string display = sample.displayName.empty()
+                    ? sample.identifier : sample.displayName;
+                if (display.size() > 40) {
+                    display.resize(37);
+                    display += "...";
+                }
+                if (!display.empty()) {
+                    currentDisplay = std::move(display);
+                    heldItemNamesByPlayer.insert_or_assign(sample.name, currentDisplay);
+                }
             }
             if (role != tablist::MurderRole::None) {
                 murderRolesByPlayer.insert_or_assign(sample.name, role);
@@ -391,6 +430,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
                 else spectatorPlayers.erase(sample.name);
             }
         }
+        if (!currentDisplay.empty()) publishHeldItemName(sample.name, currentDisplay);
         if (changed && sample.hasItem) {
             const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
                 : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
@@ -1286,8 +1326,15 @@ void refreshOneCachedFace(const std::shared_ptr<const tablist::Config>& config) 
             auto updated = std::make_shared<std::vector<PlayerRow>>(*current);
             if (!fillOneFaceSeh(levelInstance.load(std::memory_order_acquire),
                                 &(*updated)[index])) return;
+            std::lock_guard writeLock(cachedTabRowsWriteMutex);
+            current = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
+            if (!current || index >= current->size() || (*current)[index].name !=
+                (*updated)[index].name) return;
+            auto faceUpdated = std::make_shared<std::vector<PlayerRow>>(*current);
+            (*faceUpdated)[index].face = (*updated)[index].face;
+            (*faceUpdated)[index].hasFace = (*updated)[index].hasFace;
             std::atomic_store_explicit(&cachedTabRows,
-                std::shared_ptr<const std::vector<PlayerRow>>(std::move(updated)),
+                std::shared_ptr<const std::vector<PlayerRow>>(std::move(faceUpdated)),
                 std::memory_order_release);
             return; // Exactly one native skin/face read per game tick.
         }
@@ -1303,6 +1350,7 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
         std::vector<ActorNameTagEntry> actorTags;
         std::unordered_map<std::string, tablist::MurderRole> murderRoles;
         std::unordered_set<std::string> spectators;
+        std::unordered_map<std::string, std::string> heldItems;
         if (config->sortByNameColor) actorTags = snapshotSdkActorNameTags();
         if (config->murderDetect || config->gamemodeCheck) {
             std::lock_guard lock(murderDetectMutex);
@@ -1316,6 +1364,15 @@ void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) n
                          config->murderDetect, config->debug, murderRoles, spectators,
                          actorTags)) {
             return; // Keep the previous immutable snapshot on a transient read failure.
+        }
+        std::lock_guard writeLock(cachedTabRowsWriteMutex);
+        if (config->murderDetect) {
+            std::lock_guard stateLock(murderDetectMutex);
+            heldItems = heldItemNamesByPlayer;
+            for (auto& row : rows) {
+                const auto item = heldItems.find(row.name);
+                if (item != heldItems.end()) row.heldItemName = item->second;
+            }
         }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
         if (config->showFaces && previous) {
@@ -1483,8 +1540,10 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             murderActorSnapshotTick = 19; // First live roster is ready immediately.
-            murderTrackedActorCount = std::numeric_limits<std::size_t>::max();
-            loggedMurderRosterReady = false;
+            lastLoggedMurderActorCount = std::numeric_limits<std::size_t>::max();
+            lastLoggedMurderPlayerActorCount = std::numeric_limits<std::size_t>::max();
+            lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
+            lastMurderRosterStatusLogMs = 0;
         }
         // Keep the native Level actor-list walk off the hot path. Name-tag
         // observations can arrive in large bursts while players render, so
@@ -1506,48 +1565,66 @@ void refreshTrackedMurderActors(void* level) noexcept {
         actorHandles.erase(std::unique(actorHandles.begin(), actorHandles.end()),
                            actorHandles.end());
 
-        murderPlayerNames.clear();
+        std::vector<std::string> playerNames;
         for (const auto& name : gameApi->world(level).getPlayerNames()) {
             auto plainName = tablist::stripMinecraftFormatting(name);
             if (!plainName.empty() && plainName.size() <= 128)
-                murderPlayerNames.push_back(std::move(plainName));
+                playerNames.push_back(std::move(plainName));
         }
-        std::sort(murderPlayerNames.begin(), murderPlayerNames.end(),
+        std::sort(playerNames.begin(), playerNames.end(),
             [](const std::string& left, const std::string& right) {
                 return left.size() > right.size();
             });
-        murderPlayerNames.erase(std::unique(murderPlayerNames.begin(), murderPlayerNames.end()),
-                                murderPlayerNames.end());
+        playerNames.erase(std::unique(playerNames.begin(), playerNames.end()),
+                          playerNames.end());
 
         // Keep only runtime Actors whose copied name tag identifies a current
         // PlayerList entry. This moves the string matching and non-player
         // filtering to the once-per-second roster refresh instead of doing it
         // for every sampled entity on every tick.
         std::vector<MurderActorEntry> playerActors;
-        playerActors.reserve(murderPlayerNames.size());
+        playerActors.reserve(playerNames.size());
         for (auto* actor : actorHandles) {
             std::string nameTag;
             if (!copyActorNameTag(actor, &nameTag)) continue;
             const auto plainTag = tablist::stripMinecraftFormatting(nameTag);
-            const auto player = std::find_if(murderPlayerNames.begin(),
-                murderPlayerNames.end(), [&](const std::string& playerName) {
+            const auto player = std::find_if(playerNames.begin(),
+                playerNames.end(), [&](const std::string& playerName) {
                     return containsNameIgnoreCase(plainTag, playerName);
                 });
-            if (player != murderPlayerNames.end())
+            if (player != playerNames.end())
                 playerActors.push_back({actor, *player});
         }
-        std::vector<std::uintptr_t> handles;
-        handles.reserve(playerActors.size());
-        for (const auto& actor : playerActors)
-            handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
-        murderScanActors = std::move(playerActors);
-        murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
-        if (!loggedMurderRosterReady) {
-            murderTrackedActorCount = actorHandles.size();
-            loggedMurderRosterReady = true;
-            diagnostic("MurderDetect roster ready: actors=", murderTrackedActorCount,
-                       " playerActors=", murderScanActors.size(),
-                       " players=", murderPlayerNames.size());
+        if (!playerNames.empty() && !playerActors.empty()) {
+            std::vector<std::uintptr_t> handles;
+            handles.reserve(playerActors.size());
+            for (const auto& actor : playerActors)
+                handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
+            murderPlayerNames = std::move(playerNames);
+            murderScanActors = std::move(playerActors);
+            murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
+            const auto actorCount = actorHandles.size();
+            const auto playerActorCount = murderScanActors.size();
+            if (actorCount != lastLoggedMurderActorCount ||
+                playerActorCount != lastLoggedMurderPlayerActorCount ||
+                murderPlayerNames.size() != lastLoggedMurderPlayerCount) {
+                lastLoggedMurderActorCount = actorCount;
+                lastLoggedMurderPlayerActorCount = playerActorCount;
+                lastLoggedMurderPlayerCount = murderPlayerNames.size();
+                diagnostic("MurderDetect roster updated: actors=", actorCount,
+                           " playerActors=", playerActorCount,
+                           " players=", murderPlayerNames.size());
+            }
+            lastMurderRosterStatusLogMs = steadyMilliseconds();
+        } else {
+            const auto now = steadyMilliseconds();
+            if (lastMurderRosterStatusLogMs == 0 ||
+                now - lastMurderRosterStatusLogMs >= 5000) {
+                diagnostic("MurderDetect waiting for live roster: actors=",
+                           actorHandles.size(), " playerNames=", playerNames.size(),
+                           " matchedActors=", playerActors.size());
+                lastMurderRosterStatusLogMs = now;
+            }
         }
     } catch (...) {
         // Keep the last good roster if native enumeration transiently fails.
@@ -1671,7 +1748,7 @@ void drawTabList(void*) {
     // avoid heap allocations on every DXGI frame while Tab is held.
     std::array<float, 512> widths{};
     std::array<float, 512> columnX{};
-    struct RowTextMetrics { ImVec2 name{}, role{}, spectator{}; };
+    struct RowTextMetrics { ImVec2 name{}, role{}, spectator{}, item{}; };
     std::array<RowTextMetrics, 512> textMetrics{};
     std::fill_n(widths.begin(), layout.columns, config->minimumColumnWidth);
     for (std::size_t i = 0; i < players.size(); ++i) {
@@ -1684,8 +1761,11 @@ void drawTabList(void*) {
         metrics.role = ImGui::CalcTextSize(roleText);
         if (players[i].spectator)
             metrics.spectator = ImGui::CalcTextSize(" [Spectator]");
+        if (!players[i].heldItemName.empty())
+            metrics.item = ImGui::CalcTextSize(players[i].heldItemName.c_str());
         widths[column] = std::max(widths[column],
             metrics.name.x + metrics.role.x + metrics.spectator.x +
+            (metrics.item.x > 0.0f ? metrics.item.x + 8.0f : 0.0f) +
             horizontalPadding * 2.0f + faceArea);
     }
     float totalWidth = 0.0f;
@@ -1775,6 +1855,12 @@ void drawTabList(void*) {
             const float suffixX = textX + textSize.x + textMetrics[i].role.x;
             draw->AddText({suffixX, y + (config->rowHeight - textSize.y) * 0.5f},
                           IM_COL32(165, 170, 185, 230), " [Spectator]");
+        }
+        if (!players[i].heldItemName.empty()) {
+            const float itemX = textX + textSize.x + textMetrics[i].role.x +
+                textMetrics[i].spectator.x + 8.0f;
+            draw->AddText({itemX, y + (config->rowHeight - textMetrics[i].item.y) * 0.5f},
+                          IM_COL32(190, 198, 210, 220), players[i].heldItemName.c_str());
         }
     }
 }

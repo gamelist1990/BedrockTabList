@@ -13,6 +13,7 @@ Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルで�
 - Minecraftのスキンデータからプレイヤーの顔を表示（設定でOFF可能）
 - `Actor::getNameTag` のMinecraft `§` 色コードをPlayerListのRawNameへ照合し、設定で色順ソート可能
 - SDKの `Actor::getMainHand()` で取得した装備スナップショットからMurderDetectの役割を表示（弓=Sheriff/水色、`hivemurder:` ID=Murderer/赤）
+- 手持ちアイテムの表示名をプレイヤー名の横に表示
 - `gamemode_check` が有効ならSpectatorを灰色にし `[Spectator]` を表示
 - MurderDetectはTab表示前からPlayerListに一致したActorだけを順送りし、手持ちのネイティブ読み取りを最大1人/tickに制限（読み取りはゲームスレッド上で実行）
 - Sheriff／Murdererは最後の検知から5分間保持し、期間内に再検知した場合は期限を延長
@@ -76,7 +77,7 @@ Actor一覧はLevelのRuntimeActorListから1秒ごとに取得します。Playe
 1 tickにつき最大1人に制限し、読み取りはゲームスレッドで行います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄します。確認できたアイテムが前回から変わった時は、`TabList.log` に `player / name / id / role / previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。
 アイテムの読み取り失敗や空スロットは「空になった」と断定せず、最後に確認できたアイテムを比較基準として残します。
 これにより一時的なNative read失敗で変更ログが欠けたり、同じアイテムを再検知したりするのを防ぎます。
-アイテム名には、1.26.52.3の検証済み `ItemStackBase::getHoverName` から取得した表示名を使い、Item IDごとにキャッシュします。取得できない場合のみItem IDを名前欄に表示します。色遷移の詳細ログは `debug=true` の場合に限ります。MurderDetectのActor rosterはワールド参加ごとに一度だけ記録します。
+アイテム名には、1.26.52.3の検証済み `ItemStackBase::getHoverName` から取得した表示名を使い、Item IDごとにキャッシュします。取得できない場合のみItem IDを名前欄に表示します。アイテム名はNative read後にワーカーから行キャッシュへ反映するため、次の全行更新を待たずに表示されます。色遷移の詳細ログは `debug=true` の場合に限ります。MurderDetectのActor rosterは初回取得後、人数やマッチ結果が変わった時に記録します。
 
 ワーカースレッドへActorポインタやSDKハンドルは渡しません。MinecraftがActor/EnTTを更新・破棄するタイミングと競合するため、Native read自体を別スレッドへ移すことはしていません。1.26.52.3のNative item layoutも現在は候補値のため、実機での装備ID読み取り確認が必要です。
 これによりActor数がスナップショット更新間隔を超えても先頭に戻って後半のActorを取りこぼすことがなく、
