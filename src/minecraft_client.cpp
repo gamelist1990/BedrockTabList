@@ -24,9 +24,11 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -196,6 +198,21 @@ std::unordered_map<std::string, tablist::MurderRole> murderRolesByPlayer;
 std::unordered_map<std::string, std::chrono::steady_clock::time_point> murderRoleExpiryByPlayer;
 std::unordered_map<std::string, std::string> lastHeldItemByPlayer;
 std::unordered_set<std::string> loggedHeldItemIdentifiers;
+struct MurderSample {
+    std::string name;
+    std::string identifier;
+    std::string displayName;
+    std::string translationKey;
+    unsigned count{};
+    bool hasItem{};
+    bool debug{};
+};
+std::mutex murderQueueMutex;
+std::condition_variable murderQueueReady;
+std::deque<MurderSample> murderQueue;
+std::thread murderWorker;
+bool murderWorkerStopping{};
+std::atomic<std::uint64_t> droppedMurderSamples{0};
 std::vector<bedrock::Actor> murderScanActors;
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
@@ -296,6 +313,134 @@ void diagnostic(Args&&... args) {
     (diagnosticLog << ... << std::forward<Args>(args));
     diagnosticLog << '\n';
     diagnosticLog.flush();
+}
+
+void processMurderSample(const MurderSample& sample) noexcept {
+    try {
+        std::string itemKey = sample.identifier.empty()
+            ? sample.displayName : sample.identifier;
+        if (itemKey.size() > 256) return;
+        std::transform(itemKey.begin(), itemKey.end(), itemKey.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const auto role = sample.hasItem
+            ? tablist::murderRoleForHeldItem(sample.identifier, sample.displayName)
+            : tablist::MurderRole::None;
+
+        bool firstSeen = false;
+        bool changed = false;
+        std::string previous;
+        {
+            std::lock_guard lock(murderDetectMutex);
+            const auto now = std::chrono::steady_clock::now();
+            const auto old = lastHeldItemByPlayer.find(sample.name);
+            if (old != lastHeldItemByPlayer.end()) previous = old->second;
+            // Failed/empty stack reads do not erase the last confirmed item.
+            if (!itemKey.empty()) {
+                changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
+                lastHeldItemByPlayer.insert_or_assign(sample.name, itemKey);
+                firstSeen = loggedHeldItemIdentifiers.insert(itemKey).second;
+            }
+            if (role != tablist::MurderRole::None) {
+                murderRolesByPlayer.insert_or_assign(sample.name, role);
+                murderRoleExpiryByPlayer.insert_or_assign(
+                    sample.name, now + std::chrono::minutes(5));
+            }
+        }
+        if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
+        if (changed && sample.hasItem) {
+            const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
+                : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
+            if (previous.empty()) {
+                diagnostic("MurderDetect held item: player=", sample.name,
+                           " item=", itemKey, " count=", sample.count,
+                           " role=", roleName);
+            } else {
+                diagnostic("MurderDetect held item: player=", sample.name,
+                           " item=", itemKey, " count=", sample.count,
+                           " role=", roleName, " previous=", previous);
+            }
+        }
+        if (sample.debug && changed && sample.hasItem) {
+            diagnostic("MurderDetect actor item: player=", sample.name,
+                       " item=", itemKey,
+                       " name=", sample.displayName,
+                       " translation_key=", sample.translationKey,
+                       " count=", sample.count,
+                       previous.empty() ? "" : " previous=", previous);
+        }
+    } catch (...) {
+        // Background reporting must not terminate the worker or affect the game.
+    }
+}
+
+void murderWorkerLoop() noexcept {
+    for (;;) {
+        MurderSample sample;
+        {
+            std::unique_lock lock(murderQueueMutex);
+            murderQueueReady.wait(lock, [] {
+                return murderWorkerStopping || !murderQueue.empty();
+            });
+            if (murderWorkerStopping && murderQueue.empty()) return;
+            sample = std::move(murderQueue.front());
+            murderQueue.pop_front();
+        }
+        processMurderSample(sample);
+        const auto dropped = droppedMurderSamples.exchange(0, std::memory_order_relaxed);
+        if (dropped) diagnostic("MurderDetect worker queue dropped ", dropped,
+                                " older sample(s)");
+    }
+}
+
+bool startMurderWorker() noexcept {
+    try {
+        std::lock_guard lock(murderQueueMutex);
+        if (murderWorker.joinable()) return true;
+        murderWorkerStopping = false;
+        murderWorker = std::thread(murderWorkerLoop);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void stopMurderWorker() noexcept {
+    {
+        std::lock_guard lock(murderQueueMutex);
+        if (!murderWorker.joinable()) return;
+        murderWorkerStopping = true;
+    }
+    murderQueueReady.notify_all();
+    murderWorker.join();
+    std::lock_guard lock(murderQueueMutex);
+    murderWorkerStopping = false;
+}
+
+void enqueueMurderSample(MurderSample sample) noexcept {
+    bool processInline = false;
+    try {
+        {
+            std::lock_guard lock(murderQueueMutex);
+            if (!murderWorker.joinable() || murderWorkerStopping) {
+                processInline = true;
+            } else {
+                constexpr std::size_t maxQueuedMurderSamples = 256;
+                if (murderQueue.size() == maxQueuedMurderSamples) {
+                    murderQueue.pop_front();
+                    droppedMurderSamples.fetch_add(1, std::memory_order_relaxed);
+                }
+                murderQueue.push_back(std::move(sample));
+            }
+        }
+    } catch (...) {
+        // Queue allocation failure falls back to a bounded synchronous update.
+        processInline = true;
+    }
+    if (processInline) {
+        processMurderSample(sample);
+        return;
+    }
+    murderQueueReady.notify_one();
 }
 
 bool readable(const void* pointer, std::size_t bytes) noexcept {
@@ -1383,57 +1528,17 @@ void updateMurderDetection(bool debug) noexcept {
                 continue;
 
             const auto& item = snapshot.item;
-            const auto identifier = item ? item->identifier : std::string{};
-            const auto displayName = item ? item->displayName : std::string{};
-            std::string itemKey = identifier.empty() ? displayName : identifier;
-            if (itemKey.size() > 256) continue;
-            std::transform(itemKey.begin(), itemKey.end(), itemKey.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            const auto role = item ? tablist::murderRoleForHeldItem(identifier, displayName)
-                                   : tablist::MurderRole::None;
-
-            bool firstSeen = false;
-            bool changed = false;
-            std::string previous;
-            {
-                std::lock_guard lock(murderDetectMutex);
-                const auto now = std::chrono::steady_clock::now();
-                const auto old = lastHeldItemByPlayer.find(snapshot.name);
-                if (old != lastHeldItemByPlayer.end()) previous = old->second;
-                // A failed stack read is not proof that the hand became empty.
-                if (!itemKey.empty()) {
-                    changed = old == lastHeldItemByPlayer.end() || old->second != itemKey;
-                    lastHeldItemByPlayer.insert_or_assign(snapshot.name, itemKey);
-                    firstSeen = loggedHeldItemIdentifiers.insert(itemKey).second;
-                }
-                if (role != tablist::MurderRole::None) {
-                    murderRolesByPlayer.insert_or_assign(snapshot.name, role);
-                    murderRoleExpiryByPlayer.insert_or_assign(
-                        snapshot.name, now + std::chrono::minutes(5));
-                }
+            MurderSample copied;
+            copied.name = std::move(snapshot.name);
+            copied.hasItem = item.has_value();
+            copied.debug = debug;
+            if (item) {
+                copied.identifier = item->identifier;
+                copied.displayName = item->displayName;
+                copied.translationKey = item->translationKey;
+                copied.count = item->count;
             }
-            if (firstSeen) diagnostic("MurderDetect held-item candidate: ", itemKey);
-            if (changed && item) {
-                const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
-                    : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
-                if (previous.empty()) {
-                    diagnostic("MurderDetect held item: player=", snapshot.name,
-                               " item=", itemKey, " count=", item->count,
-                               " role=", roleName);
-                } else {
-                    diagnostic("MurderDetect held item: player=", snapshot.name,
-                               " item=", itemKey, " count=", item->count,
-                               " role=", roleName, " previous=", previous);
-                }
-            }
-            if (debug && changed && item) {
-                diagnostic("MurderDetect actor item: player=", snapshot.name,
-                           " item=", itemKey,
-                           " name=", item->getName(),
-                           " translation_key=", item->translationKey,
-                           " count=", item->count,
-                           previous.empty() ? "" : " previous=", previous);
-            }
+            enqueueMurderSample(std::move(copied));
         }
     } catch (...) {
         // Item inspection is observational; never interfere with the game tick.
@@ -1734,6 +1839,7 @@ void removeNativeHooks() noexcept {
         if (token) BDS_HookUnsubscribe(token);
         token = nullptr;
     }
+    stopMurderWorker();
     gameHooks.reset();
     gameApi.reset();
     originalKeyboardFeed.store(nullptr);
@@ -1885,19 +1991,24 @@ DWORD WINAPI startClient(void*) {
 
     if (itemLayoutAvailable) {
         nativeItemLayout = std::move(cachedItemLayout);
-        diagnostic("SDK item API ready [versioned layout; actor equipment + local inventory]");
+        diagnostic("SDK item API layout loaded [versioned candidate; actor equipment + local inventory]");
     } else {
         bedrock::NativeItemLayout embeddedItemLayout;
         std::string embeddedItemError;
         if (bedrock::parseNativeItemLayout(bedrock::generated::kSymbolDatabase,
                                            embeddedItemLayout, embeddedItemError)) {
             nativeItemLayout = std::move(embeddedItemLayout);
-            diagnostic("SDK item API ready [embedded exact-build layout]");
+            diagnostic("SDK item API layout loaded [embedded exact-build candidate]");
         } else {
             nativeItemLayout.reset();
             diagnostic("SDK item API unavailable: no versioned native item layout");
         }
     }
+
+    if (startMurderWorker())
+        diagnostic("MurderDetect worker ready [copied snapshots only; native reads stay on game thread]");
+    else
+        diagnostic("MurderDetect worker unavailable; copied-snapshot processing will use the game thread");
 
     originalKeyboardFeed.store(&callNextKeyboard);
     originalGrabCursor.store(&callNextCursor);
