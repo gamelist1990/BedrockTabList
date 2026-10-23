@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <string_view>
 #include <vector>
 
 int main() {
@@ -81,13 +82,13 @@ int main() {
            tablist::MurderRole::Murderer);
     assert(tablist::murderRoleForHeldItem("minecraft:crossbow", "Crossbow") ==
            tablist::MurderRole::None);
-    constexpr auto formattedJapaneseItem = u8"§o§f§r§aワンショット光線銃§r";
-    constexpr auto plainJapaneseItem = u8"ワンショット光線銃";
+    constexpr std::u8string_view formattedJapaneseItem = u8"§o§f§r§aワンショット光線銃§r";
+    constexpr std::u8string_view plainJapaneseItem = u8"ワンショット光線銃";
     const std::string_view formattedJapaneseItemBytes{
-        reinterpret_cast<const char*>(formattedJapaneseItem),
-        sizeof(formattedJapaneseItem) - 1};
+        reinterpret_cast<const char*>(formattedJapaneseItem.data()),
+        formattedJapaneseItem.size()};
     const std::string_view plainJapaneseItemBytes{
-        reinterpret_cast<const char*>(plainJapaneseItem), sizeof(plainJapaneseItem) - 1};
+        reinterpret_cast<const char*>(plainJapaneseItem.data()), plainJapaneseItem.size()};
     assert(tablist::stripMinecraftFormatting(formattedJapaneseItemBytes) ==
            plainJapaneseItemBytes);
 
