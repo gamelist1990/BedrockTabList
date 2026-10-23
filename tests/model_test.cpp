@@ -1,5 +1,6 @@
 #include "tablist/config.hpp"
 #include "tablist/model.hpp"
+#include "tablist/update_scheduler.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -7,6 +8,28 @@
 #include <vector>
 
 int main() {
+    // A delayed game callback must never trigger several overdue native jobs.
+    // Even with a continuously pending roster, player and item jobs get a turn.
+    tablist::NativeUpdateScheduler scheduler;
+    constexpr std::array<bool, 4> allReady{true, true, true, true};
+    assert(scheduler.choose(1000, allReady) == tablist::NativeUpdate::Item);
+    assert(!scheduler.choose(1000, allReady));
+    assert(!scheduler.choose(1024, allReady));
+    assert(scheduler.choose(1025, allReady) == tablist::NativeUpdate::Players);
+    assert(scheduler.choose(1050, allReady) == tablist::NativeUpdate::Roster);
+    assert(scheduler.choose(1075, allReady) == tablist::NativeUpdate::Face);
+    assert(scheduler.choose(9000, allReady) == tablist::NativeUpdate::Item);
+    assert(!scheduler.choose(9000, allReady));
+    scheduler.defer(tablist::NativeUpdate::Item, 11000);
+    for (std::int64_t now = 9025; now < 11000; now += 25) {
+        const auto job = scheduler.choose(now, allReady);
+        assert(job && *job != tablist::NativeUpdate::Item);
+    }
+    // Disabling every source does no native work. A new world drops old timers.
+    assert(!scheduler.choose(12000, {false, false, false, false}));
+    scheduler.reset();
+    assert(scheduler.choose(12000, allReady) == tablist::NativeUpdate::Item);
+
     std::string defaultsError;
     const auto defaults = tablist::parseConfig("{}", defaultsError);
     assert(defaultsError.empty() && defaults.murderScanIntervalMs == 400);

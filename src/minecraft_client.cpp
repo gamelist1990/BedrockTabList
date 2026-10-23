@@ -12,13 +12,13 @@
 #include <bedrock/resolver.hpp>
 #include <bedrock/generated_symbols.hpp>
 #include <bedrock/game_api.hpp>
-#include <bedrock/game_hooks.hpp>
 #include <bedrock/native_items.hpp>
 #include <bedrock/native_actors.hpp>
 #include <imgui.h>
 #include <entt/entt.hpp>
 #include "tablist/config.hpp"
 #include "tablist/model.hpp"
+#include "tablist/update_scheduler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -125,7 +125,6 @@ using KeyboardFeedFn = bool(__fastcall*)(int, bool);
 using CursorFn = void(__fastcall*)(void*);
 using GetFovFn = float(__fastcall*)(void*, float, void*, void*);
 using LevelSubTickFn = void(__fastcall*)(void*);
-using ActorGetNameTagFn = const std::string&(__fastcall*)(void*);
 using ItemHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 // Exact 1.26.52.3 disassembly writes a std::vector<Actor*> hidden return area
 // through RDX, then appends one Actor* per runtime entity.
@@ -200,14 +199,12 @@ std::atomic<CursorFn> originalGrabCursor{nullptr};
 std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
-std::atomic<void*> originalActorGetNameTag{nullptr};
-std::atomic<void*> resolvedActorGetNameTag{nullptr};
 BDS_HookToken actorNameTagHookToken{};
 std::atomic<std::size_t> runtimeActorListSlot{std::numeric_limits<std::size_t>::max()};
 std::atomic<void*> runtimeActorListTarget{nullptr};
 std::atomic<void*> itemHoverNameTarget{nullptr};
-std::mutex itemDisplayNameMutex;
 std::unordered_map<std::string, std::string> itemDisplayNames;
+std::unordered_map<void*, std::string> nativeItemIdentifiers; // Game thread, cleared on world change.
 std::chrono::steady_clock::time_point lastItemDisplayNameResolve{};
 thread_local bool allowRuntimeActorListCall = false;
 struct RuntimeActorListTickScope {
@@ -251,8 +248,8 @@ std::thread murderWorker;
 bool murderWorkerStopping{};
 std::atomic<std::uint64_t> droppedMurderSamples{0};
 std::atomic<std::uint64_t> murderWorldEpoch{0};
-// Raw handles are captured from GameApi's validated roster on the game thread.
-// Re-validating each wrapper for every scan repeats several VirtualQuery calls.
+// Raw handles come exclusively from Level::getRuntimeActorList on the game thread.
+// Each handle is validated incrementally before use, rather than in one sweep.
 struct MurderActorEntry {
     void* actor{};
     std::uint64_t runtimeId{};
@@ -266,8 +263,16 @@ std::unordered_map<void*, std::string> murderKnownPlayerNamesByActor;
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedScanKey = 0;
 void* murderScanLevel = nullptr;
-std::uint64_t murderActorSnapshotTick = 0;
-std::size_t lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
+struct ActorRosterBuild {
+    std::vector<void*> handles;
+    std::size_t cursor{};
+    std::vector<MurderActorEntry> tracked;
+    std::unordered_set<std::uint64_t> runtimeIds;
+    std::unordered_map<std::uint64_t, std::string> namesById;
+    std::unordered_map<void*, std::string> namesByActor;
+};
+std::optional<ActorRosterBuild> pendingActorRoster;
+std::int64_t nextActorRosterMs{};
 std::int64_t lastMurderRosterStatusLogMs{};
 std::atomic<bool> loggedMurderActorReadFault{false};
 
@@ -282,13 +287,12 @@ void pruneExpiredMurderRolesLocked(std::chrono::steady_clock::time_point now) {
     }
 }
 std::size_t cachedFaceCursor = 0;
-const std::vector<PlayerRow>* cachedFaceSource = nullptr;
 std::mutex cachedTabRowsWriteMutex;
 std::shared_ptr<const std::vector<PlayerRow>> cachedTabRows{
     std::make_shared<const std::vector<PlayerRow>>()};
 struct TabRowsBuild {
     bool failed{};
-    void* world{};
+    std::uint64_t worldEpoch{};
     std::vector<std::string> names;
     std::vector<PlayerRow> rows;
     std::shared_ptr<const tablist::Config> config;
@@ -298,15 +302,19 @@ struct TabRowsBuild {
 };
 std::mutex tabRowsWorkerMutex;
 std::thread tabRowsWorker;
-std::shared_ptr<TabRowsBuild> completedTabRowsBuild;
-bool tabRowsWorkerDone{};
+std::condition_variable tabRowsReady;
+std::shared_ptr<TabRowsBuild> pendingTabRowsBuild;
+struct FaceUpdate {
+    std::uint64_t worldEpoch{};
+    PlayerRow row;
+};
+std::optional<FaceUpdate> pendingFaceUpdate;
+bool tabRowsStopping{};
+std::unordered_map<std::string, Uuid> playerFaceIds; // Game thread only.
+std::int64_t nextFaceReadMs{};
 std::int64_t tabRowsLastStartedMs{};
 std::atomic<bool> loggedTabRowsReady{false};
-std::atomic<bool> loggedFirstNameTag{false};
 std::atomic<std::uint64_t> actorNameTagSequence{0};
-std::atomic<std::int64_t> lastActorNamePollMs{0};
-std::atomic<std::size_t> actorNamePollCursor{0};
-bool copyActorNameTag(void* actor, std::string* output);
 std::optional<std::uint64_t> readActorRuntimeId(void* actor) noexcept;
 std::optional<bedrock::NativeItemLayout> nativeItemLayout;
 std::optional<bedrock::NativeActorLayout> nativeActorLayout;
@@ -325,9 +333,11 @@ public:
     std::vector<void*> actorHandles(void* world) const override;
     std::optional<std::uint64_t> actorRuntimeId(void* actor) const override;
     std::optional<std::string> nameTag(void* actor) const override {
-        std::string result;
-        return copyActorNameTag(actor, &result) ? std::optional<std::string>{std::move(result)}
-                                               : std::nullopt;
+        std::unique_lock lock(actorNameTagMutex, std::try_to_lock);
+        if (!lock) return std::nullopt;
+        const auto found = actorNameTags.find(actor);
+        return found == actorNameTags.end() ? std::nullopt
+            : std::optional<std::string>{found->second.nameTag};
     }
     std::optional<bedrock::ItemStack> equipmentItem(
         void* actor, bedrock::EquipmentSlot slot) const override;
@@ -354,7 +364,6 @@ private:
 };
 TabListGameAccess tabListGameAccess;
 std::unique_ptr<bedrock::GameApi> gameApi;
-std::unique_ptr<bedrock::GameHooks> gameHooks;
 std::atomic<bool> loggedActorListSuccess{false};
 std::shared_ptr<const tablist::Config> liveConfig{
     std::make_shared<const tablist::Config>()};
@@ -381,18 +390,66 @@ float __fastcall callNextFov(void* self, float fov, void* a3, void* a4) {
 void __fastcall callNextLevel(void* level) {
     if (levelFrame.next) { BDS_LevelArgs args{level}; levelFrame.next(levelFrame.frame, &args); }
 }
-std::mutex diagnosticMutex;
-std::ofstream diagnosticLog;
+// Callbacks enqueue text; only this writer thread opens/writes/flushes the file.
+class DiagnosticWriter {
+public:
+    bool start(const std::filesystem::path& path) noexcept {
+        try {
+            writer_ = std::thread([this, path] {
+                try {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+                    for (;;) {
+                        std::deque<std::string> batch;
+                        bool done;
+                        {
+                            std::unique_lock lock(mutex_);
+                            ready_.wait_for(lock, std::chrono::milliseconds(250),
+                                [this] { return stopping_; });
+                            batch.swap(lines_);
+                            done = stopping_;
+                        }
+                        for (const auto& line : batch) output << line << '\n';
+                        if (!batch.empty()) output.flush();
+                        if (done) return;
+                    }
+                } catch (...) {}
+            });
+            return true;
+        } catch (...) { return false; }
+    }
+    void enqueue(std::string line) noexcept {
+        try {
+            std::unique_lock lock(mutex_, std::try_to_lock);
+            if (lock && lines_.size() < 512) lines_.push_back(std::move(line));
+        } catch (...) {}
+    }
+    void stop() noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_one();
+        if (writer_.joinable()) writer_.join();
+    }
+private:
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<std::string> lines_;
+    std::thread writer_;
+    bool stopping_{};
+};
+DiagnosticWriter diagnosticWriter;
 std::atomic<bool> loggedRenderer{false};
 std::atomic<bool> loggedListSuccess{false};
 
 template <class... Args>
-void diagnostic(Args&&... args) {
-    std::lock_guard lock(diagnosticMutex);
-    if (!diagnosticLog) return;
-    (diagnosticLog << ... << std::forward<Args>(args));
-    diagnosticLog << '\n';
-    diagnosticLog.flush();
+void diagnostic(Args&&... args) noexcept {
+    try {
+        std::ostringstream line;
+        (line << ... << std::forward<Args>(args));
+        diagnosticWriter.enqueue(std::move(line).str());
+    } catch (...) {}
 }
 
 void publishHeldItemName(const std::string& playerName,
@@ -521,6 +578,7 @@ void processMurderSample(const MurderSample& sample) noexcept {
 }
 
 void murderWorkerLoop() noexcept {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
         MurderSample sample;
         {
@@ -564,32 +622,25 @@ void stopMurderWorker() noexcept {
 }
 
 void enqueueMurderSample(MurderSample sample) noexcept {
-    bool processInline = false;
     try {
         if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
-        {
-            std::lock_guard lock(murderQueueMutex);
-            if (sample.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
-            if (!murderWorker.joinable() || murderWorkerStopping) {
-                processInline = true;
-            } else {
-                constexpr std::size_t maxQueuedMurderSamples = 256;
-                if (murderQueue.size() == maxQueuedMurderSamples) {
-                    murderQueue.pop_front();
-                    droppedMurderSamples.fetch_add(1, std::memory_order_relaxed);
-                }
-                murderQueue.push_back(std::move(sample));
-            }
+        std::unique_lock lock(murderQueueMutex, std::try_to_lock);
+        if (!lock || !murderWorker.joinable() || murderWorkerStopping) {
+            droppedMurderSamples.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
+        constexpr std::size_t maxQueuedMurderSamples = 256;
+        if (murderQueue.size() == maxQueuedMurderSamples) {
+            murderQueue.pop_front();
+            droppedMurderSamples.fetch_add(1, std::memory_order_relaxed);
+        }
+        murderQueue.push_back(std::move(sample));
+        lock.unlock();
+        murderQueueReady.notify_one();
     } catch (...) {
-        // Queue allocation failure falls back to a bounded synchronous update.
-        processInline = true;
+        // Never run role processing, row copies or logging inline on queue failure.
+        droppedMurderSamples.fetch_add(1, std::memory_order_relaxed);
     }
-    if (processInline) {
-        processMurderSample(sample);
-        return;
-    }
-    murderQueueReady.notify_one();
 }
 
 bool readable(const void* pointer, std::size_t bytes) noexcept {
@@ -775,7 +826,8 @@ void recordLevel(void* level) noexcept {
         tabRowsLastStartedMs = 0;
         {
             std::lock_guard rowsLock(tabRowsWorkerMutex);
-            completedTabRowsBuild.reset();
+            pendingTabRowsBuild.reset();
+            pendingFaceUpdate.reset();
         }
         {
             std::lock_guard queueLock(murderQueueMutex);
@@ -789,7 +841,10 @@ void recordLevel(void* level) noexcept {
             lastHeldItemByPlayer.clear();
             heldItemNamesByPlayer.clear();
         }
-        if (gameApi) gameApi->clearObservedActors();
+        playerFaceIds.clear();
+        nativeItemIdentifiers.clear();
+        nextFaceReadMs = 0;
+        cachedFaceCursor = 0;
         {
             std::lock_guard rowsLock(cachedTabRowsWriteMutex);
             std::atomic_store_explicit(&cachedTabRows,
@@ -866,17 +921,13 @@ std::vector<void*> TabListGameAccess::actorHandles(void* world) const {
     std::vector<void*> nativeActors;
     if (!invokeLevelRuntimeActorList(world, target, &nativeActors) ||
         nativeActors.size() > 4096) return result;
-    result.reserve(nativeActors.size());
-    std::unordered_set<void*> seen;
-    seen.reserve(nativeActors.size());
-    for (auto* actor : nativeActors) {
-        if (actor && isActorValid(actor) && seen.insert(actor).second)
-            result.push_back(actor);
-    }
+    // Defer per-Actor validation and RuntimeID reads to the resumable roster.
+    // The native call itself only produces handles; no handle is dereferenced here.
     if (!loggedActorListSuccess.exchange(true, std::memory_order_acq_rel))
         diagnostic("Level::getRuntimeActorList active: slot=0x", std::hex, slot,
                    " target=0x", reinterpret_cast<std::uintptr_t>(target), std::dec,
-                   " native=", nativeActors.size(), " valid=", result.size());
+                   " native=", nativeActors.size(), " [incremental validation]");
+    result = std::move(nativeActors);
     return result;
 }
 
@@ -892,7 +943,6 @@ bool invokeItemHoverName(void* stack, void* target, std::string* output) noexcep
 void populateItemDisplayName(void* stack, bedrock::ItemStack& item) {
     if (item.identifier.empty()) return;
     {
-        std::lock_guard lock(itemDisplayNameMutex);
         const auto it = itemDisplayNames.find(item.identifier);
         if (it != itemDisplayNames.end()) {
             item.displayName = it->second;
@@ -910,7 +960,6 @@ void populateItemDisplayName(void* stack, bedrock::ItemStack& item) {
         displayName.empty() || displayName.size() > 256) return;
     item.displayName = displayName;
     try {
-        std::lock_guard lock(itemDisplayNameMutex);
         if (itemDisplayNames.size() >= 512) itemDisplayNames.clear();
         itemDisplayNames.insert_or_assign(item.identifier, std::move(displayName));
     } catch (...) {
@@ -1062,11 +1111,18 @@ EquipmentReadStatus readEquipmentItem(void* actor, bedrock::EquipmentSlot slot,
         !safeRead(itemReference, 0, nativeItem) || !nativeItem)
         return EquipmentReadStatus::Failed;
     item.count = count;
-    const auto* id = static_cast<const std::byte*>(nativeItem) + layout.itemNamespacedIdOffset;
-    if (!copyNativeString(id, item.identifier, layout, layout.maxStringBytes))
-        return EquipmentReadStatus::Failed;
-    if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
-        item.identifier.insert(0, "minecraft:");
+    const auto cachedId = nativeItemIdentifiers.find(nativeItem);
+    if (cachedId != nativeItemIdentifiers.end()) {
+        item.identifier = cachedId->second;
+    } else {
+        const auto* id = static_cast<const std::byte*>(nativeItem) + layout.itemNamespacedIdOffset;
+        if (!copyNativeString(id, item.identifier, layout, layout.maxStringBytes))
+            return EquipmentReadStatus::Failed;
+        if (!item.identifier.empty() && item.identifier.find(':') == std::string::npos)
+            item.identifier.insert(0, "minecraft:");
+        if (!item.identifier.empty() && nativeItemIdentifiers.size() < 2048)
+            nativeItemIdentifiers.emplace(nativeItem, item.identifier);
+    }
     // The display name is cached by item identifier, so the native resolver
     // runs only for the first observation of each item type.
     const auto itemConfig = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
@@ -1146,10 +1202,12 @@ std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
     if (!safeRead(world, levelPlayerListOffset, players) || !players ||
         !readable(players, sizeof(NativePlayerList)) || players->size() > 512) return names;
     names.reserve(players->size());
+    playerFaceIds.clear();
     for (const auto& item : *players) {
         const auto& name = item.second.name;
         if (name.empty() || name.size() > 128 || !readable(name.data(), name.size())) continue;
         names.push_back(name);
+        playerFaceIds.insert_or_assign(tablist::stripMinecraftFormatting(name), item.first);
     }
     {
         std::lock_guard lock(playerNamesMutex_);
@@ -1160,161 +1218,37 @@ std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
     return names;
 }
 
-bool getActorNameTagView(void* actor, const char** data, std::size_t* size) noexcept {
-    auto* rawFunction = originalActorGetNameTag.load(std::memory_order_acquire);
-    if (!actor || !data || !size || !rawFunction || !readable(actor, sizeof(void*)) ||
-        !executable(rawFunction)) return false;
-    __try {
-        const auto& nameTag = reinterpret_cast<ActorGetNameTagFn>(rawFunction)(actor);
-        *size = nameTag.size();
-        *data = nameTag.data();
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 void captureQueriedActorNameTag(void* actor, const std::string& nameTag) noexcept {
     if (!actor || nameTag.size() > 512) return;
     try {
-        const bool hasVisibleName = !tablist::stripMinecraftFormatting(nameTag).empty();
-        const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
-        bool logFirstName = false;
-        {
-            std::lock_guard lock(actorNameTagMutex);
-            const auto existing = actorNameTags.find(actor);
-            if (existing != actorNameTags.end() && existing->second.nameTag == nameTag) return;
-            if (!actorNameTags.contains(actor) && actorNameTags.size() >= 4096)
-                actorNameTags.clear();
-            // Preserve an empty/reset nametag as a state change so stale colors
-            // do not remain attached to an Actor after its formatting changes.
-            const auto color = hasVisibleName ? tablist::minecraftNameColorOrder(nameTag) : 28u;
-            actorNameTags.insert_or_assign(actor,
-                ActorNameTagEntry{actor, nameTag, color, sequence});
-            logFirstName = hasVisibleName &&
-                !loggedFirstNameTag.exchange(true, std::memory_order_acq_rel);
-        }
-        if (logFirstName) diagnostic("Actor nameTag capture active; live color updates enabled");
-    } catch (...) {
-        // Never allow diagnostics/cache allocation failures to escape into
-        // Minecraft's native Actor::getNameTag call.
-    }
+        // Called by the renderer's native getter: never wait for a snapshot copy.
+        std::unique_lock lock(actorNameTagMutex, std::try_to_lock);
+        if (!lock) return;
+        const auto existing = actorNameTags.find(actor);
+        if (existing != actorNameTags.end() && existing->second.nameTag == nameTag) return;
+        if (existing == actorNameTags.end() && actorNameTags.size() >= 4096)
+            actorNameTags.erase(actorNameTags.begin());
+        const auto sequence = actorNameTagSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        actorNameTags.insert_or_assign(actor,
+            ActorNameTagEntry{actor, nameTag, 28, sequence});
+    } catch (...) {}
 }
 
-const std::string& __fastcall actorGetNameTagDetour(void* actor) {
-    static const std::string unavailable;
-    auto* rawFunction = originalActorGetNameTag.load(std::memory_order_acquire);
-    if (!actor || !rawFunction) return unavailable;
-    const auto& nameTag = reinterpret_cast<ActorGetNameTagFn>(rawFunction)(actor);
-    captureQueriedActorNameTag(actor, nameTag);
-    return nameTag;
+void BDS_HOOK_CALL actorNameTagMiddleware(void*, void* raw,
+                                        BDS_HookNext next, void* frame) noexcept {
+    next(frame, raw);
+    const auto& args = *static_cast<BDS_ActorNameTagArgs*>(raw);
+    if (args.actor && args.name_tag)
+        captureQueriedActorNameTag(args.actor,
+            *static_cast<const std::string*>(args.name_tag));
 }
 
-bool copyActorNameTag(void* actor, std::string* output) {
-    const char* data = nullptr;
-    std::size_t size = 0;
-    if (!output || !getActorNameTagView(actor, &data, &size) || size > 512 ||
-        (size && !readable(data, size))) return false;
-    output->assign(data, size);
-    return true;
-}
-
-// Actor::getNameTag is normally called by the renderer, so a hook alone only
-// refreshes actors whose labels happen to be queried that frame. Once an Actor
-// has been observed, poll a bounded batch on the game tick (20 Hz maximum).
-// This refreshes color/name changes even when its nametag is currently hidden.
-// It intentionally does not guess a Level actor-list ABI or discover new actors.
-void refreshObservedActorNameTags() noexcept {
-    constexpr std::int64_t intervalMs = 50;
-    constexpr std::size_t maximumBatch = 256;
-    if (!originalActorGetNameTag.load(std::memory_order_acquire)) return;
-    const auto now = steadyMilliseconds();
-    auto previous = lastActorNamePollMs.load(std::memory_order_acquire);
-    if (now - previous < intervalMs ||
-        !lastActorNamePollMs.compare_exchange_strong(previous, now,
-            std::memory_order_acq_rel, std::memory_order_acquire)) return;
-
-    try {
-        std::vector<void*> actors;
-        {
-            std::lock_guard lock(actorNameTagMutex);
-            actors.reserve(actorNameTags.size());
-            for (const auto& [actor, _] : actorNameTags) actors.push_back(actor);
-        }
-        if (actors.empty()) return;
-        const auto start = actorNamePollCursor.fetch_add(maximumBatch,
-            std::memory_order_acq_rel) % actors.size();
-        const auto count = std::min(maximumBatch, actors.size());
-        std::vector<void*> stale;
-        for (std::size_t i = 0; i < count; ++i) {
-            auto* actor = actors[(start + i) % actors.size()];
-            if (!looksLikeActor(actor)) {
-                stale.push_back(actor);
-                continue;
-            }
-            std::string nameTag;
-            if (copyActorNameTag(actor, &nameTag))
-                captureQueriedActorNameTag(actor, nameTag);
-        }
-        if (!stale.empty()) {
-            std::lock_guard lock(actorNameTagMutex);
-            for (auto* actor : stale) actorNameTags.erase(actor);
-        }
-    } catch (...) {
-        // Keep allocation/cache failures outside Minecraft's tick path.
-    }
-}
-
-bool tryAcquireLevelPointerFromClient(void** output) noexcept {
-    if (!output) return false;
-    *output = nullptr;
-    void* client = clientInstance.load(std::memory_order_acquire);
-    if (!validateClient(client)) return false;
-    void* minecraft = nullptr;
-    void* session = nullptr;
-    void* control = nullptr;
-    void* level = nullptr;
-    std::uint8_t ready = 0;
-    std::uint8_t controlReady = 0;
-    if (!safeRead(client, clientMinecraftOffset, minecraft) || !minecraft ||
-        !safeRead(minecraft, minecraftGameSessionOffset, session) || !session ||
-        !safeRead(session, sessionReadyOffset, ready) || ready != 1 ||
-        !safeRead(session, sessionLevelControlOffset, control) || !control ||
-        !safeRead(control, 0, controlReady) || controlReady != 1 ||
-        !safeRead(session, sessionLevelOffset, level) || !level) return false;
-    *output = level;
-    return true;
-}
-
-bool tryAcquireLevelFromClient() noexcept {
-    void* level = nullptr;
-    if (!tryAcquireLevelPointerFromClient(&level)) return false;
-    recordLevel(level);
-    return true;
-}
-
-std::vector<ActorNameTagEntry> snapshotSdkActorNameTags() {
+// Only copied names cross to the worker. Handles are opaque comparison keys there.
+std::vector<ActorNameTagEntry> snapshotActorNameTags() {
     std::vector<ActorNameTagEntry> result;
-    // Read immutable SDK snapshots only; no GameApi::actors() walk, native
-    // Actor calls, or PlayerList matching is done by the DXGI render callback.
-    if (!gameApi) return result;
-    std::unordered_map<void*, ActorNameTagEntry> byActor;
-    const auto append = [&](bedrock::NameTagSource source) {
-        const auto snapshot = gameApi->cachedActorNameTags(source);
-        for (const auto& item : *snapshot) {
-            if (!item.actor || item.nameTag.empty() || item.nameTag.size() > 512 ||
-                tablist::stripMinecraftFormatting(item.nameTag).empty()) continue;
-            const auto existing = byActor.find(item.actor);
-            if (existing != byActor.end() && existing->second.sequence > item.sequence) continue;
-            const auto color = tablist::minecraftNameColorOrder(item.nameTag);
-            byActor.insert_or_assign(item.actor,
-                ActorNameTagEntry{item.actor, item.nameTag, color, item.sequence});
-        }
-    };
-    append(bedrock::NameTagSource::View);
-    append(bedrock::NameTagSource::ActorGetter); // getter is newest/authoritative on duplicates
-    result.reserve(byActor.size());
-    for (auto& [_, entry] : byActor) result.push_back(std::move(entry));
+    std::lock_guard lock(actorNameTagMutex);
+    result.reserve(actorNameTags.size());
+    for (const auto& [_, tag] : actorNameTags) result.push_back(tag);
     return result;
 }
 
@@ -1351,7 +1285,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows,
     for (std::size_t index = begin; index < end; ++index) {
         const auto& nativeName = playerNames[index];
         const auto length = nativeName.size();
-        if (length == 0 || length > 128 || !readable(nativeName.data(), length)) continue;
+        if (length == 0 || length > 128) continue;
         PlayerRow row;
         row.name = tablist::stripMinecraftFormatting(nativeName);
         if (row.name.empty()) continue;
@@ -1368,8 +1302,7 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows,
                 const auto color = tablist::actorNameColorForPlayerName(row.name, actorTag.nameTag);
                 if (!color) continue;
                 const bool exact = true;
-                if (foundColor && (exact < bestWasExact ||
-                    (exact == bestWasExact && actorTag.sequence <= bestSequence))) continue;
+                if (foundColor && actorTag.sequence <= bestSequence) continue;
                 row.nameColorOrder = *color;
                 row.hasNameColor = true;
                 bestWasExact = exact;
@@ -1424,12 +1357,8 @@ bool collectRowsUnsafe(std::vector<PlayerRow>& rows,
 
 bool copyPlayerNamesUnsafe(std::vector<std::string>& names) {
     void* level = levelInstance.load(std::memory_order_acquire);
-    if (!level) {
-        if (!tryAcquireLevelFromClient()) return false;
-        level = levelInstance.load(std::memory_order_acquire);
-    }
     if (!level || !gameApi) return false;
-    names = gameApi->world(level).getPlayerNames();
+    names = tabListGameAccess.playerListNames(level);
     return names.size() <= 512;
 }
 
@@ -1464,6 +1393,13 @@ bool collectRowsChunk(std::vector<PlayerRow>& rows,
 
 void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexcept {
     try {
+        if (build->config->sortByNameColor) build->actorTags = snapshotActorNameTags();
+        {
+            std::lock_guard lock(murderDetectMutex);
+            pruneExpiredMurderRolesLocked(std::chrono::steady_clock::now());
+            build->roles = murderRolesByPlayer;
+            build->spectators = spectatorPlayers;
+        }
         constexpr std::size_t batchSize = 8;
         build->rows.reserve(build->names.size());
         for (std::size_t begin = 0; begin < build->names.size(); begin += batchSize) {
@@ -1500,11 +1436,99 @@ void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexce
     } catch (...) {
         build->failed = true;
     }
+    if (build->failed) return;
+    try {
+        const auto config = build->config;
+        std::lock_guard writeLock(cachedTabRowsWriteMutex);
+        if (build->worldEpoch != murderWorldEpoch.load(std::memory_order_acquire) ||
+            config != std::atomic_load_explicit(&liveConfig, std::memory_order_acquire)) return;
+        {
+            std::lock_guard stateLock(murderDetectMutex);
+            for (auto& row : build->rows) {
+                if (config->murderDetect) {
+                    const auto role = murderRolesByPlayer.find(row.name);
+                    if (role != murderRolesByPlayer.end()) row.murderRole = role->second;
+                }
+                row.spectator = config->gamemodeCheck && spectatorPlayers.contains(row.name);
+                if (config->showHeldItems && config->murderDetect) {
+                    const auto item = heldItemNamesByPlayer.find(row.name);
+                    if (item != heldItemNamesByPlayer.end()) row.heldItemName = item->second;
+                }
+            }
+        }
+        const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
+        std::unordered_map<std::string_view, const PlayerRow*> oldRows;
+        if (config->showFaces && previous) {
+            oldRows.reserve(previous->size());
+            for (const auto& row : *previous) if (row.hasFace) oldRows.emplace(row.name, &row);
+            for (auto& row : build->rows) {
+                const auto old = oldRows.find(row.name);
+                if (old != oldRows.end()) {
+                    row.face = old->second->face;
+                    row.hasFace = true;
+                }
+            }
+        }
+        std::atomic_store_explicit(&cachedTabRows,
+            std::make_shared<const std::vector<PlayerRow>>(std::move(build->rows)),
+            std::memory_order_release);
+        if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
+            diagnostic("TabList row cache ready; persistent worker publishes copied rows");
+    } catch (...) {}
+}
+
+void publishFaceUpdate(const FaceUpdate& update) {
+    std::lock_guard lock(cachedTabRowsWriteMutex);
+    if (update.worldEpoch != murderWorldEpoch.load(std::memory_order_acquire)) return;
+    const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
+    if (!previous) return;
+    const auto found = std::find_if(previous->begin(), previous->end(),
+        [&](const PlayerRow& row) { return row.name == update.row.name; });
+    if (found == previous->end() || found->hasFace) return;
+    auto rows = std::make_shared<std::vector<PlayerRow>>(*previous);
+    auto& row = (*rows)[static_cast<std::size_t>(found - previous->begin())];
+    row.face = update.row.face;
+    row.hasFace = true;
+    std::atomic_store_explicit(&cachedTabRows,
+        std::shared_ptr<const std::vector<PlayerRow>>(std::move(rows)), std::memory_order_release);
+}
+
+void tabRowsWorkerLoop() noexcept {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        std::shared_ptr<TabRowsBuild> build;
+        std::optional<FaceUpdate> face;
+        {
+            std::unique_lock lock(tabRowsWorkerMutex);
+            tabRowsReady.wait(lock, [] {
+                return tabRowsStopping || pendingTabRowsBuild || pendingFaceUpdate;
+            });
+            if (tabRowsStopping) return;
+            build = std::move(pendingTabRowsBuild);
+            face = std::move(pendingFaceUpdate);
+            pendingFaceUpdate.reset();
+        }
+        if (build) buildTabRowsInBackground(build);
+        try { if (face) publishFaceUpdate(*face); } catch (...) {}
+    }
+}
+
+bool startTabRowsWorker() noexcept {
+    try {
+        tabRowsWorker = std::thread(tabRowsWorkerLoop);
+        return true;
+    } catch (...) { return false; }
+}
+
+void stopTabRowsWorker() noexcept {
     {
         std::lock_guard lock(tabRowsWorkerMutex);
-        completedTabRowsBuild = build;
-        tabRowsWorkerDone = true;
+        tabRowsStopping = true;
+        pendingTabRowsBuild.reset();
+        pendingFaceUpdate.reset();
     }
+    tabRowsReady.notify_one();
+    if (tabRowsWorker.joinable()) tabRowsWorker.join();
 }
 
 bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
@@ -1513,14 +1537,14 @@ bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
     if (!safeRead(level, levelPlayerListOffset, nativePlayers) || !nativePlayers ||
         !readable(nativePlayers, sizeof(NativePlayerList)) || nativePlayers->size() > 512)
         return false;
-    for (const auto& [_, entry] : *nativePlayers) {
-        const auto& nativeName = entry.name;
-        if (nativeName.empty() || nativeName.size() > 128 ||
-            !readable(nativeName.data(), nativeName.size())) continue;
-        if (tablist::stripMinecraftFormatting(nativeName) != row->name) continue;
-        return extractFace(entry, *row);
-    }
-    return false;
+    const auto uuid = playerFaceIds.find(row->name);
+    if (uuid == playerFaceIds.end()) return false;
+    // Compare the copied UUID directly. The game's UUID bucket hash is not
+    // part of this profile, so do not call unordered_map::find with a guessed hash.
+    const auto entry = std::find_if(nativePlayers->begin(), nativePlayers->end(),
+        [&](const auto& item) { return item.first == uuid->second; });
+    if (entry == nativePlayers->end()) return false;
+    return extractFace(entry->second, *row);
 }
 
 bool fillOneFaceSeh(void* level, PlayerRow* row) noexcept {
@@ -1533,116 +1557,61 @@ bool fillOneFaceSeh(void* level, PlayerRow* row) noexcept {
 
 void refreshOneCachedFace(const std::shared_ptr<const tablist::Config>& config) noexcept {
     if (!config || !config->showFaces) return;
+    nextFaceReadMs = steadyMilliseconds() + 200;
     try {
-        auto current = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
+        const auto current = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
         if (!current || current->empty()) return;
-        if (cachedFaceSource != current.get()) {
-            cachedFaceSource = current.get();
-            cachedFaceCursor = 0;
-        }
+        // Retain progress when unrelated item/row publications replace the snapshot.
         for (std::size_t scanned = 0; scanned < current->size(); ++scanned) {
             const auto index = cachedFaceCursor++ % current->size();
             if ((*current)[index].hasFace) continue;
-            auto updated = std::make_shared<std::vector<PlayerRow>>(*current);
-            if (!fillOneFaceSeh(levelInstance.load(std::memory_order_acquire),
-                                &(*updated)[index])) return;
-            std::lock_guard writeLock(cachedTabRowsWriteMutex);
-            current = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
-            if (!current || index >= current->size() || (*current)[index].name !=
-                (*updated)[index].name) return;
-            auto faceUpdated = std::make_shared<std::vector<PlayerRow>>(*current);
-            (*faceUpdated)[index].face = (*updated)[index].face;
-            (*faceUpdated)[index].hasFace = (*updated)[index].hasFace;
-            std::atomic_store_explicit(&cachedTabRows,
-                std::shared_ptr<const std::vector<PlayerRow>>(std::move(faceUpdated)),
-                std::memory_order_release);
-            return; // Exactly one native skin/face read per game tick.
+            FaceUpdate update;
+            update.worldEpoch = murderWorldEpoch.load(std::memory_order_acquire);
+            update.row.name = (*current)[index].name;
+            if (!fillOneFaceSeh(levelInstance.load(std::memory_order_acquire), &update.row)) return;
+            std::unique_lock lock(tabRowsWorkerMutex, std::try_to_lock);
+            if (!lock || tabRowsStopping) return;
+            pendingFaceUpdate = std::move(update);
+            lock.unlock();
+            tabRowsReady.notify_one();
+            return;
         }
-    } catch (...) {
-        // Face extraction is optional; leave the cached row unchanged on error.
-    }
+    } catch (...) {}
 }
 
 void refreshTabRowsCache(const std::shared_ptr<const tablist::Config>& config) noexcept {
     if (!config || !config->enabled) return;
     try {
-        const auto world = levelInstance.load(std::memory_order_acquire);
-        std::shared_ptr<TabRowsBuild> completed;
-        bool workerDone = false;
-        {
-            std::lock_guard lock(tabRowsWorkerMutex);
-            workerDone = tabRowsWorkerDone;
-            if (workerDone) {
-                completed = std::move(completedTabRowsBuild);
-                tabRowsWorkerDone = false;
-            }
-        }
-        if (workerDone && tabRowsWorker.joinable()) tabRowsWorker.join();
-        if (completed && !completed->failed && completed->world == world &&
-            completed->config == config) {
-            auto& rows = completed->rows;
-            std::unordered_map<std::string, std::string> heldItems;
-            std::lock_guard writeLock(cachedTabRowsWriteMutex);
-            if (config->murderDetect) {
-                std::lock_guard stateLock(murderDetectMutex);
-                if (config->showHeldItems) {
-                    heldItems = heldItemNamesByPlayer;
-                    for (auto& row : rows) {
-                        const auto item = heldItems.find(row.name);
-                        if (item != heldItems.end()) row.heldItemName = item->second;
-                    }
-                } else {
-                    heldItemNamesByPlayer.clear();
-                }
-            }
-            const auto previous = std::atomic_load_explicit(
-                &cachedTabRows, std::memory_order_acquire);
-            if (config->showFaces && previous) {
-                for (auto& row : rows) {
-                    const auto old = std::find_if(previous->begin(), previous->end(),
-                        [&](const PlayerRow& candidate) { return candidate.name == row.name; });
-                    if (old != previous->end() && old->hasFace) {
-                        row.face = old->face;
-                        row.hasFace = true;
-                    }
-                }
-            }
-            auto snapshot = std::make_shared<const std::vector<PlayerRow>>(std::move(rows));
-            std::atomic_store_explicit(&cachedTabRows, std::move(snapshot),
-                                       std::memory_order_release);
-            if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
-                diagnostic("TabList row cache ready; renderer uses cached rows only");
-        }
-
-        // If a background build is still running, keep rendering the last
-        // immutable cache and do not enqueue another copy of the same work.
-        if (tabRowsWorker.joinable()) return;
-        const auto nowMs = steadyMilliseconds();
-        if (tabRowsLastStartedMs != 0 && nowMs - tabRowsLastStartedMs < 1000) return;
-
         auto next = std::make_shared<TabRowsBuild>();
-        next->world = world;
+        next->worldEpoch = murderWorldEpoch.load(std::memory_order_acquire);
         next->config = config;
         if (!copyPlayerNames(&next->names)) return;
-        if (config->sortByNameColor) next->actorTags = snapshotSdkActorNameTags();
-        if (config->murderDetect || config->gamemodeCheck) {
-            std::lock_guard lock(murderDetectMutex);
-            if (config->murderDetect) {
-                pruneExpiredMurderRolesLocked(std::chrono::steady_clock::now());
-                next->roles = murderRolesByPlayer;
-            }
-            if (config->gamemodeCheck) next->spectators = spectatorPlayers;
+        std::unique_lock lock(tabRowsWorkerMutex, std::try_to_lock);
+        if (!lock || tabRowsStopping) return;
+        // Only the latest captured input matters. No game callback starts or joins a thread.
+        // Match Actor names against the same capture used to render the PlayerList.
+        murderPlayerNames = next->names;
+        for (auto& name : murderPlayerNames) name = tablist::stripMinecraftFormatting(name);
+        std::sort(murderPlayerNames.begin(), murderPlayerNames.end(),
+            [](const auto& a, const auto& b) {
+                return a.size() != b.size() ? a.size() > b.size() : a < b;
+            });
+        murderPlayerNames.erase(std::remove(murderPlayerNames.begin(), murderPlayerNames.end(), ""),
+                                murderPlayerNames.end());
+        murderPlayerNames.erase(std::unique(murderPlayerNames.begin(), murderPlayerNames.end()),
+                                murderPlayerNames.end());
+        if (murderPlayerNames.empty()) {
+            murderScanActors.clear();
+            pendingActorRoster.reset();
+            murderKnownPlayerNamesByRuntimeId.clear();
+            murderKnownPlayerNamesByActor.clear();
+            nextActorRosterMs = 0;
         }
-        {
-            std::lock_guard lock(tabRowsWorkerMutex);
-            completedTabRowsBuild.reset();
-            tabRowsWorkerDone = false;
-        }
-        tabRowsLastStartedMs = nowMs;
-        tabRowsWorker = std::thread(buildTabRowsInBackground, std::move(next));
-    } catch (...) {
-        // Preserve the last complete snapshot if copying or worker startup fails.
-    }
+        pendingTabRowsBuild = std::move(next);
+        tabRowsLastStartedMs = steadyMilliseconds();
+        lock.unlock();
+        tabRowsReady.notify_one();
+    } catch (...) {}
 }
 
 bool __fastcall onKeyboardFeed(int inputKey, bool down) {
@@ -1691,33 +1660,12 @@ void readActorMurderSnapshot(void* actor,
                              ActorMurderSnapshot& snapshot,
                              bool readItem, bool readGameMode) {
     if (!actor) return;
-    bool itemRead = false;
-    if (!playerName.empty() && playerName.size() <= 128) {
-        snapshot.name.assign(playerName);
-        snapshot.isPlayer = true;
-    } else if (readItem) {
-        // Inspect one runtime Actor at a time. Check its equipment before doing
-        // name/identity work so Actors with no held stack stay on the cheap path.
+    if (playerName.empty() || playerName.size() > 128) return;
+    snapshot.name.assign(playerName);
+    snapshot.isPlayer = true;
+    if (readItem) {
         bedrock::ItemStack heldItem;
-        const auto handStatus = readEquipmentItem(
-            actor, bedrock::EquipmentSlot::MainHand, &heldItem);
-        if (handStatus == EquipmentReadStatus::Item) snapshot.item = std::move(heldItem);
-        snapshot.handEmpty = handStatus == EquipmentReadStatus::Empty;
-        itemRead = true;
-        if (snapshot.item || readGameMode) {
-            const auto identity = gameApi->actor(actor).getIdentity();
-            snapshot.isPlayer = identity.isPlayer;
-            if (snapshot.isPlayer) snapshot.name = identity.name;
-        }
-    } else {
-        const auto identity = gameApi->actor(actor).getIdentity();
-        snapshot.isPlayer = identity.isPlayer;
-        if (snapshot.isPlayer) snapshot.name = identity.name;
-    }
-    if (readItem && !itemRead && snapshot.isPlayer) {
-        bedrock::ItemStack heldItem;
-        const auto handStatus = readEquipmentItem(
-            actor, bedrock::EquipmentSlot::MainHand, &heldItem);
+        const auto handStatus = readEquipmentItem(actor, bedrock::EquipmentSlot::MainHand, &heldItem);
         if (handStatus == EquipmentReadStatus::Item) snapshot.item = std::move(heldItem);
         snapshot.handEmpty = handStatus == EquipmentReadStatus::Empty;
     }
@@ -1762,6 +1710,11 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
             auto* actor = tracked.actor;
             murderScanCursor = (murderScanCursor + 1) % murderScanActors.size();
             const auto runtimeId = tracked.runtimeId;
+            // A handle captured across ticks may have been destroyed/reused.
+            // Check its identity before reading equipment or trusting the cached name.
+            if (runtimeId != 0 && readActorRuntimeId(actor) != std::optional{runtimeId}) continue;
+            if (std::find(murderPlayerNames.begin(), murderPlayerNames.end(), tracked.playerName) ==
+                murderPlayerNames.end()) continue;
             murderLastProcessedScanKey = tracked.scanKey;
             ActorMurderSnapshot snapshot;
             if (!readActorMurderSnapshotSeh(actor, &tracked.playerName, &snapshot,
@@ -1799,156 +1752,95 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
 }
 
 void refreshTrackedMurderActors(void* level) noexcept {
-    if (!gameApi || !level) return;
+    if (!level) return;
     try {
         if (murderScanLevel != level) {
             murderScanLevel = level;
             murderScanActors.clear();
-            murderPlayerNames.clear();
             murderKnownPlayerNamesByRuntimeId.clear();
             murderKnownPlayerNamesByActor.clear();
+            pendingActorRoster.reset();
+            nextActorRosterMs = 0;
+            lastMurderRosterStatusLogMs = 0;
             murderScanCursor = 0;
             murderLastProcessedScanKey = 0;
+        }
+        if (!pendingActorRoster) {
+            if (steadyMilliseconds() < nextActorRosterMs) return;
+            ActorRosterBuild build;
+            build.handles = tabListGameAccess.actorHandles(level);
+            // Sorting/deduplication touches opaque handles only; native validation is deferred.
+            std::sort(build.handles.begin(), build.handles.end(), std::less<void*>{});
+            build.handles.erase(std::unique(build.handles.begin(), build.handles.end()),
+                                build.handles.end());
+            build.tracked.reserve(std::min(build.handles.size(), murderPlayerNames.size()));
+            pendingActorRoster = std::move(build);
+            nextActorRosterMs = steadyMilliseconds() + 2000;
+            return; // Do not combine native enumeration and Actor reads on one tick.
+        }
+        auto& build = *pendingActorRoster;
+        if (build.cursor < build.handles.size()) {
+            auto* actor = build.handles[build.cursor++];
+            if (!actor) return;
+            std::string nameTag;
             {
-                std::lock_guard stateLock(murderDetectMutex);
-                murderRolesByPlayer.clear();
-                spectatorPlayers.clear();
-                murderRoleExpiryByPlayer.clear();
-                lastHeldItemByPlayer.clear();
-                heldItemNamesByPlayer.clear();
+                std::unique_lock lock(actorNameTagMutex, std::try_to_lock);
+                if (!lock) { --build.cursor; return; }
+                const auto tag = actorNameTags.find(actor);
+                if (tag != actorNameTags.end()) nameTag = tag->second.nameTag;
             }
-            murderActorSnapshotTick = 39; // First live roster is ready immediately.
-            lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
-            lastMurderRosterStatusLogMs = 0;
-        }
-        // Refresh the native Level actor list at most once every two seconds. Match
-        // its handles against copied SDK NameTag snapshots; avoid calling the
-        // native NameTag getter or SDK identity path for every Actor each tick.
-        ++murderActorSnapshotTick;
-        if (murderActorSnapshotTick < 40) return;
-        murderActorSnapshotTick = 0;
-
-        // Actor enumeration remains exclusively Level::getRuntimeActorList.
-        auto actorHandles = tabListGameAccess.actorHandles(level);
-        std::sort(actorHandles.begin(), actorHandles.end(),
-            [](const void* left, const void* right) {
-                return reinterpret_cast<std::uintptr_t>(left) <
-                       reinterpret_cast<std::uintptr_t>(right);
-            });
-        actorHandles.erase(std::unique(actorHandles.begin(), actorHandles.end()),
-                           actorHandles.end());
-
-        std::vector<std::string> playerNames;
-        for (const auto& name : gameApi->world(level).getPlayerNames()) {
-            auto plainName = tablist::stripMinecraftFormatting(name);
-            if (!plainName.empty() && plainName.size() <= 128)
-                playerNames.push_back(std::move(plainName));
-        }
-        std::sort(playerNames.begin(), playerNames.end(),
-            [](const std::string& left, const std::string& right) {
-                return left.size() > right.size();
-            });
-        playerNames.erase(std::unique(playerNames.begin(), playerNames.end()),
-                          playerNames.end());
-
-        // These immutable SDK snapshots contain copied names and Actor handles
-        // observed by the existing NameTag hook. Intersect them with the exact
-        // runtime list instead of issuing native name reads for every entity.
-        std::unordered_map<void*, std::string> playerNamesByActor;
-        const auto actorTags = snapshotSdkActorNameTags();
-        playerNamesByActor.reserve(actorTags.size());
-        for (const auto& tag : actorTags) {
-            if (!tag.actor || tag.nameTag.empty()) continue;
-            auto playerName = matchPlayerNameFromTag(tag.nameTag, playerNames);
-            if (!playerName.empty())
-                playerNamesByActor.insert_or_assign(tag.actor, std::move(playerName));
-        }
-
-        std::vector<MurderActorEntry> trackedActors;
-        trackedActors.reserve(actorHandles.size());
-        std::unordered_map<std::uint64_t, std::string> nextKnownPlayerNames;
-        std::unordered_map<void*, std::string> nextKnownPlayerNamesByActor;
-        nextKnownPlayerNames.reserve(std::min(actorHandles.size(), playerNames.size()));
-        nextKnownPlayerNamesByActor.reserve(std::min(actorHandles.size(), playerNames.size()));
-        std::unordered_set<std::uint64_t> seenRuntimeIds;
-        seenRuntimeIds.reserve(actorHandles.size());
-        std::size_t namedActorCount = 0;
-        std::size_t runtimeIdActorCount = 0;
-        for (auto* actor : actorHandles) {
-            auto runtimeId = gameApi->actor(actor).getRuntimeId();
-            if (runtimeId && !seenRuntimeIds.insert(*runtimeId).second)
-                runtimeId.reset();
-            if (runtimeId) ++runtimeIdActorCount;
-            auto player = playerNamesByActor.find(actor);
-            if (player == playerNamesByActor.end()) {
-                if (runtimeId) {
-                    const auto known = murderKnownPlayerNamesByRuntimeId.find(*runtimeId);
-                    if (known != murderKnownPlayerNamesByRuntimeId.end())
-                        player = playerNamesByActor.emplace(actor, known->second).first;
-                } else {
-                    const auto known = murderKnownPlayerNamesByActor.find(actor);
-                    if (known != murderKnownPlayerNamesByActor.end())
-                        player = playerNamesByActor.emplace(actor, known->second).first;
-                }
+            auto playerName = matchPlayerNameFromTag(nameTag, murderPlayerNames);
+            // A handle with no PlayerList match needs an ID read only if a
+            // prior player ID exists that it could reattach to.
+            const auto knownPointer = murderKnownPlayerNamesByActor.find(actor);
+            if (playerName.empty() && knownPointer == murderKnownPlayerNamesByActor.end() &&
+                murderKnownPlayerNamesByRuntimeId.empty()) return;
+            // This reader has its own SEH boundary; one native ID read per step.
+            const auto runtimeId = readActorRuntimeId(actor);
+            if (runtimeId && !build.runtimeIds.insert(*runtimeId).second) return;
+            if (playerName.empty() && runtimeId) {
+                const auto known = murderKnownPlayerNamesByRuntimeId.find(*runtimeId);
+                if (known != murderKnownPlayerNamesByRuntimeId.end()) playerName = known->second;
             }
-            if (player != playerNamesByActor.end()) {
-                const auto scanKey = runtimeId
-                    ? static_cast<std::uintptr_t>(*runtimeId)
-                    : reinterpret_cast<std::uintptr_t>(actor);
-                trackedActors.push_back({actor, runtimeId.value_or(0), scanKey, player->second});
-                if (runtimeId)
-                    nextKnownPlayerNames.insert_or_assign(*runtimeId, player->second);
-                else
-                    nextKnownPlayerNamesByActor.insert_or_assign(actor, player->second);
-                ++namedActorCount;
+            if (playerName.empty() && !runtimeId) {
+                const auto known = murderKnownPlayerNamesByActor.find(actor);
+                if (known != murderKnownPlayerNamesByActor.end()) playerName = known->second;
             }
+            if (std::find(murderPlayerNames.begin(), murderPlayerNames.end(), playerName) ==
+                murderPlayerNames.end()) return;
+            const auto scanKey = runtimeId ? static_cast<std::uintptr_t>(*runtimeId)
+                : reinterpret_cast<std::uintptr_t>(actor);
+            build.tracked.push_back({actor, runtimeId.value_or(0), scanKey, playerName});
+            const auto active = std::find_if(murderScanActors.begin(), murderScanActors.end(),
+                [&](const auto& entry) { return entry.scanKey == scanKey; });
+            if (active == murderScanActors.end()) murderScanActors.push_back(build.tracked.back());
+            else *active = build.tracked.back();
+            if (runtimeId) build.namesById.insert_or_assign(*runtimeId, std::move(playerName));
+            else build.namesByActor.insert_or_assign(actor, std::move(playerName));
+            return;
         }
-        std::sort(trackedActors.begin(), trackedActors.end(),
-            [](const MurderActorEntry& left, const MurderActorEntry& right) {
-                return left.scanKey < right.scanKey;
-            });
-        murderKnownPlayerNamesByRuntimeId = std::move(nextKnownPlayerNames);
-        murderKnownPlayerNamesByActor = std::move(nextKnownPlayerNamesByActor);
-        if (!playerNames.empty() && !trackedActors.empty()) {
-            std::vector<std::uintptr_t> handles;
-            handles.reserve(trackedActors.size());
-            for (const auto& actor : trackedActors)
-                handles.push_back(actor.scanKey);
-            murderPlayerNames = std::move(playerNames);
-            murderScanActors = std::move(trackedActors);
-            murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedScanKey);
-            const auto now = steadyMilliseconds();
-            const bool playerCountChanged =
-                murderPlayerNames.size() != lastLoggedMurderPlayerCount;
-            if (playerCountChanged || lastMurderRosterStatusLogMs == 0 ||
-                now - lastMurderRosterStatusLogMs >= 10000) {
-                lastLoggedMurderPlayerCount = murderPlayerNames.size();
-                lastMurderRosterStatusLogMs = now;
-                diagnostic("MurderDetect roster updated: actors=", actorHandles.size(),
-                           " runtimeIds=", runtimeIdActorCount,
-                           " namedActors=", namedActorCount,
-                           " trackedActors=", murderScanActors.size(),
-                           " players=", murderPlayerNames.size(),
-                           " observedTags=", actorTags.size());
-            }
-        } else {
-            murderPlayerNames = std::move(playerNames);
-            murderScanActors.clear();
-            murderScanCursor = 0;
-            const auto now = steadyMilliseconds();
-            if (lastMurderRosterStatusLogMs == 0 ||
-                now - lastMurderRosterStatusLogMs >= 5000) {
-                diagnostic("MurderDetect waiting for live roster: actors=",
-                           actorHandles.size(), " runtimeIds=", runtimeIdActorCount,
-                           " playerNames=", playerNames.size(),
-                           " observedTags=", actorTags.size(),
-                           " namedActors=", namedActorCount,
-                           " trackedActors=", trackedActors.size());
-                lastMurderRosterStatusLogMs = now;
-            }
+        std::sort(build.tracked.begin(), build.tracked.end(),
+            [](const auto& a, const auto& b) { return a.scanKey < b.scanKey; });
+        murderScanActors = std::move(build.tracked);
+        murderKnownPlayerNamesByRuntimeId = std::move(build.namesById);
+        murderKnownPlayerNamesByActor = std::move(build.namesByActor);
+        const auto next = std::upper_bound(murderScanActors.begin(), murderScanActors.end(),
+            murderLastProcessedScanKey,
+            [](std::uintptr_t key, const MurderActorEntry& actor) { return key < actor.scanKey; });
+        murderScanCursor = next == murderScanActors.end() ? 0 :
+            static_cast<std::size_t>(next - murderScanActors.begin());
+        const auto now = steadyMilliseconds();
+        if (now - lastMurderRosterStatusLogMs >= 10000 || lastMurderRosterStatusLogMs == 0) {
+            diagnostic("MurderDetect roster: actors=", build.handles.size(),
+                       " trackedPlayers=", murderScanActors.size(),
+                       " players=", murderPlayerNames.size(), " [incremental RuntimeID reads]");
+            lastMurderRosterStatusLogMs = now;
         }
+        pendingActorRoster.reset();
+        nextActorRosterMs = steadyMilliseconds() + 2000;
     } catch (...) {
-        // Keep the last good roster if native enumeration transiently fails.
+        pendingActorRoster.reset();
+        nextActorRosterMs = steadyMilliseconds() + 2000;
     }
 }
 
@@ -1956,43 +1848,64 @@ void __fastcall onLevelSubTick(void* level) {
     RuntimeActorListTickScope actorListTickScope;
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
-    // Poll at most one cached Actor per second as a fallback for hidden labels;
-    // visible labels are captured immediately by the getter hook.
-    static unsigned refreshTicks = 0;
-    if (++refreshTicks >= 20) {
-        refreshTicks = 0;
-        if (gameApi) (void)gameApi->refreshCachedActorNameTags(1);
-    }
     const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
-    // Face extraction copies the row snapshot and reads native skin data.
-    // Limit this optional work to once every four game ticks.
-    static unsigned faceRefreshCadence = 0;
-    if (++faceRefreshCadence >= 4) {
-        faceRefreshCadence = 0;
-        refreshOneCachedFace(config);
+    if (!config->enabled || stopRequested.load(std::memory_order_acquire)) return;
+    static tablist::NativeUpdateScheduler scheduler;
+    static std::uint64_t epoch = 0;
+    const auto currentEpoch = murderWorldEpoch.load(std::memory_order_acquire);
+    if (epoch != currentEpoch) {
+        epoch = currentEpoch;
+        scheduler.reset();
+        pendingActorRoster.reset();
+        murderScanLevel = nullptr;
+        murderScanActors.clear();
+        murderPlayerNames.clear();
     }
-    static auto nextMurderScan = std::chrono::steady_clock::time_point{};
-    static unsigned lastMurderScanIntervalMs = 0;
-    if (config->murderDetect || config->gamemodeCheck) {
-        refreshTrackedMurderActors(level);
-        const auto now = std::chrono::steady_clock::now();
-        if (lastMurderScanIntervalMs != config->murderScanIntervalMs) {
-            lastMurderScanIntervalMs = config->murderScanIntervalMs;
-            nextMurderScan = now;
-        }
-        if (now >= nextMurderScan) {
-            // Schedule from the current time rather than catching up after a
-            // slow frame, so native equipment reads can never burst together.
-            nextMurderScan = now +
-                std::chrono::milliseconds(config->murderScanIntervalMs);
+    const auto now = steadyMilliseconds();
+    const bool detect = config->murderDetect || config->gamemodeCheck;
+    const auto rows = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
+    const auto work = scheduler.choose(now, {
+        detect && !murderScanActors.empty(),
+        tabRowsLastStartedMs == 0 || now - tabRowsLastStartedMs >= 1000,
+        detect && !murderPlayerNames.empty() &&
+            (pendingActorRoster.has_value() || now >= nextActorRosterMs),
+        config->showFaces && now >= nextFaceReadMs && rows &&
+            std::any_of(rows->begin(), rows->end(), [](const auto& row) { return !row.hasFace; })
+    });
+    if (!work) return;
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        switch (*work) {
+        case tablist::NativeUpdate::Item:
             updateMurderDetection(config->murderDetect, config->gamemodeCheck);
+            scheduler.defer(*work, steadyMilliseconds() + config->murderScanIntervalMs);
+            break;
+        case tablist::NativeUpdate::Players:
+            refreshTabRowsCache(config);
+            break;
+        case tablist::NativeUpdate::Roster:
+            refreshTrackedMurderActors(level);
+            break;
+        case tablist::NativeUpdate::Face:
+            refreshOneCachedFace(config);
+            break;
         }
-    } else {
-        nextMurderScan = {};
-        lastMurderScanIntervalMs = 0;
+    } catch (...) {
+        // Allocation/cache failure must not escape the native update callback.
     }
-    // Build the PlayerList snapshot in small batches across game ticks.
-    refreshTabRowsCache(config);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    static std::array<std::int64_t, 4> maximumUs{};
+    static std::int64_t nextReport = 0;
+    const auto index = static_cast<std::size_t>(*work);
+    maximumUs[index] = std::max(maximumUs[index], static_cast<std::int64_t>(elapsed));
+    if ((config->debug || elapsed >= 2000) && now >= nextReport) {
+        nextReport = now + 10000;
+        diagnostic("TabList native max us: item=", maximumUs[0], " players=", maximumUs[1],
+                   " roster=", maximumUs[2], " face=", maximumUs[3],
+                   " [one stage per callback]");
+        maximumUs.fill(0);
+    }
 }
 
 void BDS_HOOK_CALL keyboardMiddleware(void*, void* raw, BDS_HookNext next, void* frame) {
@@ -2060,7 +1973,7 @@ void drawTabList(void*) {
     const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
     if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire)) return;
-    if (!gameplayActive.load(std::memory_order_acquire)) return;
+    if (!gameplayActive.load(std::memory_order_acquire) || !levelIsFresh()) return;
     const auto playersSnapshot = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
     if (!playersSnapshot || playersSnapshot->empty()) return;
     const auto& players = *playersSnapshot;
@@ -2256,16 +2169,16 @@ void removeNativeHooks() noexcept {
         if (token) BDS_HookUnsubscribe(token);
         token = nullptr;
     }
+    stopTabRowsWorker();
     stopMurderWorker();
-    gameHooks.reset();
+    if (actorNameTagHookToken) BDS_HookUnsubscribe(actorNameTagHookToken);
+    actorNameTagHookToken = nullptr;
     gameApi.reset();
     originalKeyboardFeed.store(nullptr);
     originalGrabCursor.store(nullptr);
     originalReleaseCursor.store(nullptr);
     originalGetFov.store(nullptr);
     originalLevelSubTick.store(nullptr);
-    originalActorGetNameTag.store(nullptr, std::memory_order_release);
-    resolvedActorGetNameTag.store(nullptr, std::memory_order_release);
     runtimeActorListSlot.store(std::numeric_limits<std::size_t>::max(), std::memory_order_release);
     runtimeActorListTarget.store(nullptr, std::memory_order_release);
     itemHoverNameTarget.store(nullptr, std::memory_order_release);
@@ -2293,8 +2206,11 @@ DWORD WINAPI startClient(void*) {
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
-    diagnosticLog.open(path.parent_path() / L"TabList.log",
-                       std::ios::binary | std::ios::trunc);
+    if (!diagnosticWriter.start(path.parent_path() / L"TabList.log")) {
+        status.store(Status::Failed, std::memory_order_release);
+        return 1;
+    }
+    struct DiagnosticStop { ~DiagnosticStop() { diagnosticWriter.stop(); } } diagnosticStop;
     diagnostic("start");
     bedrock::ProfileChoice version;
     std::string profile;
@@ -2340,9 +2256,9 @@ DWORD WINAPI startClient(void*) {
     };
     std::optional<bedrock::Resolution> actorNameTag;
     const auto resolveActorNameTag = [&] {
-        actorNameTag = resolver.resolve("Actor::getNameTag", true);
-        if (actorNameTag &&
-            (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
+        actorNameTag = bedrock::resolveSharedHook(
+            resolver, "Actor::getNameTag", BDS_HOOK_ACTOR_GET_NAME_TAG);
+        if (actorNameTag && !bedrock::isUsableSharedHookResolution(*actorNameTag))
             actorNameTag.reset();
     };
     const auto resolveRuntimeActorList = [](const bedrock::Resolver& source) {
@@ -2419,9 +2335,9 @@ DWORD WINAPI startClient(void*) {
             embeddedResolver.attachWindowsMainModule(version.identity, embeddedError) &&
             embeddedResolver.exactBuild()) {
             if (!actorNameTag) {
-                actorNameTag = embeddedResolver.resolve("Actor::getNameTag", true);
-                if (actorNameTag &&
-                    (!actorNameTag->exact_build || actorNameTag->method != "exact-rva"))
+                actorNameTag = bedrock::resolveSharedHook(
+                    embeddedResolver, "Actor::getNameTag", BDS_HOOK_ACTOR_GET_NAME_TAG);
+                if (actorNameTag && !bedrock::isUsableSharedHookResolution(*actorNameTag))
                     actorNameTag.reset();
             }
             if (!runtimeActorListReady)
@@ -2477,10 +2393,15 @@ DWORD WINAPI startClient(void*) {
         diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
 
+    if (!startTabRowsWorker()) {
+        diagnostic("TabList row worker unavailable; startup stopped");
+        status.store(Status::Failed, std::memory_order_release);
+        return 1;
+    }
     if (startMurderWorker())
         diagnostic("MurderDetect worker ready [copied snapshots only; native reads stay on game thread]");
     else
-        diagnostic("MurderDetect worker unavailable; copied-snapshot processing will use the game thread");
+        diagnostic("MurderDetect worker unavailable; samples are skipped");
 
     originalKeyboardFeed.store(&callNextKeyboard);
     originalGrabCursor.store(&callNextCursor);
@@ -2504,7 +2425,7 @@ DWORD WINAPI startClient(void*) {
     diagnostic("shared hooks registered");
 
     gameApi = std::make_unique<bedrock::GameApi>(tabListGameAccess);
-    gameHooks = std::make_unique<bedrock::GameHooks>(*gameApi);
+
     bool actorNameTagHookReady = false;
     if (actorNameTag) {
         diagnostic("Actor::getNameTag subscribe attempt: target=0x", std::hex,
@@ -2514,25 +2435,19 @@ DWORD WINAPI startClient(void*) {
                    " broker_owned=",
                    BDS_HookOwnsTarget(BDS_HOOK_ACTOR_GET_NAME_TAG,
                        reinterpret_cast<void*>(actorNameTag->address)));
-        actorNameTagHookReady = gameHooks->installActorNameTag(resolver, error);
+        actorNameTagHookReady = BDS_HookSubscribe(BDS_HOOK_ACTOR_GET_NAME_TAG,
+            reinterpret_cast<void*>(actorNameTag->address), actorNameTagMiddleware,
+            nullptr, &actorNameTagHookToken);
     }
     if (actorNameTagHookReady) {
-        gameApi->Event.Enum.ActorNameTag.then([](const bedrock::ActorNameTagEvent& event) {
-            if (!event.actor || event.nameTag.empty() || event.nameTag.size() > 512) return;
-            try {
-                captureQueriedActorNameTag(event.actor, std::string(event.nameTag));
-            } catch (...) {
-                // Cache updates are best-effort; never interfere with rendering.
-            }
-        });
-        diagnostic("SDK GameHooks::ActorNameTag active; method=", actorNameTag->method,
+        diagnostic("Shared ActorNameTag capture active [no per-call SDK validation]; method=", actorNameTag->method,
                    " exact_build=", actorNameTag->exact_build,
                    " verified=", actorNameTag->verified);
     } else {
         diagnostic("SDK ActorNameTag hook unavailable; color sorting has no live Actor source",
                    error.empty() ? "" : ": ", error);
     }
-    diagnostic("Actor NameTag color source: SDK hook ",
+    diagnostic("Actor NameTag color source: shared capture ",
                actorNameTagHookReady ? "active" : "unavailable");
 
     bedrock::gui::OverlayOptions options;
@@ -2559,7 +2474,7 @@ DWORD WINAPI startClient(void*) {
         const auto delay = std::atomic_load_explicit(&liveConfig,
             std::memory_order_acquire)->reloadIntervalMs;
         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-        if (!levelIsFresh()) tryAcquireLevelFromClient();
+
         std::error_code ec;
         const auto currentWrite = std::filesystem::last_write_time(path, ec);
         if (!ec && currentWrite != lastWrite && loadConfig(path, logger)) {
@@ -2568,7 +2483,6 @@ DWORD WINAPI startClient(void*) {
         }
     }
 
-    if (tabRowsWorker.joinable()) tabRowsWorker.join();
     bedrock::gui::Overlay::shutdown();
     removeNativeHooks();
     status.store(Status::Stopped, std::memory_order_release);
