@@ -254,12 +254,11 @@ struct MurderActorEntry {
 };
 std::vector<MurderActorEntry> murderScanActors;
 std::vector<std::string> murderPlayerNames;
+std::unordered_map<void*, std::string> murderKnownPlayerNamesByActor;
 std::size_t murderScanCursor = 0;
 std::uintptr_t murderLastProcessedActor = 0;
 void* murderScanLevel = nullptr;
 std::uint64_t murderActorSnapshotTick = 0;
-std::size_t lastLoggedMurderActorCount = std::numeric_limits<std::size_t>::max();
-std::size_t lastLoggedMurderPlayerActorCount = std::numeric_limits<std::size_t>::max();
 std::size_t lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
 std::int64_t lastMurderRosterStatusLogMs{};
 std::atomic<bool> loggedMurderActorReadFault{false};
@@ -460,7 +459,9 @@ void processMurderSample(const MurderSample& sample) noexcept {
         if (changed && sample.hasItem) {
             const char* roleName = role == tablist::MurderRole::Sheriff ? "Sheriff"
                 : role == tablist::MurderRole::Murderer ? "Murderer" : "none";
-            diagnostic("Item held: player=", sample.name,
+            const bool resolvedPlayer = sample.name.rfind("unmatched@0x", 0) != 0;
+            diagnostic("Item held: ", resolvedPlayer ? "player=" : "actor=",
+                       sample.name,
                        " name=", currentDisplay.empty() ? itemKey : currentDisplay,
                        " id=", itemKey, " count=", sample.count,
                        " role=", roleName,
@@ -1589,6 +1590,7 @@ void refreshTrackedMurderActors(void* level) noexcept {
             murderScanLevel = level;
             murderScanActors.clear();
             murderPlayerNames.clear();
+            murderKnownPlayerNamesByActor.clear();
             murderScanCursor = 0;
             murderLastProcessedActor = 0;
             {
@@ -1599,17 +1601,15 @@ void refreshTrackedMurderActors(void* level) noexcept {
                 lastHeldItemByPlayer.clear();
                 heldItemNamesByPlayer.clear();
             }
-            murderActorSnapshotTick = 19; // First live roster is ready immediately.
-            lastLoggedMurderActorCount = std::numeric_limits<std::size_t>::max();
-            lastLoggedMurderPlayerActorCount = std::numeric_limits<std::size_t>::max();
+            murderActorSnapshotTick = 39; // First live roster is ready immediately.
             lastLoggedMurderPlayerCount = std::numeric_limits<std::size_t>::max();
             lastMurderRosterStatusLogMs = 0;
         }
-        // Refresh the native Level actor list at most once per second. Match
+        // Refresh the native Level actor list at most once every two seconds. Match
         // its handles against copied SDK NameTag snapshots; avoid calling the
         // native NameTag getter or SDK identity path for every Actor each tick.
         ++murderActorSnapshotTick;
-        if (murderActorSnapshotTick < 20) return;
+        if (murderActorSnapshotTick < 40) return;
         murderActorSnapshotTick = 0;
 
         // Actor enumeration remains exclusively Level::getRuntimeActorList.
@@ -1648,41 +1648,48 @@ void refreshTrackedMurderActors(void* level) noexcept {
                 playerNamesByActor.insert_or_assign(tag.actor, std::move(playerName));
         }
 
-        std::vector<MurderActorEntry> playerActors;
-        playerActors.reserve(actorHandles.size());
+        std::vector<MurderActorEntry> trackedActors;
+        trackedActors.reserve(actorHandles.size());
+        std::unordered_map<void*, std::string> nextKnownPlayerNames;
+        nextKnownPlayerNames.reserve(std::min(actorHandles.size(), playerNames.size()));
         std::size_t namedActorCount = 0;
         for (auto* actor : actorHandles) {
-            const auto player = playerNamesByActor.find(actor);
+            auto player = playerNamesByActor.find(actor);
+            if (player == playerNamesByActor.end()) {
+                const auto known = murderKnownPlayerNamesByActor.find(actor);
+                if (known != murderKnownPlayerNamesByActor.end())
+                    player = playerNamesByActor.emplace(actor, known->second).first;
+            }
             if (player != playerNamesByActor.end()) {
-                playerActors.push_back({actor, player->second});
+                trackedActors.push_back({actor, player->second});
+                nextKnownPlayerNames.insert_or_assign(actor, player->second);
                 ++namedActorCount;
             } else {
-                playerActors.push_back({actor, {}});
+                trackedActors.push_back({actor, {}});
             }
         }
-        if (!playerNames.empty() && !playerActors.empty()) {
+        murderKnownPlayerNamesByActor = std::move(nextKnownPlayerNames);
+        if (!playerNames.empty() && !trackedActors.empty()) {
             std::vector<std::uintptr_t> handles;
-            handles.reserve(playerActors.size());
-            for (const auto& actor : playerActors)
+            handles.reserve(trackedActors.size());
+            for (const auto& actor : trackedActors)
                 handles.push_back(reinterpret_cast<std::uintptr_t>(actor.actor));
             murderPlayerNames = std::move(playerNames);
-            murderScanActors = std::move(playerActors);
+            murderScanActors = std::move(trackedActors);
             murderScanCursor = tablist::nextActorScanIndex(handles, murderLastProcessedActor);
-            const auto actorCount = actorHandles.size();
-            const auto playerActorCount = namedActorCount;
-            if (actorCount != lastLoggedMurderActorCount ||
-                playerActorCount != lastLoggedMurderPlayerActorCount ||
-                murderPlayerNames.size() != lastLoggedMurderPlayerCount) {
-                lastLoggedMurderActorCount = actorCount;
-                lastLoggedMurderPlayerActorCount = playerActorCount;
+            const auto now = steadyMilliseconds();
+            const bool playerCountChanged =
+                murderPlayerNames.size() != lastLoggedMurderPlayerCount;
+            if (playerCountChanged || lastMurderRosterStatusLogMs == 0 ||
+                now - lastMurderRosterStatusLogMs >= 10000) {
                 lastLoggedMurderPlayerCount = murderPlayerNames.size();
-                diagnostic("MurderDetect roster updated: actors=", actorCount,
-                           " namedActors=", playerActorCount,
+                lastMurderRosterStatusLogMs = now;
+                diagnostic("MurderDetect roster updated: actors=", actorHandles.size(),
+                           " namedActors=", namedActorCount,
                            " trackedActors=", murderScanActors.size(),
                            " players=", murderPlayerNames.size(),
                            " observedTags=", actorTags.size());
             }
-            lastMurderRosterStatusLogMs = steadyMilliseconds();
         } else {
             const auto now = steadyMilliseconds();
             if (lastMurderRosterStatusLogMs == 0 ||

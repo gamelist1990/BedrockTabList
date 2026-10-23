@@ -70,7 +70,17 @@ int main() {
     assert(roundTrip.murderDetect && roundTrip.debug);
     assert(tablist::murderRoleForHeldItem("minecraft:bow", "Bow") ==
            tablist::MurderRole::Sheriff);
+    assert(tablist::murderRoleForHeldItem("", "Bow") ==
+           tablist::MurderRole::None);
     assert(tablist::murderRoleForHeldItem("minecraft:arrow", "Arrow") ==
+           tablist::MurderRole::Sheriff);
+    assert(tablist::murderRoleForHeldItem(
+        "hivemurder:magnifying_glass_item", "Magnifying Glass") ==
+           tablist::MurderRole::Sheriff);
+    assert(tablist::murderRoleForHeldItem(
+        "hivemurder:zapper_ray_gun", "Zapper Ray Gun") ==
+           tablist::MurderRole::Murderer);
+    assert(tablist::murderRoleForHeldItem("hivemurder:utility_compass", "Compass") ==
            tablist::MurderRole::None);
     assert(tablist::murderRoleForHeldItem(
         "hivemurder:murder_weapon_baseball_bat", "hivemurder:murder_weapon_baseball_bat") ==

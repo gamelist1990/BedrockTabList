@@ -8,6 +8,7 @@ namespace tablist {
 
 MurderRole murderRoleForHeldItem(std::string_view identifier,
                                  std::string_view displayName) {
+    (void)displayName; // Role identity is based only on the stable Item ID.
     const auto equalsIgnoreCase = [](std::string_view left, std::string_view right) {
         if (left.size() != right.size()) return false;
         for (std::size_t i = 0; i < left.size(); ++i) {
@@ -21,12 +22,13 @@ MurderRole murderRoleForHeldItem(std::string_view identifier,
             (identifier.size() > id.size() && identifier[identifier.size() - id.size() - 1] == ':' &&
              equalsIgnoreCase(identifier.substr(identifier.size() - id.size()), id));
     };
-    constexpr std::string_view murderNamespace = "hivemurder:";
-    if (identifier.size() >= murderNamespace.size() &&
-        equalsIgnoreCase(identifier.substr(0, murderNamespace.size()), murderNamespace))
-        return MurderRole::Murderer;
-    if (idIs("bow") || equalsIgnoreCase(displayName, "bow"))
+    if (idIs("bow") || idIs("arrow") || idIs("magnifying_glass_item"))
         return MurderRole::Sheriff;
+    constexpr std::string_view murderWeaponPrefix = "hivemurder:murder_weapon_";
+    if ((identifier.size() >= murderWeaponPrefix.size() &&
+         equalsIgnoreCase(identifier.substr(0, murderWeaponPrefix.size()), murderWeaponPrefix)) ||
+        idIs("zapper_ray_gun"))
+        return MurderRole::Murderer;
     constexpr std::array<std::string_view, 7> meleeWeapons{
         "wooden_sword", "stone_sword", "iron_sword", "golden_sword",
         "diamond_sword", "netherite_sword", "mace"};
