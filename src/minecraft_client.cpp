@@ -248,6 +248,7 @@ std::thread murderWorker;
 bool murderWorkerStopping{};
 std::atomic<std::uint64_t> droppedMurderSamples{0};
 std::atomic<std::uint64_t> murderWorldEpoch{0};
+bool murderRoundHasRole = false; // Game thread only.
 // Raw handles come exclusively from Level::getRuntimeActorList on the game thread.
 // Each handle is validated incrementally before use, rather than in one sweep.
 struct MurderActorEntry {
@@ -816,12 +817,17 @@ bool levelIsFresh() noexcept {
     return heartbeat > 0 && steadyMilliseconds() - heartbeat <= 1000;
 }
 
-void recordLevel(void* level) noexcept {
+void recordLevel(void* level, bool lobbyReturn = false) noexcept {
     if (!level) return;
-    void* previous = levelInstance.exchange(level, std::memory_order_acq_rel);
+    static tablist::WorldIdentityTracker identity;
+    auto* player = tabListGameAccess.localPlayer();
+    const bool changed = identity.observe(reinterpret_cast<std::uintptr_t>(level),
+        reinterpret_cast<std::uintptr_t>(player), readActorRuntimeId(player));
+    levelInstance.store(level, std::memory_order_release);
     levelHeartbeatMs.store(steadyMilliseconds(), std::memory_order_release);
-    if (previous != level) {
+    if (changed || lobbyReturn) {
         murderWorldEpoch.fetch_add(1, std::memory_order_acq_rel);
+        murderRoundHasRole = false;
         tabListGameAccess.clearPlayerNameCache();
         tabRowsLastStartedMs = 0;
         {
@@ -843,6 +849,15 @@ void recordLevel(void* level) noexcept {
         }
         playerFaceIds.clear();
         nativeItemIdentifiers.clear();
+        murderScanActors.clear();
+        murderPlayerNames.clear();
+        murderKnownPlayerNamesByRuntimeId.clear();
+        murderKnownPlayerNamesByActor.clear();
+        pendingActorRoster.reset();
+        murderScanLevel = nullptr;
+        murderScanCursor = 0;
+        murderLastProcessedScanKey = 0;
+        nextActorRosterMs = 0;
         nextFaceReadMs = 0;
         cachedFaceCursor = 0;
         {
@@ -858,7 +873,8 @@ void recordLevel(void* level) noexcept {
         }
         loggedMurderActorReadFault.store(false, std::memory_order_release);
         droppedMurderSamples.store(0, std::memory_order_release);
-        diagnostic("level ready");
+        diagnostic("level ready [", lobbyReturn ? "returned to lobby" : "world identity changed",
+                   "; roles and item caches reset]");
     }
 }
 
@@ -1744,6 +1760,17 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
                 copied.displayName = item->displayName;
                 copied.count = item->count;
             }
+            // Hive can return to its lobby inside the same Level and player.
+            // Reset once on that boundary, retaining roles during ordinary swaps.
+            if (murderRoundHasRole && tablist::isMurderLobbyItem(copied.identifier)) {
+                recordLevel(level, true);
+                copied.worldEpoch = murderWorldEpoch.load(std::memory_order_acquire);
+                enqueueMurderSample(std::move(copied));
+                return; // recordLevel invalidated the Actor roster.
+            }
+            if (copied.hasItem && tablist::murderRoleForHeldItem(
+                    copied.identifier, copied.displayName) != tablist::MurderRole::None)
+                murderRoundHasRole = true;
             enqueueMurderSample(std::move(copied));
         }
     } catch (...) {

@@ -16,8 +16,21 @@ struct Layout {
 };
 
 enum class MurderRole { None, Sheriff, Murderer };
+// Servers can replace the local player without replacing the Level allocation.
+// Missing RuntimeID reads do not replace the last successful identity.
+class WorldIdentityTracker {
+public:
+    bool observe(std::uintptr_t level, std::uintptr_t player,
+                 std::optional<std::uint64_t> runtimeId) noexcept;
+private:
+    std::uintptr_t level_{};
+    std::uintptr_t player_{};
+    std::optional<std::uint64_t> runtimeId_;
+};
+
 [[nodiscard]] MurderRole murderRoleForHeldItem(std::string_view identifier,
                                                 std::string_view displayName);
+[[nodiscard]] bool isMurderLobbyItem(std::string_view identifier) noexcept;
 // Actor handles are sorted before polling. Preserve round-robin progress when
 // the live Actor snapshot is refreshed so large worlds cannot starve entries
 // near the end of the list.

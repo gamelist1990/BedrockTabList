@@ -102,7 +102,26 @@ int main() {
            tablist::MurderRole::Sheriff);
     assert(tablist::murderRoleForHeldItem(
         "hivemurder:zapper_ray_gun", "Zapper Ray Gun") ==
-           tablist::MurderRole::Murderer);
+           tablist::MurderRole::None);
+    assert(tablist::murderRoleForHeldItem("HIVEMURDER:ZAPPER_RAY_GUN", "Zapper") ==
+           tablist::MurderRole::None);
+
+    tablist::WorldIdentityTracker worldIdentity;
+    assert(worldIdentity.observe(100, 200, 1));
+    assert(!worldIdentity.observe(100, 200, 1));
+    assert(!worldIdentity.observe(100, 200, std::nullopt));
+    assert(!worldIdentity.observe(100, 200, 1));
+    assert(worldIdentity.observe(100, 200, 2)); // Same allocations, new RuntimeID.
+    assert(worldIdentity.observe(100, 201, 2)); // Replaced local player.
+    assert(worldIdentity.observe(100, 0, std::nullopt)); // Loading/disconnect.
+    assert(!worldIdentity.observe(100, 0, std::nullopt));
+    assert(worldIdentity.observe(100, 201, 2)); // Allocations reused after loading.
+    assert(worldIdentity.observe(101, 201, 2));
+    assert(tablist::isMurderLobbyItem("hivehub:compass"));
+    assert(tablist::isMurderLobbyItem("hivecommon:settings"));
+    assert(!tablist::isMurderLobbyItem("hivemurder:zapper_ray_gun"));
+    assert(!tablist::isMurderLobbyItem("minecraft:compass")); // Spectator teleporter.
+    assert(!tablist::isMurderLobbyItem("minecraft:nether_star")); // Weapon ability.
     assert(tablist::murderRoleForHeldItem("hivemurder:utility_compass", "Compass") ==
            tablist::MurderRole::None);
     assert(tablist::murderRoleForHeldItem(

@@ -6,6 +6,22 @@
 
 namespace tablist {
 
+bool WorldIdentityTracker::observe(std::uintptr_t level, std::uintptr_t player,
+                                   std::optional<std::uint64_t> runtimeId) noexcept {
+    const bool changed = level != level_ || player != player_ ||
+        (runtimeId && runtimeId_ && runtimeId != runtimeId_);
+    if (changed) runtimeId_.reset();
+    level_ = level;
+    player_ = player;
+    if (runtimeId) runtimeId_ = runtimeId;
+    return changed;
+}
+
+bool isMurderLobbyItem(std::string_view identifier) noexcept {
+    // Stable IDs observed in the hub and pre-game lobby, never display names.
+    return identifier.starts_with("hivehub:") || identifier == "hivecommon:settings";
+}
+
 MurderRole murderRoleForHeldItem(std::string_view identifier,
                                  std::string_view displayName) {
     (void)displayName; // Role identity is based only on the stable Item ID.
@@ -25,9 +41,8 @@ MurderRole murderRoleForHeldItem(std::string_view identifier,
     if (idIs("bow") || idIs("arrow") || idIs("magnifying_glass_item"))
         return MurderRole::Sheriff;
     constexpr std::string_view murderWeaponPrefix = "hivemurder:murder_weapon_";
-    if ((identifier.size() >= murderWeaponPrefix.size() &&
-         equalsIgnoreCase(identifier.substr(0, murderWeaponPrefix.size()), murderWeaponPrefix)) ||
-        idIs("zapper_ray_gun"))
+    if (identifier.size() >= murderWeaponPrefix.size() &&
+        equalsIgnoreCase(identifier.substr(0, murderWeaponPrefix.size()), murderWeaponPrefix))
         return MurderRole::Murderer;
     constexpr std::array<std::string_view, 7> meleeWeapons{
         "wooden_sword", "stone_sword", "iron_sword", "golden_sword",
