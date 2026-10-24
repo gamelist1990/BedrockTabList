@@ -32,11 +32,11 @@ int main() {
 
     std::string defaultsError;
     const auto defaults = tablist::parseConfig("{}", defaultsError);
-    assert(defaultsError.empty() && defaults.murderScanIntervalMs == 400);
+    assert(defaultsError.empty() && defaults.murderScanIntervalMs == 150);
     std::string oldConfigError;
     const auto oldConfig = tablist::parseConfig(
         R"({"murder_scan_interval_ticks":20})", oldConfigError);
-    assert(oldConfigError.empty() && oldConfig.murderScanIntervalMs == 400);
+    assert(oldConfigError.empty() && oldConfig.murderScanIntervalMs == 150);
     std::string customConfigError;
     const auto customConfig = tablist::parseConfig(
         R"({"murder_scan_interval_ticks":5})", customConfigError);

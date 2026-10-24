@@ -644,11 +644,26 @@ void enqueueMurderSample(MurderSample sample) noexcept {
     }
 }
 
+struct ReadRegion { std::uintptr_t begin{},end{}; };
+thread_local std::array<ReadRegion,32> nativeReadRegions{};
+thread_local std::size_t nativeReadRegionCursor{};
+thread_local bool nativeReadRegionsActive=false;
+struct NativeReadRegionScope {
+    bool previous=nativeReadRegionsActive;
+    NativeReadRegionScope() noexcept {
+        if(!previous) { nativeReadRegions.fill({}); nativeReadRegionCursor=0; }
+        nativeReadRegionsActive=true;
+    }
+    ~NativeReadRegionScope() { nativeReadRegionsActive=previous; }
+};
+
 bool readable(const void* pointer, std::size_t bytes) noexcept {
     if (!pointer || !bytes) return false;
     const auto start = reinterpret_cast<std::uintptr_t>(pointer);
     if (start > UINTPTR_MAX - bytes) return false;
     const auto wantedEnd = start + bytes;
+    if(nativeReadRegionsActive) for(const auto& region:nativeReadRegions)
+        if(start>=region.begin && wantedEnd<=region.end) return true;
     auto cursor = start;
     while (cursor < wantedEnd) {
         MEMORY_BASIC_INFORMATION region{};
@@ -663,6 +678,8 @@ bool readable(const void* pointer, std::size_t bytes) noexcept {
         const auto regionStart = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
         const auto regionEnd = regionStart + region.RegionSize;
         if (regionEnd <= cursor) return false;
+        if(nativeReadRegionsActive)
+            nativeReadRegions[nativeReadRegionCursor++%nativeReadRegions.size()]={regionStart,regionEnd};
         cursor = regionEnd;
     }
     return true;
@@ -1716,11 +1733,15 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
         void* level = levelInstance.load(std::memory_order_acquire);
         if (!level) return;
         if (murderScanActors.empty() || murderPlayerNames.empty()) return;
-        // One bounded equipment read per configured interval. The roster is
-        // prefiltered to Actors matched to current PlayerList names.
-        constexpr std::size_t actorsPerTick = 1;
-        const auto sampleCount = std::min(actorsPerTick, murderScanActors.size());
+        const auto config=std::atomic_load_explicit(&liveConfig,std::memory_order_acquire);
+        const auto sampleCount=tablist::equipmentReadsPerTick(murderScanActors.size(),config->murderScanIntervalMs);
+        const auto begin=std::chrono::steady_clock::now();
+        std::size_t attempted=0;
         for (std::size_t sample = 0; sample < sampleCount; ++sample) {
+            // A single native call cannot be preempted. Continue from this cursor
+            // on the next tick instead of doing overdue work in a catch-up burst.
+            if(sample && std::chrono::steady_clock::now()-begin>=std::chrono::microseconds(750)) break;
+            ++attempted;
             if (murderScanCursor >= murderScanActors.size()) murderScanCursor = 0;
             const auto& tracked = murderScanActors[murderScanCursor];
             auto* actor = tracked.actor;
@@ -1772,6 +1793,16 @@ void updateMurderDetection(bool readItems, bool readGameMode) noexcept {
                     copied.identifier, copied.displayName) != tablist::MurderRole::None)
                 murderRoundHasRole = true;
             enqueueMurderSample(std::move(copied));
+        }
+        static std::int64_t nextScanLog=0;
+        const auto now=steadyMilliseconds();
+        if(now>=nextScanLog) {
+            nextScanLog=now+5000;
+            diagnostic("MurderDetect equipment sweep: tracked=",murderScanActors.size(),
+                " target_ms=",config->murderScanIntervalMs," planned_per_tick=",sampleCount,
+                " attempted=",attempted," budget_limited=",attempted<sampleCount,
+                " native_us=",std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count(),
+                " [750us cooperative budget; maximum 12 Actors/tick; copied snapshots to worker]");
         }
     } catch (...) {
         // Item inspection is observational; never interfere with the game tick.
@@ -1875,6 +1906,7 @@ void __fastcall onLevelSubTick(void* level) {
     RuntimeActorListTickScope actorListTickScope;
     recordLevel(level);
     if (auto original = originalLevelSubTick.load(std::memory_order_acquire)) original(level);
+    NativeReadRegionScope nativeReadScope;
     const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
     if (!config->enabled || stopRequested.load(std::memory_order_acquire)) return;
     static tablist::NativeUpdateScheduler scheduler;
@@ -1891,8 +1923,19 @@ void __fastcall onLevelSubTick(void* level) {
     const auto now = steadyMilliseconds();
     const bool detect = config->murderDetect || config->gamemodeCheck;
     const auto rows = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
+    static std::array<std::int64_t, 4> maximumUs{};
+    static std::int64_t nextReport = 0;
+    const auto start = std::chrono::steady_clock::now();
+    if(detect) updateMurderDetection(config->murderDetect,config->gamemodeCheck);
+    const auto itemUs=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
+    maximumUs[0]=std::max(maximumUs[0],static_cast<std::int64_t>(itemUs));
+    // Maintenance keeps a guaranteed turn at least every three callbacks even
+    // if a single native equipment getter exceeds the cooperative time budget.
+    static unsigned maintenanceTurn=0;
+    const bool maintenanceDue=(++maintenanceTurn%3)==0;
+    if(!maintenanceDue && std::chrono::steady_clock::now()-start>=std::chrono::microseconds(750)) return;
     const auto work = scheduler.choose(now, {
-        detect && !murderScanActors.empty(),
+        false, // Equipment is distributed on every tick, independently of maintenance.
         tabRowsLastStartedMs == 0 || now - tabRowsLastStartedMs >= 1000,
         detect && !murderPlayerNames.empty() &&
             (pendingActorRoster.has_value() || now >= nextActorRosterMs),
@@ -1900,13 +1943,11 @@ void __fastcall onLevelSubTick(void* level) {
             std::any_of(rows->begin(), rows->end(), [](const auto& row) { return !row.hasFace; })
     });
     if (!work) return;
-    const auto start = std::chrono::steady_clock::now();
+    const auto stageStart=std::chrono::steady_clock::now();
     try {
         switch (*work) {
         case tablist::NativeUpdate::Item:
-            updateMurderDetection(config->murderDetect, config->gamemodeCheck);
-            scheduler.defer(*work, steadyMilliseconds() + config->murderScanIntervalMs);
-            break;
+            break; // Equipment runs above; never schedule another sweep here.
         case tablist::NativeUpdate::Players:
             refreshTabRowsCache(config);
             break;
@@ -1921,16 +1962,14 @@ void __fastcall onLevelSubTick(void* level) {
         // Allocation/cache failure must not escape the native update callback.
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - start).count();
-    static std::array<std::int64_t, 4> maximumUs{};
-    static std::int64_t nextReport = 0;
+        std::chrono::steady_clock::now() - stageStart).count();
     const auto index = static_cast<std::size_t>(*work);
     maximumUs[index] = std::max(maximumUs[index], static_cast<std::int64_t>(elapsed));
-    if ((config->debug || elapsed >= 2000) && now >= nextReport) {
+    if ((config->debug || elapsed >= 2000 || maximumUs[0]>=2000) && now >= nextReport) {
         nextReport = now + 10000;
         diagnostic("TabList native max us: item=", maximumUs[0], " players=", maximumUs[1],
                    " roster=", maximumUs[2], " face=", maximumUs[3],
-                   " [one stage per callback]");
+                   " [bounded item slice + at most one maintenance stage per callback]");
         maximumUs.fill(0);
     }
 }

@@ -64,16 +64,12 @@ Config parseConfig(std::string_view jsonText, std::string& error) noexcept {
         config.gamemodeCheck = root.value("gamemode_check", config.gamemodeCheck);
         config.debug = root.value("debug", config.debug);
         if (root.contains("murder_scan_interval_ms")) {
-            config.murderScanIntervalMs = std::clamp(
-                numberOr<unsigned>(root, "murder_scan_interval_ms",
-                                   config.murderScanIntervalMs), 250u, 2000u);
-        } else {
-            // Migrate the old tick setting to a stable real-time interval.
-            const auto legacyTicks = numberOr<unsigned>(
-                root, "murder_scan_interval_ticks", 8u);
-            config.murderScanIntervalMs = legacyTicks == 3 || legacyTicks == 20
-                ? 400u
-                : std::clamp(legacyTicks, 5u, 40u) * 50u;
+            const auto saved=numberOr<unsigned>(root,"murder_scan_interval_ms",150u);
+            // Migrate the previous generated 400ms default to the 3-tick target.
+            config.murderScanIntervalMs=saved==400 ? 150u : std::clamp(saved,50u,2000u);
+        } else if(root.contains("murder_scan_interval_ticks")) {
+            const auto ticks=numberOr<unsigned>(root,"murder_scan_interval_ticks",3u);
+            config.murderScanIntervalMs=ticks==20 ? 150u : std::clamp(ticks,1u,40u)*50u;
         }
         config.background = parseColor(root, "background_color", config.background);
         config.text = parseColor(root, "text_color", config.text);

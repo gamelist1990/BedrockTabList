@@ -45,7 +45,7 @@ C:\Users\<ユーザー名>\Documents\PEXData\TabList\config.json
   "murder_detect": true,
   "show_held_items": true,
   "gamemode_check": true,
-  "murder_scan_interval_ms": 400,
+  "murder_scan_interval_ms": 150,
   "debug": false,
   "background_color": "#0A0D14CC",
   "text_color": "#F2F5FBFF",
@@ -73,7 +73,7 @@ MurderDetectとGamemodeCheckのActor一覧は、SDKアダプターから `Level:
 `murder_detect` は手持ちの弓・矢・`hivemurder:magnifying_glass_item` を `[Sheriff]`（水色）、IDが `hivemurder:murder_weapon_*` または `hivemurder:zapper_ray_gun` のアイテム、バニラの剣・メイスを `[Murderer]`（赤）で
 表示します。`show_held_items` は手持ち名をTabListに表示する設定です。`false` にすると表示名の取得・キャッシュ・描画を止め、MurderDetectはItem IDだけを使って継続します。
 Actorごとの手持ち読み出しを実時間間隔で分散し、TabListを開いた瞬間には追加走査しません。
-`murder_scan_interval_ms` は追跡中のActor手持ちを読む間隔（既定400ms、最小250ms、最大2000ms）です。1回に読むActorは最大1人です。読み取り時刻は前回処理が遅れても追いつき実行せず、次の間隔を現在時刻から数え直します。以前のtick設定 `3` と `20` は400msに、その他のtick設定は50ms単位に変換して範囲内へ収めます。短時間だけ表示されるアイテムを見落とす可能性は上がりますが、ゲームスレッド上の読み取り頻度を下げ、安定性を優先しています。
+`murder_scan_interval_ms` は追跡中のPlayer全員の手持ちを一巡する目標間隔です（既定150ms≒3tick、最小50ms、最大2000ms）。毎tickに人数を分散して読み取り、最大12人/tick・協調的な750µs予算で打ち切って次tickへ続けます。16人なら通常は6人ずつ読み、3tickを目標に一巡します。予算や人数上限で遅れる場合があり、150ms未満の持ち替えを確実に捉える保証はありません。旧設定の400ms、旧tick設定20は新しい150msへ移行し、それ以外の明示設定は範囲内で維持します。描画名キャッシュ・素手のクリア・RuntimeID検証・ワーカーでの役割判定は継続します。`MurderDetect equipment sweep` の5秒ごとのログで目標・処理人数・予算不足を確認できます。
 Actor一覧はLevelのRuntimeActorListから取得し、取得開始の間隔を最短2秒に制限します。一覧の取得と各Actorの検証は別の更新に分け、RuntimeIDの確認を1更新につき最大1件ずつ進めます。処理中は前の完成済み一覧で追跡を続けます。`RuntimeIDComponent` はSDKのバージョン別レイアウトを使うアダプターで読み、名前キャッシュとラウンドロビン順序のキーに使います。これはEnTTのentity IDやActorUniqueIDとは別のBedrock RuntimeIDです。共有Hook runtimeでコピーしたNameTagは最初のActorとPlayerList名の照合に使います。NameTagのgetter呼び出しごとにSDKのActor再検証・全体キャッシュ更新を行わず、変更された短い文字列だけを保存します。キャッシュが使用中ならgetter側は待たず、次の観測に任せます。一度一致した後はActorポインタが変わってもRuntimeIDで名前対応を保持します。RuntimeIDを読めないActorはポインタを予備キーとして使い、同じRuntimeIDの重複Actorは除外します。手持ちの読み取り対象はPlayerList名と照合できたActorに絞り、その他のエンティティの装備を読みません。NameTagが一度も観測されずPlayerList名と結び付いていないActorは対象外です。役割判定は表示名でなくItem IDで行います。手持ちのNative readは
 1回の走査につき最大1 Actorに制限し、読み取りはゲームスレッドで行います。新しいアイテムIDの表示名をNative解決する処理も最大500msに1回に制限し、同じIDの名前はキャッシュを使います。Item IDと表示名がコピーされた後の役割判定・差分管理・ログ出力は上限256件のワーカーキューで処理します。キューが満杯なら古いサンプルを破棄し、キューが使用中の場合もゲームスレッドは待ちません。ワーカーを利用できない場合に、役割判定や行コピーをゲームスレッドへ戻す処理も行いません。確認できたアイテムが前回から変わった時は、`TabList.log` に `player` / `name` / `id` / `role` / `previous` を1行出します。同じアイテムを継続して持っている間は繰り返しません。`show_held_items=false` の場合は表示名のNative解決を省き、ログの`name`欄はItem IDになります。
 アイテムの読み取り失敗では最後に確認できた表示を保ちます。getterが正常に空を返すかスタック数0を確認できた場合は、素手として前の表示を消します。
