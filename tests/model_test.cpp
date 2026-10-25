@@ -128,9 +128,13 @@ int main() {
         "hivemurder:murder_weapon_baseball_bat", "hivemurder:murder_weapon_baseball_bat") ==
            tablist::MurderRole::Murderer);
     assert(tablist::murderRoleForHeldItem("minecraft:golden_sword", "Golden Sword") ==
-           tablist::MurderRole::Murderer);
+           tablist::MurderRole::None);
     assert(tablist::murderRoleForHeldItem("minecraft:diamond_sword", "Diamond Sword") ==
-           tablist::MurderRole::Murderer);
+           tablist::MurderRole::None);
+    assert(tablist::murderRoleForHeldItem("minecraft:mace", "Mace") ==
+           tablist::MurderRole::None);
+    assert(tablist::murderRoleForHeldItem("minecraft:diamond", "Diamond") ==
+           tablist::MurderRole::None);
     assert(tablist::murderRoleForHeldItem("minecraft:crossbow", "Crossbow") ==
            tablist::MurderRole::None);
     constexpr std::string_view formattedJapaneseItem =

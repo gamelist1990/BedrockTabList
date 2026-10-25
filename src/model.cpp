@@ -44,9 +44,9 @@ MurderRole murderRoleForHeldItem(std::string_view identifier,
     if (identifier.size() >= murderWeaponPrefix.size() &&
         equalsIgnoreCase(identifier.substr(0, murderWeaponPrefix.size()), murderWeaponPrefix))
         return MurderRole::Murderer;
-    constexpr std::array<std::string_view, 7> meleeWeapons{
-        "wooden_sword", "stone_sword", "iron_sword", "golden_sword",
-        "diamond_sword", "netherite_sword", "mace"};
+    // Golden/diamond swords and the mace are not role evidence on this server.
+    constexpr std::array<std::string_view, 4> meleeWeapons{
+        "wooden_sword", "stone_sword", "iron_sword", "netherite_sword"};
     if (std::any_of(meleeWeapons.begin(), meleeWeapons.end(), idIs))
         return MurderRole::Murderer;
     return MurderRole::None;
