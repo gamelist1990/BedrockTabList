@@ -4,7 +4,7 @@
 #include <bedrock/native/player_list.hpp>
 #include <bedrock/native/runtime_actors.hpp>
 #include <bedrock/packets/packet_api.hpp>
-#include <bedrock/packets/player_list_packets.hpp>
+#include <bedrock/packets/player_roster_service.hpp>
 #include <bedrock/runtime/module_identity.hpp>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -137,17 +137,10 @@ using ItemHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 // through RDX, then appends one Actor* per runtime entity.
 
 
-// These layouts come from the matching Latite SDK revision and are used only
-// after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
-constexpr std::size_t clientMinecraftOffset = 0x1B0;
-constexpr std::size_t minecraftGameSessionOffset = 0xC8;
-constexpr std::size_t sessionReadyOffset = 0x28;
-constexpr std::size_t sessionLevelControlOffset = 0x30;
-constexpr std::size_t sessionLevelOffset = 0x40;
 bedrock::NativePlayerList playerRoster; // Legacy builds without the common receive bridge.
 bedrock::NativeRuntimeActors runtimeActors;
 bedrock::PacketApi packets;
-bedrock::PlayerListPackets packetPlayers;
+bedrock::PlayerRosterService packetPlayers;
 bool packetRosterMode{};
 bedrock::NativeLocalPlayerGetter localPlayerGetter;
 constexpr int tabInputKey = 0x09;
@@ -1927,10 +1920,12 @@ void drawTabList(void*) {
     static auto nextReport=std::chrono::steady_clock::time_point{};
     const auto now=std::chrono::steady_clock::now();
     if(now>=nextReport){
-        nextReport=now+std::chrono::seconds(5);const auto net=packetPlayers.statistics();
+        nextReport=now+std::chrono::seconds(5);const auto net=packetPlayers.statistics();const auto receive=packets.receiveStatistics();
         diagnostic("TabList display: enabled=",config->enabled," gameplay=",playing," fresh_level=",fresh,
             " rows=",playersSnapshot?playersSnapshot->size():0," packet_source=",packetRosterMode,
-            " receive_ready=",packets.receiveReady()," roster_packets=",net.packets," added=",net.added,
+            " receive_ready=",packets.receiveReady()," receive_targets=",packets.receiveTargetCount(),
+            " native_calls=",receive.calls," copied=",receive.copied," stream_failed=",receive.streamFailures,
+            " game_decode_failed=",receive.decodeFailures," published=",receive.published," queue_dropped=",packetPlayers.dropped()," roster_packets=",net.packets," added=",net.added,
             " removed=",net.removed," rejected=",net.rejected," error=",net.error,
             " viewport=",io.DisplaySize.x,"x",io.DisplaySize.y);
     }
@@ -2149,6 +2144,7 @@ void removeNativeHooks() noexcept {
     originalGetFov.store(nullptr);
     originalLevelSubTick.store(nullptr);
     packets.stop();
+    packetPlayers.stop(packets);
     itemHoverNameTarget.store(nullptr, std::memory_order_release);
     gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
@@ -2180,7 +2176,7 @@ DWORD WINAPI startClient(void*) {
     }
     struct DiagnosticStop { ~DiagnosticStop() { diagnosticWriter.stop(); } } diagnosticStop;
     diagnostic("start ",bedrock::moduleIdentity(reinterpret_cast<const void*>(&startClient)));
-    diagnostic("TabList roster revision=3 [packet PlayerList / SDK runtime Actors]");
+    diagnostic("TabList roster revision=4 [packet PlayerList / SDK runtime Actors]");
     bedrock::ProfileChoice version;
     std::string profile;
     if (!bedrock::fetchSupportedProfile(profile, version, error,
@@ -2398,14 +2394,10 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("shared hooks registered");
     if(packetRosterMode){
-        (void)bedrock::ProtocolCodec::types(); // Parse the embedded schema before network callbacks.
-        for(const auto id:{bedrock::PacketId::StartGame,bedrock::PacketId::Disconnect,bedrock::PacketId::PlayerList,bedrock::PacketId::PlayerSkin})
-            packets.onReceive(id,[](const bedrock::PacketReadEvent& event){
-                if(!stopRequested.load(std::memory_order_acquire))packetPlayers.observe(event.rawId(),event.payload());
-            });
+        packetPlayers.start(packets);
         if(!packets.installReceive(profile,bedrock::generated::kSymbolDatabase,error))
             diagnostic("SDK packet PlayerList unavailable: ",error);
-        else diagnostic("SDK packet PlayerList ready [add/remove + skin updates; join a world after loading]");
+        else diagnostic("SDK packet PlayerList ready [per-ID virtual decoders; copied-data worker; rejoin after loading]");
     }
 
 
