@@ -2358,7 +2358,7 @@ DWORD WINAPI startClient(void*) {
         diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
 
-    packetRosterMode=bedrock::PlayerListPackets::supports(bedrock::native_profile::layoutProfile(profile,bedrock::generated::kSymbolDatabase,"RuntimeActorList"));
+    packetRosterMode=bedrock::PlayerListPackets::supports(profile,bedrock::generated::kSymbolDatabase);
     if(!packetRosterMode){
         try{playerRoster.load(profile,bedrock::generated::kSymbolDatabase);
             diagnostic("SDK PlayerList API ready [legacy native roster]");}
