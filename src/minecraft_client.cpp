@@ -24,7 +24,6 @@
 #include <bedrock/native/actor_components.hpp>
 #include <bedrock/enums/game_type.hpp>
 #include <imgui.h>
-#include <entt/entt.hpp>
 #include "tablist/config.hpp"
 #include "tablist/model.hpp"
 #include "tablist/update_scheduler.hpp"
