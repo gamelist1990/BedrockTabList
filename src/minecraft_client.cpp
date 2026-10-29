@@ -1,6 +1,7 @@
 #include <bedrock/profile_json.hpp>
 #ifdef _WIN32
 #include <bedrock/native_local_player.hpp>
+#include <bedrock/native_player_list.hpp>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -139,42 +140,11 @@ constexpr std::size_t minecraftGameSessionOffset = 0xC8;
 constexpr std::size_t sessionReadyOffset = 0x28;
 constexpr std::size_t sessionLevelControlOffset = 0x30;
 constexpr std::size_t sessionLevelOffset = 0x40;
-std::size_t levelPlayerListOffset{};
+bedrock::NativePlayerList playerRoster;
 bedrock::NativeLocalPlayerGetter localPlayerGetter;
 constexpr int tabInputKey = 0x09;
 constexpr int tabInputKeyGlfw = 258;
 
-struct Uuid {
-    std::uint64_t low{};
-    std::uint64_t high{};
-    bool operator==(const Uuid&) const = default;
-};
-struct UuidHash {
-    std::size_t operator()(const Uuid& value) const noexcept {
-        return static_cast<std::size_t>(value.low ^ value.high);
-    }
-};
-struct NativePlayerListEntry {
-    std::byte beforeName[0x18];
-    std::string name;
-    std::byte beforeSkin[0x80 - 0x18 - sizeof(std::string)];
-    struct {
-        void* implementation;
-        void* referenceCount;
-    } skin;
-    std::byte afterSkin[0xA8 - 0x80 - 0x10];
-};
-struct NativeSkinImage {
-    std::int32_t format;
-    std::uint32_t width;
-    std::uint32_t height;
-    std::uint32_t depth;
-    std::uint8_t usage;
-    std::byte padding[7];
-    void* deleter;
-    const std::uint8_t* data;
-    std::size_t size;
-};
 struct PlayerRow {
     std::string name;
     std::string heldItemName;
@@ -185,10 +155,6 @@ struct PlayerRow {
     std::array<std::uint32_t, 64> face{};
     bool hasFace = false;
 };
-static_assert(sizeof(std::string) == 0x20);
-static_assert(sizeof(NativePlayerListEntry) == 0xA8);
-static_assert(sizeof(NativeSkinImage) == 0x30);
-using NativePlayerList = std::unordered_map<Uuid, NativePlayerListEntry, UuidHash>;
 
 std::atomic<Status> status{Status::NotStarted};
 std::atomic<bool> stopRequested{false};
@@ -314,7 +280,7 @@ struct FaceUpdate {
 };
 std::optional<FaceUpdate> pendingFaceUpdate;
 bool tabRowsStopping{};
-std::unordered_map<std::string, Uuid> playerFaceIds; // Game thread only.
+std::unordered_map<std::string, bedrock::PlayerUuid> playerFaceIds; // Game thread only.
 std::int64_t nextFaceReadMs{};
 std::int64_t tabRowsLastStartedMs{};
 std::atomic<bool> loggedTabRowsReady{false};
@@ -783,49 +749,6 @@ bool validateClient(void* client) noexcept {
         reinterpret_cast<const void*>(vtable), sizeof(void*));
 }
 
-bool extractFace(const NativePlayerListEntry& entry, PlayerRow& row) {
-    if (!entry.skin.implementation) return false;
-    NativeSkinImage image{};
-    if (!safeRead(entry.skin.implementation, 0xA0, image) ||
-        !image.data || image.width < 64 || image.height < 16 ||
-        image.width > 4096 || image.height > 4096 || image.width % 8 != 0)
-        return false;
-    const std::size_t expected = static_cast<std::size_t>(image.width) * image.height * 4u;
-    if (expected / 4u / image.width != image.height || image.size < expected ||
-        !readable(image.data, expected)) return false;
-    const auto sourceSize = image.width / 8;
-    const auto faceX = sourceSize;
-    const auto faceY = sourceSize;
-    const auto overlayX = sourceSize * 5;
-    if (faceX + sourceSize > image.width || overlayX + sourceSize > image.width ||
-        faceY + sourceSize > image.height) return false;
-
-    const auto pixel = [&](std::uint32_t x, std::uint32_t y) {
-        return image.data + ((static_cast<std::size_t>(y) * image.width + x) * 4u);
-    };
-    for (std::uint32_t y = 0; y < 8; ++y) {
-        for (std::uint32_t x = 0; x < 8; ++x) {
-            const auto sourceX = x * sourceSize / 8;
-            const auto sourceY = y * sourceSize / 8;
-            const auto* base = pixel(faceX + sourceX, faceY + sourceY);
-            const auto* overlay = pixel(overlayX + sourceX, faceY + sourceY);
-            const unsigned alpha = overlay[3];
-            const unsigned inverse = 255u - alpha;
-            const auto blend = [&](unsigned channel) {
-                return static_cast<std::uint8_t>(
-                    (overlay[channel] * alpha + base[channel] * inverse) / 255u);
-            };
-            const auto r = blend(0);
-            const auto g = blend(1);
-            const auto b = blend(2);
-            row.face[y * 8 + x] = (static_cast<std::uint32_t>(r) << 24) |
-                (static_cast<std::uint32_t>(g) << 16) |
-                (static_cast<std::uint32_t>(b) << 8) | 255u;
-        }
-    }
-    row.hasFace = true;
-    return true;
-}
 
 std::int64_t steadyMilliseconds() noexcept {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1091,7 +1014,7 @@ bool readActorGameType(void* actor, std::int32_t& gameType) noexcept {
 void* TabListGameAccess::localPlayer() const noexcept {
     if (!nativeItemLayout) return nullptr;
     void* client = clientInstance.load(std::memory_order_acquire);
-    void* player=localPlayerGetter.get(client,nativeItemLayout->localPlayerVtableSlot);
+    void* player=localPlayerGetter.get(client);
     return looksLikeActor(player)?player:nullptr;
 }
 
@@ -1217,24 +1140,17 @@ void* TabListGameAccess::worldOf(void* actor) const noexcept {
 
 std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
     std::vector<std::string> names;
-    if (!levelPlayerListOffset || !world || world != levelInstance.load(std::memory_order_acquire)) return names;
+    if (!world || world != levelInstance.load(std::memory_order_acquire)) return names;
     const auto now = steadyMilliseconds();
     {
         std::lock_guard lock(playerNamesMutex_);
         if (cachedWorld_ == world && now - playerNamesCacheMs_ < 50)
             return playerNamesCache_;
     }
-    NativePlayerList* players = nullptr;
-    if (!safeRead(world, levelPlayerListOffset, players) || !players ||
-        !readable(players, sizeof(NativePlayerList)) || players->size() > 512) return names;
-    names.reserve(players->size());
-    playerFaceIds.clear();
-    for (const auto& item : *players) {
-        const auto& name = item.second.name;
-        if (name.empty() || name.size() > 128 || !readable(name.data(), name.size())) continue;
-        names.push_back(name);
-        playerFaceIds.insert_or_assign(tablist::stripMinecraftFormatting(name), item.first);
-    }
+    const auto players=playerRoster.snapshot(world);if(!players)return names;
+    names.reserve(players->size());playerFaceIds.clear();
+    for(const auto& player:*players){names.push_back(player.name);
+        playerFaceIds.insert_or_assign(tablist::stripMinecraftFormatting(player.name),player.uuid);}
     {
         std::lock_guard lock(playerNamesMutex_);
         cachedWorld_ = world;
@@ -1558,19 +1474,9 @@ void stopTabRowsWorker() noexcept {
 }
 
 bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
-    if (!levelPlayerListOffset || !level || !row || row->name.empty()) return false;
-    NativePlayerList* nativePlayers = nullptr;
-    if (!safeRead(level, levelPlayerListOffset, nativePlayers) || !nativePlayers ||
-        !readable(nativePlayers, sizeof(NativePlayerList)) || nativePlayers->size() > 512)
-        return false;
-    const auto uuid = playerFaceIds.find(row->name);
-    if (uuid == playerFaceIds.end()) return false;
-    // Compare the copied UUID directly. The game's UUID bucket hash is not
-    // part of this profile, so do not call unordered_map::find with a guessed hash.
-    const auto entry = std::find_if(nativePlayers->begin(), nativePlayers->end(),
-        [&](const auto& item) { return item.first == uuid->second; });
-    if (entry == nativePlayers->end()) return false;
-    return extractFace(entry->second, *row);
+    if(!level||!row||row->name.empty())return false;
+    const auto uuid=playerFaceIds.find(row->name);if(uuid==playerFaceIds.end())return false;
+    row->hasFace=playerRoster.face(level,uuid->second,row->face);return row->hasFace;
 }
 
 bool fillOneFaceSeh(void* level, PlayerRow* row) noexcept {
@@ -2036,7 +1942,7 @@ void drawTabList(void*) {
     const auto playersSnapshot = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
     if (!playersSnapshot || playersSnapshot->empty()) {
         static auto next=std::chrono::steady_clock::time_point{};const auto now=std::chrono::steady_clock::now();
-        if(now>=next){next=now+std::chrono::seconds(5);diagnostic("TabList display waiting: PlayerList has no readable rows; offset=",levelPlayerListOffset);}
+        if(now>=next){next=now+std::chrono::seconds(5);diagnostic("TabList display waiting: SDK PlayerList has no readable rows; ready=",playerRoster.ready());}
         return;
     }
     const auto& players = *playersSnapshot;
@@ -2456,24 +2362,11 @@ DWORD WINAPI startClient(void*) {
         diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
 
-    // The profile cache may predate PlayerList metadata. Use embedded data
-    // only after its executable fingerprint has been matched above.
     try {
-        auto root=bedrock::parseNativeProfile(profile);
-        const auto embedded=bedrock::parseNativeProfile(bedrock::generated::kSymbolDatabase);
-        if(root.at("target").at("sha256")==embedded.at("target").at("sha256")&&embedded.contains("native_player_identity"))
-            root=embedded;
-        localPlayerGetter.load(root);
-        if(root.contains("native_player_identity")) {
-            const auto& identity=root.at("native_player_identity");
-            if(identity.at("schema")!=1||identity.at("pointer_size")!=8||identity.at("entry_size")!=0xA8||
-               identity.at("actor_unique_id_offset")!=0||identity.at("uuid_offset")!=8||identity.at("name_offset")!=24)
-                throw std::runtime_error("unsupported PlayerList entry layout");
-            levelPlayerListOffset=bedrock::native_profile::number(identity.at("level_player_list_offset"));
-            if(!levelPlayerListOffset||levelPlayerListOffset>0x10000)throw std::runtime_error("invalid PlayerList offset");
-        }
-        diagnostic("PlayerList profile offset=",levelPlayerListOffset," exact local getter=",localPlayerGetter.exactGetter());
-    }catch(const std::exception& e){diagnostic("PlayerList profile unavailable: ",e.what());}
+        playerRoster.load(profile,bedrock::generated::kSymbolDatabase);
+        localPlayerGetter.load(profile);
+        diagnostic("SDK PlayerList API ready; exact local getter=",localPlayerGetter.exactGetter());
+    }catch(const std::exception& e){diagnostic("SDK PlayerList API unavailable: ",e.what());}
 
     if (!startTabRowsWorker()) {
         diagnostic("TabList row worker unavailable; startup stopped");
