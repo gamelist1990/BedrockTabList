@@ -1,22 +1,26 @@
-#include <bedrock/profile_json.hpp>
+#include <bedrock/profiles/profile_json.hpp>
 #ifdef _WIN32
-#include <bedrock/native_local_player.hpp>
-#include <bedrock/native_player_list.hpp>
+#include <bedrock/native/local_player.hpp>
+#include <bedrock/native/player_list.hpp>
+#include <bedrock/native/runtime_actors.hpp>
+#include <bedrock/packets/packet_api.hpp>
+#include <bedrock/packets/player_list_packets.hpp>
+#include <bedrock/runtime/module_identity.hpp>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <knownfolders.h>
 #include <shlobj.h>
 
-#include <bedrock/hook_runtime.h>
-#include <bedrock/gui_overlay.hpp>
-#include <bedrock/logger.hpp>
-#include <bedrock/remote_catalog.hpp>
-#include <bedrock/resolver.hpp>
-#include <bedrock/generated_symbols.hpp>
-#include <bedrock/game_api.hpp>
-#include <bedrock/native_items.hpp>
-#include <bedrock/native_actors.hpp>
+#include <bedrock/runtime/hook_runtime.h>
+#include <bedrock/render/gui_overlay.hpp>
+#include <bedrock/logging/logger.hpp>
+#include <bedrock/profiles/remote_catalog.hpp>
+#include <bedrock/profiles/resolver.hpp>
+#include <bedrock/generated/symbols.hpp>
+#include <bedrock/api/game_api.hpp>
+#include <bedrock/native/items.hpp>
+#include <bedrock/native/actors.hpp>
 #include <imgui.h>
 #include <entt/entt.hpp>
 #include "tablist/config.hpp"
@@ -131,7 +135,7 @@ using LevelSubTickFn = void(__fastcall*)(void*);
 using ItemHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 // Exact 1.26.52.3 disassembly writes a std::vector<Actor*> hidden return area
 // through RDX, then appends one Actor* per runtime entity.
-using LevelRuntimeActorListFn = void(__fastcall*)(void*, std::vector<void*>*);
+
 
 // These layouts come from the matching Latite SDK revision and are used only
 // after BedrockDynamicSDK has verified the exact 1.26.52.3 executable hash.
@@ -140,7 +144,11 @@ constexpr std::size_t minecraftGameSessionOffset = 0xC8;
 constexpr std::size_t sessionReadyOffset = 0x28;
 constexpr std::size_t sessionLevelControlOffset = 0x30;
 constexpr std::size_t sessionLevelOffset = 0x40;
-bedrock::NativePlayerList playerRoster;
+bedrock::NativePlayerList playerRoster; // Legacy builds without the common receive bridge.
+bedrock::NativeRuntimeActors runtimeActors;
+bedrock::PacketApi packets;
+bedrock::PlayerListPackets packetPlayers;
+bool packetRosterMode{};
 bedrock::NativeLocalPlayerGetter localPlayerGetter;
 constexpr int tabInputKey = 0x09;
 constexpr int tabInputKeyGlfw = 258;
@@ -169,8 +177,6 @@ std::atomic<CursorFn> originalReleaseCursor{nullptr};
 std::atomic<GetFovFn> originalGetFov{nullptr};
 std::atomic<LevelSubTickFn> originalLevelSubTick{nullptr};
 BDS_HookToken actorNameTagHookToken{};
-std::atomic<std::size_t> runtimeActorListSlot{std::numeric_limits<std::size_t>::max()};
-std::atomic<void*> runtimeActorListTarget{nullptr};
 std::atomic<void*> itemHoverNameTarget{nullptr};
 std::unordered_map<std::string, std::string> itemDisplayNames;
 std::unordered_map<void*, std::string> nativeItemIdentifiers; // Game thread, cleared on world change.
@@ -290,10 +296,6 @@ std::optional<bedrock::NativeItemLayout> nativeItemLayout;
 std::optional<bedrock::NativeActorLayout> nativeActorLayout;
 class TabListGameAccess final : public bedrock::GameAccess {
 public:
-    void setRuntimeActorList(std::size_t slot, void* target) noexcept {
-        runtimeActorListTarget.store(target, std::memory_order_release);
-        runtimeActorListSlot.store(slot, std::memory_order_release);
-    }
     void setItemHoverName(void* target) noexcept {
         itemHoverNameTarget.store(target, std::memory_order_release);
     }
@@ -844,18 +846,6 @@ bool looksLikeActor(void* actor) noexcept {
     return executableSlots >= 2;
 }
 
-bool invokeLevelRuntimeActorList(void* level, void* target,
-                                std::vector<void*>* actors) noexcept {
-    if (!allowRuntimeActorListCall || !level || !target || !actors ||
-        !readable(level, sizeof(void*)) || !executable(target)) return false;
-    __try {
-        reinterpret_cast<LevelRuntimeActorListFn>(target)(level, actors);
-        return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 bool TabListGameAccess::isActorValid(void* actor) const noexcept {
     return looksLikeActor(actor);
 }
@@ -864,30 +854,11 @@ std::vector<void*> TabListGameAccess::actorHandles(void* world) const {
     std::vector<void*> result;
     if (!allowRuntimeActorListCall || !world ||
         world != levelInstance.load(std::memory_order_acquire)) return result;
-    const auto slot = runtimeActorListSlot.load(std::memory_order_acquire);
-    auto* expectedTarget = runtimeActorListTarget.load(std::memory_order_acquire);
-    if (slot == std::numeric_limits<std::size_t>::max() || slot > 0x400 ||
-        !expectedTarget) return result;
-
-    void** vtable = nullptr;
-    void* target = nullptr;
-    // Slot 0x145 is zero-based; reject derived/foreign vtables unless the
-    // target is exactly the one resolved from this executable's profile.
-    if (!safeRead(world, 0, vtable) || !vtable ||
-        !safeRead(vtable, slot * sizeof(void*), target) ||
-        target != expectedTarget || !executable(target)) return result;
-
-    std::vector<void*> nativeActors;
-    if (!invokeLevelRuntimeActorList(world, target, &nativeActors) ||
-        nativeActors.size() > 4096) return result;
-    // Defer per-Actor validation and RuntimeID reads to the resumable roster.
-    // The native call itself only produces handles; no handle is dereferenced here.
-    if (!loggedActorListSuccess.exchange(true, std::memory_order_acq_rel))
-        diagnostic("Level::getRuntimeActorList active: slot=0x", std::hex, slot,
-                   " target=0x", reinterpret_cast<std::uintptr_t>(target), std::dec,
-                   " native=", nativeActors.size(), " [incremental validation]");
-    result = std::move(nativeActors);
-    return result;
+    auto captured=runtimeActors.snapshot(world);
+    if(!captured)return result;
+    if(!loggedActorListSuccess.exchange(true,std::memory_order_acq_rel))
+        diagnostic("SDK Level::getRuntimeActorList active: native=",captured->size()," [owning tick; incremental validation]");
+    return std::move(*captured);
 }
 
 bool invokeItemHoverName(void* stack, void* target, std::string* output) noexcept {
@@ -1147,10 +1118,15 @@ std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
         if (cachedWorld_ == world && now - playerNamesCacheMs_ < 50)
             return playerNamesCache_;
     }
+    if(packetRosterMode){
+        const auto players=packetPlayers.snapshot();names.reserve(players.size());
+        for(const auto& player:players)names.push_back(player.name);
+    }else{
     const auto players=playerRoster.snapshot(world);if(!players)return names;
     names.reserve(players->size());playerFaceIds.clear();
     for(const auto& player:*players){names.push_back(player.name);
         playerFaceIds.insert_or_assign(tablist::stripMinecraftFormatting(player.name),player.uuid);}
+    }
     {
         std::lock_guard lock(playerNamesMutex_);
         cachedWorld_ = world;
@@ -1398,9 +1374,14 @@ void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexce
                 }
             }
         }
+        if(packetRosterMode&&config->showFaces){
+            const auto players=packetPlayers.snapshot();
+            for(auto& row:build->rows)for(const auto& player:players)
+                if(tablist::stripMinecraftFormatting(player.name)==row.name){row.face=player.face;row.hasFace=player.hasFace;break;}
+        }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
         std::unordered_map<std::string_view, const PlayerRow*> oldRows;
-        if (config->showFaces && previous) {
+        if (config->showFaces && previous && !packetRosterMode) {
             oldRows.reserve(previous->size());
             for (const auto& row : *previous) if (row.hasFace) oldRows.emplace(row.name, &row);
             for (auto& row : build->rows) {
@@ -1411,11 +1392,12 @@ void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexce
                 }
             }
         }
+        const auto publishedCount=build->rows.size();
         std::atomic_store_explicit(&cachedTabRows,
             std::make_shared<const std::vector<PlayerRow>>(std::move(build->rows)),
             std::memory_order_release);
         if (!loggedTabRowsReady.exchange(true, std::memory_order_acq_rel))
-            diagnostic("TabList row cache ready; persistent worker publishes copied rows");
+            diagnostic("TabList row cache ready; rows=",publishedCount," source_names=",build->names.size()," [copied worker rows]");
     } catch (...) {}
 }
 
@@ -1475,6 +1457,9 @@ void stopTabRowsWorker() noexcept {
 
 bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
     if(!level||!row||row->name.empty())return false;
+    if(packetRosterMode){for(const auto& player:packetPlayers.snapshot())
+        if(tablist::stripMinecraftFormatting(player.name)==row->name){row->face=player.face;row->hasFace=player.hasFace;return row->hasFace;}
+        return false;}
     const auto uuid=playerFaceIds.find(row->name);if(uuid==playerFaceIds.end())return false;
     row->hasFace=playerRoster.face(level,uuid->second,row->face);return row->hasFace;
 }
@@ -1936,18 +1921,33 @@ void drawTabList(void*) {
     io.MouseDrawCursor = false;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     const auto config = std::atomic_load_explicit(&liveConfig, std::memory_order_acquire);
-    if (!config->enabled) return;
     if (!tabHeld.load(std::memory_order_acquire)) return;
-    if (!gameplayActive.load(std::memory_order_acquire) || !levelIsFresh()) return;
+    const bool fresh=levelIsFresh();const bool playing=gameplayActive.load(std::memory_order_acquire);
     const auto playersSnapshot = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
-    if (!playersSnapshot || playersSnapshot->empty()) {
-        static auto next=std::chrono::steady_clock::time_point{};const auto now=std::chrono::steady_clock::now();
-        if(now>=next){next=now+std::chrono::seconds(5);diagnostic("TabList display waiting: SDK PlayerList has no readable rows; ready=",playerRoster.ready());}
+    static auto nextReport=std::chrono::steady_clock::time_point{};
+    const auto now=std::chrono::steady_clock::now();
+    if(now>=nextReport){
+        nextReport=now+std::chrono::seconds(5);const auto net=packetPlayers.statistics();
+        diagnostic("TabList display: enabled=",config->enabled," gameplay=",playing," fresh_level=",fresh,
+            " rows=",playersSnapshot?playersSnapshot->size():0," packet_source=",packetRosterMode,
+            " receive_ready=",packets.receiveReady()," roster_packets=",net.packets," added=",net.added,
+            " removed=",net.removed," rejected=",net.rejected," error=",net.error,
+            " viewport=",io.DisplaySize.x,"x",io.DisplaySize.y);
+    }
+    if(!config->enabled||!playing||!fresh)return;
+    if(!playersSnapshot||playersSnapshot->empty()){
+        auto* draw=ImGui::GetForegroundDrawList();const char* title="Players  0";
+        const char* message=packetRosterMode?"Waiting for player list. Rejoin the world if needed.":"Waiting for player list.";
+        const float width=std::max(280.0f,ImGui::CalcTextSize(message).x+24.0f);
+        const ImVec2 start{(io.DisplaySize.x-width)*0.5f,config->topOffset};
+        draw->AddRectFilled(start,{start.x+width,start.y+60},IM_COL32(20,24,32,230),6);
+        draw->AddText({start.x+12,start.y+8},IM_COL32(240,240,245,255),title);
+        draw->AddText({start.x+12,start.y+34},IM_COL32(180,185,195,255),message);
         return;
     }
     const auto& players = *playersSnapshot;
     if (!loggedListSuccess.exchange(true, std::memory_order_acq_rel))
-        diagnostic("Native player list active: ", players.size(), " player(s)");
+        diagnostic("Player list draw submitted: ", players.size(), " player(s)");
     const auto layout = tablist::layoutFor(players.size(), config->maximumRows);
     auto* draw = ImGui::GetForegroundDrawList();
     const auto display = ImGui::GetIO().DisplaySize;
@@ -2148,8 +2148,7 @@ void removeNativeHooks() noexcept {
     originalReleaseCursor.store(nullptr);
     originalGetFov.store(nullptr);
     originalLevelSubTick.store(nullptr);
-    runtimeActorListSlot.store(std::numeric_limits<std::size_t>::max(), std::memory_order_release);
-    runtimeActorListTarget.store(nullptr, std::memory_order_release);
+    packets.stop();
     itemHoverNameTarget.store(nullptr, std::memory_order_release);
     gameplayActive.store(false, std::memory_order_release);
     clientInstance.store(nullptr);
@@ -2180,7 +2179,8 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
     struct DiagnosticStop { ~DiagnosticStop() { diagnosticWriter.stop(); } } diagnosticStop;
-    diagnostic("start");
+    diagnostic("start ",bedrock::moduleIdentity(reinterpret_cast<const void*>(&startClient)));
+    diagnostic("TabList roster revision=3 [packet PlayerList / SDK runtime Actors]");
     bedrock::ProfileChoice version;
     std::string profile;
     if (!bedrock::fetchSupportedProfile(profile, version, error,
@@ -2211,7 +2211,7 @@ DWORD WINAPI startClient(void*) {
         status.store(Status::Failed, std::memory_order_release);
         return 1;
     }
-    diagnostic("resolver ready");
+    diagnostic("resolver ready; executable SHA256=",version.identity.fileSha256," profile=",version.path);
     std::optional<bedrock::Resolution> keyboard, grab, release, fov, levelTick;
     const auto resolveRequired = [&] {
         keyboard = bedrock::resolveSharedHook(resolver, "Keyboard::feed", BDS_HOOK_KEYBOARD_FEED);
@@ -2230,15 +2230,11 @@ DWORD WINAPI startClient(void*) {
         if (actorNameTag && !bedrock::isUsableSharedHookResolution(*actorNameTag))
             actorNameTag.reset();
     };
-    const auto resolveRuntimeActorList = [](const bedrock::Resolver& source) {
-        if (!source.exactBuild()) return false;
-        const auto slot = source.resolveVirtualSlot("Level::getRuntimeActorList");
-        const auto method = source.resolve("Level::getRuntimeActorList");
-        if (!slot || !method || !method->exact_build || !method->verified ||
-            method->method != "exact-rva") return false;
-        tabListGameAccess.setRuntimeActorList(*slot,
-            reinterpret_cast<void*>(method->address));
-        return true;
+    const auto resolveRuntimeActorList = [&](const bedrock::Resolver&) {
+        std::string failure;
+        const bool loaded=runtimeActors.load(profile,bedrock::generated::kSymbolDatabase,failure);
+        if(!loaded)diagnostic("SDK runtime Actor list unavailable: ",failure);
+        return loaded;
     };
     const auto resolveItemHoverName = [](const bedrock::Resolver& source) {
         if (!source.exactBuild()) return false;
@@ -2324,7 +2320,7 @@ DWORD WINAPI startClient(void*) {
     }
     diagnostic("world Actor source: Level::getRuntimeActorList=",
                runtimeActorListReady ? "profile ready" : "unavailable",
-               runtimeActorListReady ? " [exact vtable slot and ABI]" : "");
+               runtimeActorListReady ? " [SDK exact function / hidden vector return]" : "");
     diagnostic("ItemStackBase::getHoverName=",
                itemHoverNameReady ? "verified exact-build display name active"
                                    : "unavailable; item ID fallback");
@@ -2362,11 +2358,14 @@ DWORD WINAPI startClient(void*) {
         diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
 
-    try {
-        playerRoster.load(profile,bedrock::generated::kSymbolDatabase);
-        localPlayerGetter.load(profile);
-        diagnostic("SDK PlayerList API ready; exact local getter=",localPlayerGetter.exactGetter());
-    }catch(const std::exception& e){diagnostic("SDK PlayerList API unavailable: ",e.what());}
+    packetRosterMode=bedrock::PlayerListPackets::supports(bedrock::native_profile::layoutProfile(profile,bedrock::generated::kSymbolDatabase,"RuntimeActorList"));
+    if(!packetRosterMode){
+        try{playerRoster.load(profile,bedrock::generated::kSymbolDatabase);
+            diagnostic("SDK PlayerList API ready [legacy native roster]");}
+        catch(const std::exception& e){diagnostic("SDK PlayerList API unavailable: ",e.what());}
+    }
+    try{localPlayerGetter.load(profile);diagnostic("SDK local player getter ready; exact=",localPlayerGetter.exactGetter());}
+    catch(const std::exception& e){diagnostic("SDK local player getter unavailable: ",e.what());}
 
     if (!startTabRowsWorker()) {
         diagnostic("TabList row worker unavailable; startup stopped");
@@ -2398,6 +2397,17 @@ DWORD WINAPI startClient(void*) {
         return 1;
     }
     diagnostic("shared hooks registered");
+    if(packetRosterMode){
+        (void)bedrock::ProtocolCodec::types(); // Parse the embedded schema before network callbacks.
+        for(const auto id:{bedrock::PacketId::StartGame,bedrock::PacketId::Disconnect,bedrock::PacketId::PlayerList,bedrock::PacketId::PlayerSkin})
+            packets.onReceive(id,[](const bedrock::PacketReadEvent& event){
+                if(!stopRequested.load(std::memory_order_acquire))packetPlayers.observe(event.rawId(),event.payload());
+            });
+        if(!packets.installReceive(profile,bedrock::generated::kSymbolDatabase,error))
+            diagnostic("SDK packet PlayerList unavailable: ",error);
+        else diagnostic("SDK packet PlayerList ready [add/remove + skin updates; join a world after loading]");
+    }
+
 
     gameApi = std::make_unique<bedrock::GameApi>(tabListGameAccess);
 
