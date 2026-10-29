@@ -1,4 +1,6 @@
+#include <bedrock/profile_json.hpp>
 #ifdef _WIN32
+#include <bedrock/native_local_player.hpp>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -137,7 +139,8 @@ constexpr std::size_t minecraftGameSessionOffset = 0xC8;
 constexpr std::size_t sessionReadyOffset = 0x28;
 constexpr std::size_t sessionLevelControlOffset = 0x30;
 constexpr std::size_t sessionLevelOffset = 0x40;
-constexpr std::size_t levelPlayerListOffset = 0x4E0;
+std::size_t levelPlayerListOffset{};
+bedrock::NativeLocalPlayerGetter localPlayerGetter;
 constexpr int tabInputKey = 0x09;
 constexpr int tabInputKeyGlfw = 258;
 
@@ -1088,18 +1091,8 @@ bool readActorGameType(void* actor, std::int32_t& gameType) noexcept {
 void* TabListGameAccess::localPlayer() const noexcept {
     if (!nativeItemLayout) return nullptr;
     void* client = clientInstance.load(std::memory_order_acquire);
-    void** vtable = nullptr;
-    if (!client || !safeRead(client, 0, vtable) || !vtable ||
-        !readable(vtable, sizeof(void*) * (nativeItemLayout->localPlayerVtableSlot + 1)))
-        return nullptr;
-    void* target = nullptr;
-    if (!safeRead(vtable, sizeof(void*) * nativeItemLayout->localPlayerVtableSlot, target) ||
-        !executable(target)) return nullptr;
-    using GetLocalPlayerFn = void*(__fastcall*)(void*);
-    __try {
-        void* player = reinterpret_cast<GetLocalPlayerFn>(target)(client);
-        return looksLikeActor(player) ? player : nullptr;
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    void* player=localPlayerGetter.get(client,nativeItemLayout->localPlayerVtableSlot);
+    return looksLikeActor(player)?player:nullptr;
 }
 
 enum class EquipmentReadStatus { Failed, Empty, Item };
@@ -1224,7 +1217,7 @@ void* TabListGameAccess::worldOf(void* actor) const noexcept {
 
 std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
     std::vector<std::string> names;
-    if (!world || world != levelInstance.load(std::memory_order_acquire)) return names;
+    if (!levelPlayerListOffset || !world || world != levelInstance.load(std::memory_order_acquire)) return names;
     const auto now = steadyMilliseconds();
     {
         std::lock_guard lock(playerNamesMutex_);
@@ -1565,7 +1558,7 @@ void stopTabRowsWorker() noexcept {
 }
 
 bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
-    if (!level || !row || row->name.empty()) return false;
+    if (!levelPlayerListOffset || !level || !row || row->name.empty()) return false;
     NativePlayerList* nativePlayers = nullptr;
     if (!safeRead(level, levelPlayerListOffset, nativePlayers) || !nativePlayers ||
         !readable(nativePlayers, sizeof(NativePlayerList)) || nativePlayers->size() > 512)
@@ -2041,7 +2034,11 @@ void drawTabList(void*) {
     if (!tabHeld.load(std::memory_order_acquire)) return;
     if (!gameplayActive.load(std::memory_order_acquire) || !levelIsFresh()) return;
     const auto playersSnapshot = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
-    if (!playersSnapshot || playersSnapshot->empty()) return;
+    if (!playersSnapshot || playersSnapshot->empty()) {
+        static auto next=std::chrono::steady_clock::time_point{};const auto now=std::chrono::steady_clock::now();
+        if(now>=next){next=now+std::chrono::seconds(5);diagnostic("TabList display waiting: PlayerList has no readable rows; offset=",levelPlayerListOffset);}
+        return;
+    }
     const auto& players = *playersSnapshot;
     if (!loggedListSuccess.exchange(true, std::memory_order_acq_rel))
         diagnostic("Native player list active: ", players.size(), " player(s)");
@@ -2458,6 +2455,25 @@ DWORD WINAPI startClient(void*) {
         nativeActorLayout.reset();
         diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
+
+    // The profile cache may predate PlayerList metadata. Use embedded data
+    // only after its executable fingerprint has been matched above.
+    try {
+        auto root=bedrock::parseNativeProfile(profile);
+        const auto embedded=bedrock::parseNativeProfile(bedrock::generated::kSymbolDatabase);
+        if(root.at("target").at("sha256")==embedded.at("target").at("sha256")&&embedded.contains("native_player_identity"))
+            root=embedded;
+        localPlayerGetter.load(root);
+        if(root.contains("native_player_identity")) {
+            const auto& identity=root.at("native_player_identity");
+            if(identity.at("schema")!=1||identity.at("pointer_size")!=8||identity.at("entry_size")!=0xA8||
+               identity.at("actor_unique_id_offset")!=0||identity.at("uuid_offset")!=8||identity.at("name_offset")!=24)
+                throw std::runtime_error("unsupported PlayerList entry layout");
+            levelPlayerListOffset=bedrock::native_profile::number(identity.at("level_player_list_offset"));
+            if(!levelPlayerListOffset||levelPlayerListOffset>0x10000)throw std::runtime_error("invalid PlayerList offset");
+        }
+        diagnostic("PlayerList profile offset=",levelPlayerListOffset," exact local getter=",localPlayerGetter.exactGetter());
+    }catch(const std::exception& e){diagnostic("PlayerList profile unavailable: ",e.what());}
 
     if (!startTabRowsWorker()) {
         diagnostic("TabList row worker unavailable; startup stopped");
