@@ -1112,8 +1112,8 @@ std::vector<std::string> TabListGameAccess::playerListNames(void* world) const {
             return playerNamesCache_;
     }
     if(packetRosterMode){
-        const auto players=packetPlayers.snapshot();names.reserve(players.size());
-        for(const auto& player:players)names.push_back(player.name);
+        const auto players=packetPlayers.snapshotShared();names.reserve(players->size());
+        for(const auto& player:*players)names.push_back(player.name);
     }else{
     const auto players=playerRoster.snapshot(world);if(!players)return names;
     names.reserve(players->size());playerFaceIds.clear();
@@ -1368,8 +1368,8 @@ void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexce
             }
         }
         if(packetRosterMode&&config->showFaces){
-            const auto players=packetPlayers.snapshot();
-            for(auto& row:build->rows)for(const auto& player:players)
+            const auto players=packetPlayers.snapshotShared();
+            for(auto& row:build->rows)for(const auto& player:*players)
                 if(tablist::stripMinecraftFormatting(player.name)==row.name){row.face=player.face;row.hasFace=player.hasFace;break;}
         }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
@@ -1450,7 +1450,7 @@ void stopTabRowsWorker() noexcept {
 
 bool fillOneFaceUnsafe(void* level, PlayerRow* row) {
     if(!level||!row||row->name.empty())return false;
-    if(packetRosterMode){for(const auto& player:packetPlayers.snapshot())
+    if(packetRosterMode){const auto players=packetPlayers.snapshotShared();for(const auto& player:*players)
         if(tablist::stripMinecraftFormatting(player.name)==row->name){row->face=player.face;row->hasFace=player.hasFace;return row->hasFace;}
         return false;}
     const auto uuid=playerFaceIds.find(row->name);if(uuid==playerFaceIds.end())return false;
