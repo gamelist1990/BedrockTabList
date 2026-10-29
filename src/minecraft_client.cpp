@@ -21,6 +21,8 @@
 #include <bedrock/api/game_api.hpp>
 #include <bedrock/native/items.hpp>
 #include <bedrock/native/actors.hpp>
+#include <bedrock/native/actor_components.hpp>
+#include <bedrock/enums/game_type.hpp>
 #include <imgui.h>
 #include <entt/entt.hpp>
 #include "tablist/config.hpp"
@@ -55,76 +57,6 @@
 #include <utility>
 #include <vector>
 
-namespace tablist_native {
-struct EntityId {
-    std::uint32_t rawId{};
-    [[nodiscard]] constexpr bool operator==(const EntityId&) const = default;
-    [[nodiscard]] constexpr operator std::uint32_t() const { return rawId; }
-};
-struct EntityIdTraits {
-    using value_type = EntityId;
-    using entity_type = std::uint32_t;
-    using version_type = std::uint16_t;
-    static constexpr entity_type entity_mask = 0x3FFFF;
-    static constexpr version_type version_mask = 0x3FFF;
-};
-struct ActorEquipmentComponent {
-    static constexpr std::uint32_t type_hash = 0xB06141A9;
-    void* handContainer{};
-    void* armorContainer{};
-};
-struct ActorGameTypeComponent {
-    static constexpr std::uint32_t type_hash = 0x88D3EDDF;
-    std::int32_t gameType{};
-};
-}
-
-// These traits mirror the pinned Latite reference's Bedrock ECS component
-// registration so GameApi::Actor::getHeldItem can use an Actor's replicated
-// hand container without consulting PlayerSupplies or enumerating Inventory.
-namespace entt {
-template<> struct entt_traits<tablist_native::EntityId>
-    : basic_entt_traits<tablist_native::EntityIdTraits> {
-    static constexpr std::size_t page_size = 2048;
-};
-template<> struct component_traits<tablist_native::ActorEquipmentComponent,
-                                   tablist_native::EntityId> {
-    using element_type = tablist_native::ActorEquipmentComponent;
-    using entity_type = tablist_native::EntityId;
-    static constexpr bool in_place_delete = true;
-    static constexpr std::size_t page_size = 128 * !std::is_empty_v<element_type>;
-};
-template<> struct storage_type<tablist_native::ActorEquipmentComponent,
-                               tablist_native::EntityId> {
-    using type = basic_storage<tablist_native::ActorEquipmentComponent,
-                               tablist_native::EntityId>;
-};
-template<> struct type_hash<tablist_native::ActorEquipmentComponent> {
-    [[nodiscard]] static consteval id_type value() noexcept {
-        return tablist_native::ActorEquipmentComponent::type_hash;
-    }
-    [[nodiscard]] consteval operator id_type() const noexcept { return value(); }
-};
-template<> struct component_traits<tablist_native::ActorGameTypeComponent,
-                                   tablist_native::EntityId> {
-    using element_type = tablist_native::ActorGameTypeComponent;
-    using entity_type = tablist_native::EntityId;
-    static constexpr bool in_place_delete = true;
-    static constexpr std::size_t page_size = 128 * !std::is_empty_v<element_type>;
-};
-template<> struct storage_type<tablist_native::ActorGameTypeComponent,
-                               tablist_native::EntityId> {
-    using type = basic_storage<tablist_native::ActorGameTypeComponent,
-                               tablist_native::EntityId>;
-};
-template<> struct type_hash<tablist_native::ActorGameTypeComponent> {
-    [[nodiscard]] static consteval id_type value() noexcept {
-        return tablist_native::ActorGameTypeComponent::type_hash;
-    }
-    [[nodiscard]] consteval operator id_type() const noexcept { return value(); }
-};
-}
-
 namespace {
 enum class Status : unsigned { NotStarted, Loading, Running, Stopped, Failed };
 
@@ -139,6 +71,7 @@ using ItemHoverNameFn = std::string*(__fastcall*)(void*, std::string*);
 
 bedrock::NativePlayerList playerRoster; // Legacy builds without the common receive bridge.
 bedrock::NativeRuntimeActors runtimeActors;
+bedrock::NativeActorComponents actorComponents;
 bedrock::PacketApi packets;
 bedrock::PlayerRosterService packetPlayers;
 bool packetRosterMode{};
@@ -890,56 +823,12 @@ void populateItemDisplayName(void* stack, bedrock::ItemStack& item) {
     }
 }
 
-bool readActorEquipment(void* actor, const bedrock::NativeItemLayout& layout,
-                        tablist_native::ActorEquipmentComponent** output) noexcept {
-    if (output) *output = nullptr;
-    if (!actor || !output) return false;
-    void* registry = nullptr;
-    std::uint32_t rawId = 0;
-    const auto base = layout.actorEntityContextOffset;
-    if (!safeRead(actor, base + layout.contextEnttRegistryOffset, registry) ||
-        !safeRead(actor, base + layout.contextEntityIdOffset, rawId) || !registry ||
-        !readable(registry, sizeof(void*))) return false;
-    __try {
-        auto* typed = static_cast<entt::basic_registry<tablist_native::EntityId>*>(registry);
-        auto* storage = typed->storage(layout.equipmentComponentHash);
-        if (!storage) return false;
-        const auto entity = tablist_native::EntityId{rawId};
-        if (!storage->contains(entity)) return false;
-        *output = static_cast<tablist_native::ActorEquipmentComponent*>(storage->value(entity));
-        return *output != nullptr;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        *output = nullptr;
-        return false;
-    }
+bool readActorEquipment(void* actor,const bedrock::NativeItemLayout& layout,void** output) noexcept {
+    if(!output)return false;*output=actorComponents.component(actor,layout.equipmentComponentHash);return *output!=nullptr;
 }
-
-bool readActorRuntimeIdValue(void* actor, std::uint64_t* output) noexcept {
-    if (output) *output = 0;
-    if (!actor || !output || !nativeActorLayout) return false;
-    const auto& layout = *nativeActorLayout;
-    void* registry = nullptr;
-    std::uint32_t rawId = 0;
-    const auto context = layout.actorEntityContextOffset;
-    if (!safeRead(actor, context + layout.contextRegistryOffset, registry) ||
-        !safeRead(actor, context + layout.contextEntityIdOffset, rawId) || !registry ||
-        !readable(registry, sizeof(void*))) return false;
-    __try {
-        auto* typed = static_cast<entt::basic_registry<tablist_native::EntityId>*>(registry);
-        auto* storage = typed->storage(layout.runtimeIdComponentHash);
-        const auto entity = tablist_native::EntityId{rawId};
-        if (!storage || !storage->contains(entity)) return false;
-        auto* component = storage->value(entity);
-        std::uint64_t runtimeId = 0;
-        if (!component || !safeRead(component, layout.runtimeIdValueOffset, runtimeId) ||
-            runtimeId == 0) return false;
-        *output = runtimeId;
-        return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+bool readActorRuntimeIdValue(void* actor,std::uint64_t* output) noexcept {
+    if(!output)return false;const auto value=actorComponents.runtimeId(actor);*output=value.value_or(0);return value.has_value();
 }
-
 std::optional<std::uint64_t> readActorRuntimeId(void* actor) noexcept {
     std::uint64_t runtimeId = 0;
     return readActorRuntimeIdValue(actor, &runtimeId)
@@ -950,29 +839,8 @@ std::optional<std::uint64_t> TabListGameAccess::actorRuntimeId(void* actor) cons
     return readActorRuntimeId(actor);
 }
 
-bool readActorGameType(void* actor, std::int32_t& gameType) noexcept {
-    if (!actor || !nativeItemLayout) return false;
-    const auto& layout = *nativeItemLayout;
-    void* registry = nullptr;
-    std::uint32_t rawId = 0;
-    if (!safeRead(actor, layout.actorEntityContextOffset + layout.contextEnttRegistryOffset,
-                  registry) ||
-        !safeRead(actor, layout.actorEntityContextOffset + layout.contextEntityIdOffset,
-                  rawId) || !registry || !readable(registry, sizeof(void*))) return false;
-    __try {
-        auto* typed = static_cast<entt::basic_registry<tablist_native::EntityId>*>(registry);
-        auto* storage = typed->storage(tablist_native::ActorGameTypeComponent::type_hash);
-        if (!storage) return false;
-        const auto entity = tablist_native::EntityId{rawId};
-        if (!storage->contains(entity)) return false;
-        const auto* component = static_cast<const tablist_native::ActorGameTypeComponent*>(
-            storage->value(entity));
-        if (!component) return false;
-        gameType = component->gameType;
-        return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+bool readActorGameType(void* actor,std::int32_t& gameType) noexcept {
+    const auto value=actorComponents.gameType(actor);if(!value)return false;gameType=*value;return true;
 }
 
 void* TabListGameAccess::localPlayer() const noexcept {
@@ -989,7 +857,7 @@ EquipmentReadStatus readEquipmentItem(void* actor, bedrock::EquipmentSlot slot,
     if (output) *output = {};
     if (!nativeItemLayout || !actor || !output) return EquipmentReadStatus::Failed;
     const auto& layout = *nativeItemLayout;
-    tablist_native::ActorEquipmentComponent* component = nullptr;
+    void* component = nullptr;
     if (!readActorEquipment(actor, layout, &component) || !component)
         return EquipmentReadStatus::Failed;
     std::size_t slotIndex = 0;
@@ -1582,7 +1450,7 @@ void readActorMurderSnapshot(void* actor,
     if (readGameMode) {
         std::int32_t gameType = -1;
         snapshot.hasGameType = snapshot.isPlayer && readActorGameType(actor, gameType);
-        snapshot.spectator = snapshot.hasGameType && gameType == 3;
+        snapshot.spectator = snapshot.hasGameType && gameType == static_cast<int>(bedrock::GameType::Spectator);
     }
 }
 
@@ -2354,6 +2222,7 @@ DWORD WINAPI startClient(void*) {
         diagnostic("Actor RuntimeID component reader unavailable: ", cachedActorLayoutError);
     }
 
+    if(nativeActorLayout)actorComponents.configure(*nativeActorLayout,bedrock::parseNativeProfile(profile));
     packetRosterMode=bedrock::PlayerListPackets::supports(profile,bedrock::generated::kSymbolDatabase);
     if(!packetRosterMode){
         try{playerRoster.load(profile,bedrock::generated::kSymbolDatabase);
