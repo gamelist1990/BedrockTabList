@@ -1236,8 +1236,10 @@ void buildTabRowsInBackground(const std::shared_ptr<TabRowsBuild>& build) noexce
         }
         if(packetRosterMode&&config->showFaces){
             const auto players=packetPlayers.snapshotShared();
-            for(auto& row:build->rows)for(const auto& player:*players)
-                if(tablist::stripMinecraftFormatting(player.name)==row.name){row.face=player.face;row.hasFace=player.hasFace;break;}
+            std::unordered_map<std::string,const bedrock::PacketPlayer*> faces;
+            faces.reserve(players->size());
+            for(const auto& player:*players)faces.try_emplace(tablist::stripMinecraftFormatting(player.name),&player);
+            for(auto& row:build->rows){const auto found=faces.find(row.name);if(found!=faces.end()){row.face=found->second->face;row.hasFace=found->second->hasFace;}}
         }
         const auto previous = std::atomic_load_explicit(&cachedTabRows, std::memory_order_acquire);
         std::unordered_map<std::string_view, const PlayerRow*> oldRows;
