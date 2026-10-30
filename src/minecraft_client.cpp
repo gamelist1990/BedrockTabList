@@ -2045,7 +2045,7 @@ DWORD WINAPI startClient(void*) {
     }
     struct DiagnosticStop { ~DiagnosticStop() { diagnosticWriter.stop(); } } diagnosticStop;
     diagnostic("start ",bedrock::moduleIdentity(reinterpret_cast<const void*>(&startClient)));
-    diagnostic("TabList roster revision=4 [packet PlayerList / SDK runtime Actors]");
+    diagnostic("TabList roster revision=5 [exact-build packet layout fallback / SDK runtime Actors]");
     bedrock::ProfileChoice version;
     std::string profile;
     if (!bedrock::fetchSupportedProfile(profile, version, error,

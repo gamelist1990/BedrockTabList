@@ -4,7 +4,9 @@ Windows配布物は `BedrockTabList.dll` 単体です。SDK hook runtimeとMinHo
 SDK共有ランタイムが他のBedrockDynamicSDK対応ModとMinecraft hookを共用します。
 
 [BedrockDynamicSDK](https://github.com/gamelist1990/BedrockDynamicSDK) 用の、
-Minecraft Bedrock 1.26.52.3（Windows x64）向け公開TabListサンプルです。
+Minecraft Bedrock 1.26.52.3 / 1.26.60.5（Windows x64）向け公開TabListサンプルです。
+
+roster revision=5では、古いキャッシュにlayoutsがない場合も、EXEのSHA・text SHA・image/text範囲が一致する内蔵定義からパケット受信を準備します。キャッシュの削除は不要です。DLL交換時はMinecraftを完全終了し、読み込み後にサーバーへ参加し直してください。新しい受信経路の実機動作は確認待ちです。
 
 ## 動作
 
