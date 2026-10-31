@@ -1184,7 +1184,7 @@ void onLevelTick(const bedrock::LevelTickEvent& event) {
             refreshTabRowsCache(config);
             break;
         case tablist::NativeUpdate::Roster:
-            refreshTrackedMurderActors(level);
+            refreshTrackedMurderActors(event.level);
             break;
         case tablist::NativeUpdate::Face:
             refreshOneCachedFace(config);
