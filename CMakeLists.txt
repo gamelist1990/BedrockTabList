@@ -4,6 +4,10 @@ project(BedrockTabList LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(WIN32)
+    set(BEDROCK_SDK_ENABLE_NATIVE_CLIENT ON CACHE BOOL "SDK-owned client adapter" FORCE)
+endif()
+
 include(FetchContent)
 set(BEDROCK_SDK_REF "main" CACHE STRING "BedrockDynamicSDK branch/tag/commit")
 set(BEDROCK_SDK_ENABLE_GUI ON CACHE BOOL "Enable the SDK in-game overlay" FORCE)
@@ -27,20 +31,9 @@ if(MSVC)
 endif()
 
 if(WIN32)
-    # Match the EnTT revision used by the bundled Latite reference. The game
-    # stores Actor equipment in its entity registry; only the hand container is
-    # queried (never the player's full inventory).
-    FetchContent_Declare(
-        entt
-        GIT_REPOSITORY https://github.com/skypjack/entt.git
-        GIT_TAG fe8d7d78c4823e8a66a050bf86f5c6318cf76ce7
-        GIT_SHALLOW FALSE
-        GIT_PROGRESS TRUE
-    )
-    FetchContent_MakeAvailable(entt)
     add_library(BedrockTabList SHARED src/minecraft_client.cpp)
     target_link_libraries(BedrockTabList PRIVATE tablist_core bedrock::gui_overlay
-        bedrock::symbols bedrock::logging bedrock::hook_runtime EnTT::EnTT shell32 ole32)
+        bedrock::client bedrock::logging bedrock::hook_runtime shell32 ole32)
     target_compile_features(BedrockTabList PRIVATE cxx_std_20)
     bedrock_enable_hook_runtime(BedrockTabList)
     if(MSVC)
@@ -61,5 +54,13 @@ if(BUILD_TESTING)
         target_compile_options(tablist_test PRIVATE -UNDEBUG)
     endif()
     add_test(NAME tablist_test COMMAND tablist_test)
+    if(WIN32)
+        add_executable(tablist_dll_smoke tests/dll_smoke_win32.cpp)
+        set_property(TARGET tablist_dll_smoke PROPERTY MSVC_RUNTIME_LIBRARY
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        add_dependencies(tablist_dll_smoke BedrockTabList)
+        add_test(NAME tablist_dll_smoke COMMAND tablist_dll_smoke $<TARGET_FILE:BedrockTabList>)
+        set_tests_properties(tablist_dll_smoke PROPERTIES TIMEOUT 75)
+    endif()
 endif()
 
