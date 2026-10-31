@@ -1517,7 +1517,7 @@ DWORD WINAPI startClient(void*) {
     });
     gameApi=std::make_unique<bedrock::GameApi>(tabListGameAccess);
     gameHooks=std::make_unique<bedrock::GameHooks>(*gameApi);
-    gameApi->Event.Enum.Key.then(&onKey);
+    gameApi->Event.Enum.Keyboard.then(&onKey);
     gameApi->Event.Enum.Gameplay.then(&onGameplay);
     gameApi->Event.Enum.Fov.then([](const bedrock::FovEvent&) { gameplayActive=true; });
     gameApi->Event.Enum.LevelTick.then(&onLevelTick);
