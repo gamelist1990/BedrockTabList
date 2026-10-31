@@ -461,6 +461,7 @@ void recordLevel(void* level, bool lobbyReturn = false) noexcept {
         murderWorldEpoch.fetch_add(1, std::memory_order_acq_rel);
         murderRoundHasRole = false;
         tabListGameAccess.clearWorldCaches();
+        if (gameApi) gameApi->clearObservedActors();
         tabRowsLastStartedMs = 0;
         {
             std::lock_guard rowsLock(tabRowsWorkerMutex);
